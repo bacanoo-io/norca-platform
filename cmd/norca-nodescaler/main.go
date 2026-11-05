@@ -53,6 +53,8 @@ type flags struct {
 	metricsAddr    string
 	logLevel       string
 	showVersion    bool
+	orphanSweep    time.Duration
+	orphanAfter    time.Duration
 }
 
 func parseFlags(args []string) (*flags, error) {
@@ -69,6 +71,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "address of the /metrics endpoint (disabled if empty)")
 	fs.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn or error")
 	fs.BoolVar(&f.showVersion, "version", false, "print the version and exit")
+	fs.DurationVar(&f.orphanSweep, "orphan-sweep", 5*time.Minute, "period of the sweep of orphaned instances")
+	fs.DurationVar(&f.orphanAfter, "orphan-after", 15*time.Minute, "age after which an orphaned instance without a node is deleted")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -130,6 +134,7 @@ func run(ctx context.Context, args []string) error {
 		ProviderTTL:    f.providerTTL,
 		TokenNamespace: f.tokenNamespace,
 		AllowHTTP:      f.allowHTTP,
+		OrphanAfter:    f.orphanAfter,
 		Logger:         logger,
 	})
 	var election *controller.LeaderElectionConfig
@@ -145,6 +150,7 @@ func run(ctx context.Context, args []string) error {
 		Workers:        f.workers,
 		ResyncPeriod:   f.resync,
 		LeaderElection: election,
+		Sources:        []controller.Source{&operator.OrphanSweep{Reconciler: rec, Interval: f.orphanSweep}},
 		Metrics:        metrics,
 		Logger:         logger,
 	})

@@ -40,17 +40,33 @@ matches the nodes that join with their instances by the meta key
 | Field | Meaning |
 | --- | --- |
 | `replicas` | Ready nodes of the group's instances. |
-| `joining` | Live instances whose node has not joined yet. |
+| `joining` | Live instances whose node has not joined yet, without the slow ones (they no longer count as capacity). |
 | `failed` | Instances the provider reports as failed. |
 | `capacity`, `allocatable` | The size of a machine from the provider, less `spec.node.reserved`. |
-| `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, and `node`, `ready` once it joined. |
+| `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
-| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`) and `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`). |
+| `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
+| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`) and `JoinFailing` (`TooManyFailures`). |
+
+**The join of the nodes.** An instance whose node has not joined by
+`join.deadline` (15 minutes) is deleted, and so is one the provider reports
+as failed: both are join failures (events `JoinTimeout`, `InstanceFailed`).
+After `join.max_failures` (3) in a row the group stops asking for instances
+(`JoinFailing`) until the template (`spec.node`, the provider, its group)
+changes or `join.resume_generation` is raised; a node that joins
+(`NodeJoined`) ends the row. A node still joining after `join.slow_after`
+(5 minutes) no longer counts in `joining` (`JoinSlow`), so the autoscaler may
+ask for another one.
+
+**Orphans.** Every `-orphan-sweep` (5 minutes) the leader looks at the groups
+of the available providers: an instance of this region whose node group is
+gone, or no longer names that provider and group, is deleted after
+`-orphan-after` (15 minutes) if it has no node; one with a node is left alone
+and logged.
 
 The status is shared with the autoscaler (`status.decision`): the operator
-changes only its own fields and writes with the index it read. This version
-adds instances; the join deadline, orphans, scale down and the bootstrap of
-a machine come next.
+changes only its own fields and writes with the index it read. Scale down
+and the bootstrap of a machine come next.
 
 ```shell
 norca-nodescaler -region eu -provider-ttl 3m -token-namespace default

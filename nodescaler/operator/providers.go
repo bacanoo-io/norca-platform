@@ -102,17 +102,32 @@ func (p *providers) client(ctx context.Context, name, group string) (*provider.C
 	if !ok {
 		return nil, &errUnavailable{"UnknownProvider", fmt.Sprintf("no NodeProvider %q is registered", name)}
 	}
-	if !reg.Heartbeat.IsZero() && p.now().Sub(reg.Heartbeat) > p.ttl {
-		return nil, &errUnavailable{"ProviderUnavailable",
-			fmt.Sprintf("the heartbeat of provider %q is %s old", name, p.now().Sub(reg.Heartbeat).Round(time.Second))}
+	if err := p.available(reg); err != nil {
+		return nil, err
 	}
 	if len(reg.Groups) > 0 && !reg.Groups[group] {
 		return nil, &errUnavailable{"UnknownGroup", fmt.Sprintf("provider %q does not offer the group %q", name, group)}
 	}
+	return p.clientOf(ctx, reg)
+}
+
+// available checks that a provider is alive: a heartbeat within the TTL,
+// or none (a static registration).
+func (p *providers) available(reg *registeredProvider) error {
+	if !reg.Heartbeat.IsZero() && p.now().Sub(reg.Heartbeat) > p.ttl {
+		return &errUnavailable{"ProviderUnavailable",
+			fmt.Sprintf("the heartbeat of provider %q is %s old", reg.Name, p.now().Sub(reg.Heartbeat).Round(time.Second))}
+	}
+	return nil
+}
+
+// clientOf returns the client of a registered provider: an https endpoint
+// (http only when allowed) and its token.
+func (p *providers) clientOf(ctx context.Context, reg *registeredProvider) (*provider.Client, error) {
 	u, err := url.Parse(reg.Endpoint)
 	if err != nil || (u.Scheme != "https" && (u.Scheme != "http" || !p.allowHTTP)) {
 		return nil, &errUnavailable{"InvalidProvider",
-			fmt.Sprintf("the endpoint %q of provider %q is not an https URL", reg.Endpoint, name)}
+			fmt.Sprintf("the endpoint %q of provider %q is not an https URL", reg.Endpoint, reg.Name)}
 	}
 	token, err := p.token(ctx, reg)
 	if err != nil {

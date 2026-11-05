@@ -4,8 +4,11 @@
 package operator
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/bacanoo-io/norca/norca/controller"
 )
@@ -56,7 +59,10 @@ type groupSpec struct {
 		Parameters map[string]any    `json:"parameters"`
 	} `json:"node"`
 	Join struct {
-		Deadline string `json:"deadline"`
+		Deadline         string `json:"deadline"`
+		SlowAfter        string `json:"slow_after"`
+		MaxFailures      int    `json:"max_failures"`
+		ResumeGeneration int64  `json:"resume_generation"`
 	} `json:"join"`
 }
 
@@ -91,4 +97,57 @@ func (s *groupSpec) providerGroup() string {
 		return s.Group
 	}
 	return s.Datacenter
+}
+
+// joinDeadline is how long an instance may live without its node joining
+// (join.deadline, 15 minutes by default).
+func (s *groupSpec) joinDeadline() time.Duration {
+	return durationOr(s.Join.Deadline, 15*time.Minute)
+}
+
+// slowAfter is when a node still joining no longer counts as capacity
+// (join.slow_after, 5 minutes by default).
+func (s *groupSpec) slowAfter() time.Duration {
+	return durationOr(s.Join.SlowAfter, 5*time.Minute)
+}
+
+// maxFailures is the number of join failures in a row after which the group
+// stops asking for instances (join.max_failures, 3 by default).
+func (s *groupSpec) maxFailures() int {
+	if s.Join.MaxFailures > 0 {
+		return s.Join.MaxFailures
+	}
+	return 3
+}
+
+// templateRevision identifies the template of a machine: the provider, its
+// group and spec.node. A change of it is a new chance for a group whose
+// nodes did not join.
+func (s *groupSpec) templateRevision() string {
+	data, _ := json.Marshal(map[string]any{"provider": s.Provider, "group": s.providerGroup(), "node": s.Node})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:6])
+}
+
+func durationOr(s string, def time.Duration) time.Duration {
+	if d, err := parseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+// parseDuration reads a duration with s, m, h or d, as the schema of the
+// kind allows (a day is 24 hours).
+func parseDuration(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	if n := len(s); n > 1 && s[n-1] == 'd' {
+		var days int64
+		if _, err := fmt.Sscanf(s[:n-1], "%d", &days); err != nil {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
 }

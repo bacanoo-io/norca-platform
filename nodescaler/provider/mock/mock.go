@@ -124,3 +124,17 @@ func (p *Provider) Delete(_ context.Context, group, id string) error {
 	delete(p.inst[group], id)
 	return nil
 }
+
+// Fail marks an instance as failed with the reason, as a platform does with
+// a machine that did not come up. It reports whether the instance exists.
+func (p *Provider) Fail(group, id, reason, message string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	inst, ok := p.inst[group][id]
+	if !ok {
+		return false
+	}
+	inst.State, inst.Reason, inst.Message = provider.StateFailed, reason, message
+	p.inst[group][id] = inst
+	return true
+}

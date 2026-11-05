@@ -12,9 +12,9 @@
 // conditions ProviderAvailable and Provisioned.
 //
 // A request to the provider is idempotent by its ID (region/group/number):
-// a request repeated after a failure or a restart creates nothing more. This
-// version only adds instances; removing them (scale down, the join deadline,
-// orphans) comes with the next steps.
+// a request repeated after a failure or a restart creates nothing more. The
+// join of the nodes is tracked (join.go) and the instances of groups that are
+// gone are swept (orphans.go); scale down comes with the next steps.
 package operator
 
 import (
@@ -61,6 +61,10 @@ type Config struct {
 	RetryAfter time.Duration
 	JoinCheck  time.Duration
 
+	// OrphanAfter is the age after which an orphaned instance without a
+	// node is deleted (default 15 minutes, the default join deadline).
+	OrphanAfter time.Duration
+
 	Logger *slog.Logger
 	Now    func() time.Time
 }
@@ -90,6 +94,9 @@ func NewReconciler(backend controller.Backend, nodes NodeLister, cfg Config) *Re
 	if cfg.JoinCheck <= 0 {
 		cfg.JoinCheck = 15 * time.Second
 	}
+	if cfg.OrphanAfter <= 0 {
+		cfg.OrphanAfter = 15 * time.Minute
+	}
 	if cfg.HTTP == nil {
 		cfg.HTTP = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -117,10 +124,12 @@ type observed struct {
 	instances []provider.Instance // of this group
 	capacity  *provider.Capacity
 	nodeOf    map[string]Node // the joined node of an instance, by instance ID
+	slow      map[string]bool // instances still joining after join.slow_after
 }
 
-// counts returns the ready nodes, the instances whose node has not joined,
-// the failed instances and the live instances (creating or running).
+// counts returns the ready nodes, the instances whose node has not joined
+// (the slow ones left out: they no longer count as capacity), the failed
+// instances and the live instances (creating or running).
 func (o *observed) counts() (ready, joining, failed, live int64) {
 	for _, inst := range o.instances {
 		switch inst.State {
@@ -132,9 +141,10 @@ func (o *observed) counts() (ready, joining, failed, live int64) {
 		default:
 			continue
 		}
-		if n, ok := o.nodeOf[inst.ID]; ok && n.Ready {
+		switch n, ok := o.nodeOf[inst.ID]; {
+		case ok && n.Ready:
 			ready++
-		} else {
+		case !ok && !o.slow[inst.ID]:
 			joining++
 		}
 	}
@@ -198,6 +208,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		}
 	}
 
+	// The join of the nodes: failed and late instances are deleted, slow ones
+	// marked.
+	prevStatus := normalize(obj.Status)
+	js := r.trackJoins(ctx, obj, client, group, spec, o, prevStatus, now)
+	failing := js.Failures >= spec.maxFailures()
+	if failing && readJoinState(prevStatus).Failures < spec.maxFailures() {
+		r.event(ctx, obj, api.ObjectEventTypeWarning, CondJoinFailing, joinCondition(js, spec.maxFailures()).Message)
+	}
+
 	// Ask for the instances that are missing.
 	want := spec.replicas()
 	_, _, _, live := o.counts()
@@ -205,7 +224,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	provisioned := condition{Type: CondProvisioned, Status: "True", Reason: "Requested",
 		Message: fmt.Sprintf("%d instances for a scale of %d", live, want)}
 	requested, createFailed := false, false
-	if want > live {
+	if failing && want > live {
+		provisioned = condition{Type: CondProvisioned, Status: "False", Reason: CondJoinFailing,
+			Message: fmt.Sprintf("%d instances for a scale of %d; none is asked for while the nodes do not join", live, want)}
+	}
+	if !failing && want > live {
 		req := provider.CreateRequest{
 			RequestID:  r.requestID(obj.Name, seq),
 			Count:      int(want - live),
@@ -249,6 +272,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		if requested {
 			status["lastRequest"] = seq
 		}
+		status["join"] = js.doc()
+		setCondition(status, joinCondition(js, spec.maxFailures()), now)
 		status["observedGeneration"] = obj.Generation
 		setCondition(status, condition{Type: CondProviderAvailable, Status: "True", Reason: "Available"}, now)
 		setCondition(status, provisioned, now)
@@ -261,7 +286,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		// The failure is in the condition and the event; the provider is
 		// asked again after a while, not at the pace of the error backoff.
 		return r.cfg.RetryAfter, nil
-	case joining > 0:
+	case joining > 0 || len(o.slow) > 0:
 		return r.cfg.JoinCheck, nil
 	}
 	return 0, nil
@@ -316,6 +341,9 @@ func nodeRecords(o *observed) []any {
 		if n, ok := o.nodeOf[inst.ID]; ok {
 			rec["node"] = n.ID
 			rec["ready"] = n.Ready
+		}
+		if o.slow[inst.ID] {
+			rec["slow"] = true
 		}
 		out = append(out, rec)
 	}

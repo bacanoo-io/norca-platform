@@ -56,6 +56,7 @@ func newEnv(t *testing.T, token string) *env {
 	e.mock = mock.New(map[string]mock.GroupConfig{
 		"dc1": {Capacity: provider.Capacity{CPU: 4000, Memory: 8192, Disk: 40000}, Max: 5},
 	})
+	e.mock.Now = func() time.Time { return e.now }
 	srv := httptest.NewServer(provider.NewHandler(e.mock, token, nil))
 	t.Cleanup(srv.Close)
 	e.url = srv.URL
