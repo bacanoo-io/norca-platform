@@ -29,9 +29,17 @@ const (
 	LabelNodeGroup  = "norca.node_group"
 	LabelRequest    = "norca.request"
 
-	// MetaProviderID is the meta key of a node with the ID of its instance:
-	// how a node is matched with the instance it runs on.
-	MetaProviderID = "norca.provider_id"
+	// MetaInstance is the meta key of a node with the name of its instance
+	// (the name the operator gave it in the request): how a node is matched
+	// with the instance it runs on. The provider's ID of the instance is not
+	// known when the machine is described, so the name is the operator's.
+	MetaInstance = "norca.instance"
+
+	// The other marks of a node the operator created.
+	MetaCreatedBy = "norca.created_by"
+	MetaNodeGroup = "norca.node_group"
+	MetaRequest   = "norca.request"
+	MetaCreatedAt = "norca.created_at"
 )
 
 // nodeResource is a size: CPU in MHz, memory and disk in MB.

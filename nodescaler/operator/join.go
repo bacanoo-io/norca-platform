@@ -95,7 +95,7 @@ func (r *Reconciler) trackJoins(ctx context.Context, obj *api.CustomObject, clie
 
 	kept := o.instances[:0]
 	for _, inst := range o.instances {
-		node, hasNode := o.nodeOf[inst.ID]
+		node, hasNode := o.nodeOf[instanceKey(inst)]
 		age := now.Sub(inst.CreatedAt)
 		var failure string
 		switch {

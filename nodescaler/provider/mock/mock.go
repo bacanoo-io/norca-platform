@@ -33,6 +33,7 @@ type Provider struct {
 	groups   map[string]GroupConfig
 	inst     map[string]map[string]provider.Instance // by group and ID
 	requests map[string][]string                     // instance IDs by request ID
+	userData map[string]string                       // the bootstrap of an instance, by ID
 	next     int
 
 	// Now is replaced in tests.
@@ -45,6 +46,7 @@ func New(groups map[string]GroupConfig) *Provider {
 		groups:   maps.Clone(groups),
 		inst:     map[string]map[string]provider.Instance{},
 		requests: map[string][]string{},
+		userData: map[string]string{},
 	}
 	for name := range groups {
 		p.inst[name] = map[string]provider.Instance{}
@@ -93,15 +95,16 @@ func (p *Provider) Create(_ context.Context, group string, req provider.CreateRe
 		}
 		return out, nil
 	}
-	if cfg.Max > 0 && len(p.inst[group])+req.Count > cfg.Max {
+	if cfg.Max > 0 && len(p.inst[group])+len(req.Instances) > cfg.Max {
 		return nil, provider.Fail(provider.ReasonQuota, "group %s has %d of %d instances, %d more asked for",
-			group, len(p.inst[group]), cfg.Max, req.Count)
+			group, len(p.inst[group]), cfg.Max, len(req.Instances))
 	}
-	out := make([]provider.Instance, 0, req.Count)
-	for range req.Count {
+	out := make([]provider.Instance, 0, len(req.Instances))
+	for _, ir := range req.Instances {
 		p.next++
 		inst := provider.Instance{
 			ID:        fmt.Sprintf("mock-%s-%d", group, p.next),
+			Name:      ir.Name,
 			State:     provider.StateRunning,
 			RequestID: req.RequestID,
 			Labels:    maps.Clone(req.Labels),
@@ -109,9 +112,20 @@ func (p *Provider) Create(_ context.Context, group string, req provider.CreateRe
 		}
 		p.inst[group][inst.ID] = inst
 		p.requests[req.RequestID] = append(p.requests[req.RequestID], inst.ID)
+		if ir.Bootstrap != nil {
+			p.userData[inst.ID] = ir.Bootstrap.UserData
+		}
 		out = append(out, inst)
 	}
 	return out, nil
+}
+
+// UserData returns the bootstrap an instance was created with, as a platform
+// would run it.
+func (p *Provider) UserData(id string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.userData[id]
 }
 
 // Delete implements provider.Provider.

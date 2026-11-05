@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap"
 	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
 	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
@@ -64,6 +66,10 @@ type Config struct {
 	// OrphanAfter is the age after which an orphaned instance without a
 	// node is deleted (default 15 minutes, the default join deadline).
 	OrphanAfter time.Duration
+
+	// Bootstrap gives the template of the bootstrap of a node; nil sends
+	// no bootstrap, only the names of the instances.
+	Bootstrap BootstrapSource
 
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -123,7 +129,7 @@ func NewReconciler(backend controller.Backend, nodes NodeLister, cfg Config) *Re
 type observed struct {
 	instances []provider.Instance // of this group
 	capacity  *provider.Capacity
-	nodeOf    map[string]Node // the joined node of an instance, by instance ID
+	nodeOf    map[string]Node // the joined node of an instance, by instanceKey
 	slow      map[string]bool // instances still joining after join.slow_after
 }
 
@@ -141,7 +147,7 @@ func (o *observed) counts() (ready, joining, failed, live int64) {
 		default:
 			continue
 		}
-		switch n, ok := o.nodeOf[inst.ID]; {
+		switch n, ok := o.nodeOf[instanceKey(inst)]; {
 		case ok && n.Ready:
 			ready++
 		case !ok && !o.slow[inst.ID]:
@@ -203,8 +209,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
 	for _, n := range nodes {
-		if n.ProviderID != "" {
-			o.nodeOf[n.ProviderID] = n
+		if n.Instance != "" {
+			o.nodeOf[n.Instance] = n
 		}
 	}
 
@@ -229,33 +235,46 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 			Message: fmt.Sprintf("%d instances for a scale of %d; none is asked for while the nodes do not join", live, want)}
 	}
 	if !failing && want > live {
-		req := provider.CreateRequest{
-			RequestID:  r.requestID(obj.Name, seq),
-			Count:      int(want - live),
-			Parameters: spec.Node.Parameters,
-			Labels: map[string]string{
-				LabelRegion: r.cfg.Region, LabelPool: spec.Pool, LabelDatacenter: spec.Datacenter,
-				LabelClass: spec.NodeClass, LabelNodeGroup: obj.Name, LabelRequest: r.requestID(obj.Name, seq),
-			},
-		}
-		created, err := client.Create(ctx, group, req)
+		reqID := r.requestID(obj.Name, seq)
+		instances, issued, err := r.describe(ctx, obj, spec, seq, int(want-live), now)
 		if err != nil {
 			createFailed = true
-			reason := provider.ReasonOf(err)
-			provisioned = condition{Type: CondProvisioned, Status: "False", Reason: reasonName(reason),
-				Message: fmt.Sprintf("provider %q could not create %d instances: %v", spec.Provider, req.Count, err)}
-			r.event(ctx, obj, api.ObjectEventTypeWarning, "CreateFailed", provisioned.Message)
+			provisioned = condition{Type: CondProvisioned, Status: "False", Reason: "NoBootstrap", Message: err.Error()}
+			r.event(ctx, obj, api.ObjectEventTypeWarning, "BootstrapFailed", err.Error())
 		} else {
-			requested = true
-			for _, inst := range created {
-				if !slices.ContainsFunc(o.instances, func(i provider.Instance) bool { return i.ID == inst.ID }) {
-					o.instances = append(o.instances, inst)
-				}
+			req := provider.CreateRequest{
+				RequestID:  reqID,
+				Instances:  instances,
+				Parameters: spec.Node.Parameters,
+				Labels: map[string]string{
+					LabelRegion: r.cfg.Region, LabelPool: spec.Pool, LabelDatacenter: spec.Datacenter,
+					LabelClass: spec.NodeClass, LabelNodeGroup: obj.Name, LabelRequest: reqID,
+				},
 			}
-			_, _, _, live = o.counts()
-			provisioned.Message = fmt.Sprintf("%d instances for a scale of %d", live, want)
-			r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
-				fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, req.Count, req.RequestID))
+			created, err := client.Create(ctx, group, req)
+			if err != nil {
+				createFailed = true
+				reason := provider.ReasonOf(err)
+				provisioned = condition{Type: CondProvisioned, Status: "False", Reason: reasonName(reason),
+					Message: fmt.Sprintf("provider %q could not create %d instances: %v", spec.Provider, len(req.Instances), err)}
+				r.event(ctx, obj, api.ObjectEventTypeWarning, "CreateFailed", provisioned.Message)
+			} else {
+				requested = true
+				for _, inst := range created {
+					if slices.ContainsFunc(o.instances, func(i provider.Instance) bool { return i.ID == inst.ID }) {
+						continue // an instance of a repeated request
+					}
+					o.instances = append(o.instances, inst)
+					if rd, ok := issued[inst.Name]; ok {
+						r.event(ctx, obj, api.ObjectEventTypeNormal, "CertificateIssued",
+							fmt.Sprintf("certificate %s of node %s, valid until %s", rd.Serial, inst.Name, rd.NotAfter.UTC().Format(time.RFC3339)))
+					}
+				}
+				_, _, _, live = o.counts()
+				provisioned.Message = fmt.Sprintf("%d instances for a scale of %d", live, want)
+				r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
+					fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, len(req.Instances), req.RequestID))
+			}
 		}
 	}
 
@@ -290,6 +309,80 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		return r.cfg.JoinCheck, nil
 	}
 	return 0, nil
+}
+
+// describe names the instances of a request and renders the bootstrap of
+// each, with the marks of the operator in the meta of its node. Without a
+// bootstrap source the instances have names only (a provider that brings its
+// own machines, tests).
+func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *groupSpec, seq int64, count int,
+	now time.Time) ([]provider.InstanceRequest, map[string]*bootstrap.Rendered, error) {
+
+	var tmpl *bootstrap.Template
+	if r.cfg.Bootstrap != nil {
+		var err error
+		if tmpl, err = r.cfg.Bootstrap.Template(ctx); err != nil {
+			return nil, nil, fmt.Errorf("the bootstrap of the nodes is not available: %w", err)
+		}
+	}
+	out := make([]provider.InstanceRequest, 0, count)
+	issued := map[string]*bootstrap.Rendered{}
+	for i := 1; i <= count; i++ {
+		name := instanceName(obj.Name, seq, i)
+		ir := provider.InstanceRequest{Name: name}
+		if tmpl != nil {
+			meta := maps.Clone(spec.Node.Meta)
+			if meta == nil {
+				meta = map[string]string{}
+			}
+			maps.Copy(meta, map[string]string{
+				MetaCreatedBy: "nodescaler", MetaNodeGroup: obj.Name, MetaInstance: name,
+				MetaRequest: r.requestID(obj.Name, seq), MetaCreatedAt: now.UTC().Format(time.RFC3339),
+			})
+			rd, err := tmpl.Render(bootstrap.Node{Name: name, Datacenter: spec.Datacenter, Pool: spec.Pool,
+				Class: spec.NodeClass, Meta: meta})
+			if err != nil {
+				return nil, nil, err
+			}
+			ir.Bootstrap = &provider.Bootstrap{UserData: rd.UserData}
+			issued[name] = rd
+		}
+		out = append(out, ir)
+	}
+	return out, issued, nil
+}
+
+// instanceName is the name of the i-th instance of a request: the group, the
+// number of the request and i, as a host name (lower case letters, digits and
+// dashes, at most 63 characters).
+func instanceName(group string, seq int64, i int) string {
+	suffix := fmt.Sprintf("-%d-%d", seq, i)
+	var b strings.Builder
+	for _, c := range strings.ToLower(group) {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			b.WriteRune(c)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	base := strings.Trim(b.String(), "-")
+	if base == "" {
+		base = "node"
+	}
+	if max := 63 - len(suffix); len(base) > max {
+		base = strings.TrimRight(base[:max], "-")
+	}
+	return base + suffix
+}
+
+// instanceKey is how an instance is matched with its node: the name the
+// operator gave it, or the provider's ID for an instance without one.
+func instanceKey(inst provider.Instance) string {
+	if inst.Name != "" {
+		return inst.Name
+	}
+	return inst.ID
 }
 
 // unavailable reports a provider that can't be used and tries again later.
@@ -338,7 +431,7 @@ func nodeRecords(o *observed) []any {
 		if inst.Reason != "" {
 			rec["reason"] = inst.Reason
 		}
-		if n, ok := o.nodeOf[inst.ID]; ok {
+		if n, ok := o.nodeOf[instanceKey(inst)]; ok {
 			rec["node"] = n.ID
 			rec["ready"] = n.Ready
 		}

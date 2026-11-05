@@ -10,7 +10,9 @@
 // job, NORCA_ADDR=unix://${NORCA_SECRETS_DIR}/api.sock with the workload
 // identity. The token needs read and write-status (and write-events) on the
 // objects of norca.io/NodeGroup, read on norca.io/NodeProvider, node read,
-// and read on the Variables with the tokens of the providers.
+// and read on the Variables with the tokens of the providers and on the
+// bootstrap Variable (nodescaler/bootstrap/<region>), which holds the key of
+// the node CA and must be readable by the operator only.
 package main
 
 import (
@@ -55,6 +57,9 @@ type flags struct {
 	showVersion    bool
 	orphanSweep    time.Duration
 	orphanAfter    time.Duration
+	bootstrap      bool
+	bootstrapVar   string
+	bootstrapNS    string
 }
 
 func parseFlags(args []string) (*flags, error) {
@@ -73,6 +78,9 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.showVersion, "version", false, "print the version and exit")
 	fs.DurationVar(&f.orphanSweep, "orphan-sweep", 5*time.Minute, "period of the sweep of orphaned instances")
 	fs.DurationVar(&f.orphanAfter, "orphan-after", 15*time.Minute, "age after which an orphaned instance without a node is deleted")
+	fs.BoolVar(&f.bootstrap, "bootstrap", true, "send each instance a bootstrap with the certificate and the configuration of its node")
+	fs.StringVar(&f.bootstrapVar, "bootstrap-variable", "", "Variable with the bootstrap template of the region (default nodescaler/bootstrap/<region>)")
+	fs.StringVar(&f.bootstrapNS, "bootstrap-namespace", "default", "namespace of the bootstrap Variable")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -81,6 +89,9 @@ func parseFlags(args []string) (*flags, error) {
 	}
 	if f.workers < 1 {
 		return nil, errors.New("-workers must be at least 1")
+	}
+	if f.bootstrapVar == "" {
+		f.bootstrapVar = "nodescaler/bootstrap/" + f.region
 	}
 	return &f, nil
 }
@@ -129,7 +140,12 @@ func run(ctx context.Context, args []string) error {
 		}()
 	}
 
+	var boot operator.BootstrapSource
+	if f.bootstrap {
+		boot = &operator.VariableBootstrap{Vars: backend, Namespace: f.bootstrapNS, Path: f.bootstrapVar, Region: f.region}
+	}
 	rec := operator.NewReconciler(backend, &operator.APINodes{Client: client}, operator.Config{
+		Bootstrap:      boot,
 		Region:         f.region,
 		ProviderTTL:    f.providerTTL,
 		TokenNamespace: f.tokenNamespace,

@@ -84,9 +84,17 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	case req.RequestID == "":
 		writeError(w, http.StatusBadRequest, &Error{Reason: ReasonInvalid, Message: "request_id is required"})
 		return
-	case req.Count < 1:
-		writeError(w, http.StatusBadRequest, &Error{Reason: ReasonInvalid, Message: "count must be at least 1"})
+	case len(req.Instances) == 0:
+		writeError(w, http.StatusBadRequest, &Error{Reason: ReasonInvalid, Message: "instances must not be empty"})
 		return
+	}
+	names := map[string]bool{}
+	for _, inst := range req.Instances {
+		if inst.Name == "" || names[inst.Name] {
+			writeError(w, http.StatusBadRequest, &Error{Reason: ReasonInvalid, Message: "every instance needs a name of its own"})
+			return
+		}
+		names[inst.Name] = true
 	}
 	instances, err := h.p.Create(r.Context(), r.PathValue("group"), req)
 	if err != nil {

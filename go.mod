@@ -10,6 +10,7 @@ replace (
 )
 
 require (
+	github.com/bacanoo-io/norca-pki v0.1.1-0.20261105182009-9426845506a7
 	github.com/bacanoo-io/norca/norca/api v0.0.0-20230103221135-ce00d683f9be
 	github.com/bacanoo-io/norca/norca/controller v0.0.0-00010101000000-000000000000
 )

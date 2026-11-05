@@ -56,6 +56,11 @@ type Instance struct {
 	ID    string `json:"id"`
 	State string `json:"state"`
 
+	// Name is the name the operator gave the instance in the request; the
+	// node it runs registers with it (meta norca.instance), which is how a
+	// node is matched with its instance.
+	Name string `json:"name,omitempty"`
+
 	// Reason and Message say why an instance failed.
 	Reason  string `json:"reason,omitempty"`
 	Message string `json:"message,omitempty"`
@@ -78,16 +83,24 @@ type Group struct {
 	Instances []Instance `json:"instances"`
 }
 
-// CreateRequest asks for Count instances. It is idempotent by RequestID: the
-// same request again returns the instances of the first one and creates
-// nothing, so a request repeated after a failure or a restart of the
-// operator does not create more machines.
+// CreateRequest asks for instances, one per entry of Instances. It is
+// idempotent by RequestID: the same request again returns the instances of
+// the first one and creates nothing, so a request repeated after a failure or
+// a restart of the operator does not create more machines.
 type CreateRequest struct {
 	RequestID  string            `json:"request_id"`
-	Count      int               `json:"count"`
+	Instances  []InstanceRequest `json:"instances"`
 	Parameters map[string]any    `json:"parameters,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty"`
-	Bootstrap  *Bootstrap        `json:"bootstrap,omitempty"`
+}
+
+// InstanceRequest is one instance of a request: its name (the machine name
+// on the platform, and the name of the node) and what it runs first. Each
+// instance has a bootstrap of its own: it holds the key and the certificate
+// of its node.
+type InstanceRequest struct {
+	Name      string     `json:"name"`
+	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
 }
 
 // Bootstrap is what a new machine runs first: the agent, its configuration

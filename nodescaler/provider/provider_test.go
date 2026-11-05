@@ -6,6 +6,7 @@ package provider_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,6 +29,15 @@ func serve(t *testing.T, token string) *provider.Client {
 	return &provider.Client{Endpoint: srv.URL, Token: token}
 }
 
+// names describes n instances named n1, n2, ...
+func names(n int) []provider.InstanceRequest {
+	out := make([]provider.InstanceRequest, n)
+	for i := range out {
+		out[i].Name = fmt.Sprintf("n%d", i+1)
+	}
+	return out
+}
+
 func TestContract_GroupHasTheCapacityWithoutInstances(t *testing.T) {
 	c := serve(t, "")
 	g, err := c.Group(context.Background(), "fsn1", map[string]any{"size": "cx32"})
@@ -46,15 +56,19 @@ func TestContract_CreateIsIdempotentByRequestID(t *testing.T) {
 	c := serve(t, "")
 	ctx := context.Background()
 	req := provider.CreateRequest{
-		RequestID: "eu/workers-dc-a/1", Count: 2,
-		Labels:    map[string]string{"norca.node_group": "workers-dc-a"},
-		Bootstrap: &provider.Bootstrap{UserData: "#cloud-config\n"},
+		RequestID: "eu/workers-dc-a/1",
+		Instances: []provider.InstanceRequest{
+			{Name: "workers-dc-a-1-1", Bootstrap: &provider.Bootstrap{UserData: "#cloud-config\n"}},
+			{Name: "workers-dc-a-1-2", Bootstrap: &provider.Bootstrap{UserData: "#cloud-config\n"}},
+		},
+		Labels: map[string]string{"norca.node_group": "workers-dc-a"},
 	}
 	first, err := c.Create(ctx, "fsn1", req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != 2 || first[0].State != provider.StateRunning || first[0].Labels["norca.node_group"] != "workers-dc-a" {
+	if len(first) != 2 || first[0].State != provider.StateRunning || first[0].Labels["norca.node_group"] != "workers-dc-a" ||
+		first[0].Name != "workers-dc-a-1-1" || first[1].Name != "workers-dc-a-1-2" {
 		t.Fatalf("first: %+v", first)
 	}
 	again, err := c.Create(ctx, "fsn1", req)
@@ -75,7 +89,7 @@ func TestContract_CreateIsIdempotentByRequestID(t *testing.T) {
 
 func TestContract_QuotaHasAReason(t *testing.T) {
 	c := serve(t, "")
-	_, err := c.Create(context.Background(), "fsn1", provider.CreateRequest{RequestID: "r1", Count: 4})
+	_, err := c.Create(context.Background(), "fsn1", provider.CreateRequest{RequestID: "r1", Instances: names(4)})
 	if provider.ReasonOf(err) != provider.ReasonQuota {
 		t.Fatalf("want a quota error, got %v", err)
 	}
@@ -85,8 +99,10 @@ func TestContract_InvalidRequests(t *testing.T) {
 	c := serve(t, "")
 	ctx := context.Background()
 	for name, req := range map[string]provider.CreateRequest{
-		"no request id": {Count: 1},
-		"no count":      {RequestID: "r1"},
+		"no request id":       {Instances: names(1)},
+		"no instance":         {RequestID: "r1"},
+		"an instance no name": {RequestID: "r1", Instances: []provider.InstanceRequest{{}}},
+		"the same name twice": {RequestID: "r1", Instances: []provider.InstanceRequest{{Name: "a"}, {Name: "a"}}},
 	} {
 		_, err := c.Create(ctx, "fsn1", req)
 		if provider.ReasonOf(err) != provider.ReasonInvalid {
@@ -101,7 +117,7 @@ func TestContract_InvalidRequests(t *testing.T) {
 func TestContract_Delete(t *testing.T) {
 	c := serve(t, "")
 	ctx := context.Background()
-	inst, err := c.Create(ctx, "nbg1", provider.CreateRequest{RequestID: "r1", Count: 1})
+	inst, err := c.Create(ctx, "nbg1", provider.CreateRequest{RequestID: "r1", Instances: names(1)})
 	if err != nil {
 		t.Fatal(err)
 	}

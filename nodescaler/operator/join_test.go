@@ -127,7 +127,7 @@ func TestJoin_ANodeThatJoinsEndsTheRow(t *testing.T) {
 
 	// One times out, one joins.
 	e.advance(10 * time.Minute)
-	e.nodes.set(Node{ID: "n1", ProviderID: insts[0].ID, Ready: true})
+	e.nodes.set(Node{ID: "n1", Instance: insts[0].Name, Ready: true})
 	e.reconcile()
 	if e.eventCount("NodeJoined") != 1 {
 		t.Fatalf("NodeJoined events: %d", e.eventCount("NodeJoined"))
@@ -141,10 +141,10 @@ func TestJoin_ANodeThatJoinsEndsTheRow(t *testing.T) {
 	var fresh string
 	for _, inst := range e.instances() {
 		if inst.ID != insts[0].ID {
-			fresh = inst.ID
+			fresh = inst.Name
 		}
 	}
-	e.nodes.set(Node{ID: "n1", ProviderID: insts[0].ID, Ready: true}, Node{ID: "n2", ProviderID: fresh, Ready: true})
+	e.nodes.set(Node{ID: "n1", Instance: insts[0].Name, Ready: true}, Node{ID: "n2", Instance: fresh, Ready: true})
 	e.reconcile()
 	st := e.status()
 	if joinFailures(st) != 0 || st["replicas"] != 2.0 || st["joining"] != 0.0 {

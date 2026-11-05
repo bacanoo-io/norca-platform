@@ -25,6 +25,7 @@ nodescaler/provider/        the contract between the node scaling operator and a
 nodescaler/provider/mock/   a node provider in memory, for trials and tests
 nodescaler/registrar/       the NodeProvider object of a provider and its heartbeat
 nodescaler/operator/        the operator: reconciles the NodeGroup objects with their providers
+nodescaler/bootstrap/       the bootstrap of a machine: the node's certificate and agent configuration, as cloud-init
 cmd/nodeprovider/           a node provider program (type mock)
 cmd/norca-nodescaler/       the operator program
 ```
@@ -33,9 +34,11 @@ cmd/norca-nodescaler/       the operator program
 
 `norca-nodescaler` reconciles every `norca.io/NodeGroup` with a `provider`:
 it asks the provider for the instances the scale (`spec.replicas`) is
-missing, in a request that is idempotent by its ID (`<region>/<group>/<n>`),
-matches the nodes that join with their instances by the meta key
-`norca.provider_id`, and writes the status of the group:
+missing, in a request that is idempotent by its ID (`<region>/<group>/<n>`).
+Each instance has a name of the operator (`<group>-<n>-<i>`) and a
+bootstrap of its own; the node it runs registers with that name in the meta
+key `norca.instance`, which is how nodes are matched with their instances.
+The operator writes the status of the group:
 
 | Field | Meaning |
 | --- | --- |
@@ -58,6 +61,30 @@ changes or `join.resume_generation` is raised; a node that joins
 (5 minutes) no longer counts in `joining` (`JoinSlow`), so the autoscaler may
 ask for another one.
 
+**The bootstrap of a machine.** The deployer writes the static parts of a
+region into the Variable `nodescaler/bootstrap/<region>` (namespace
+`default`; it holds the key of the node CA, so only the operator may read
+it):
+
+| Item | Meaning |
+| --- | --- |
+| `ca` | The cluster CA (PEM), the `ca_file` of the agents. |
+| `node_ca`, `node_ca_key` | The node CA of the region and its key (`norca-deployer pki issue-node-ca`). |
+| `agent_config` | The agent configuration, a Go template with `.Name`, `.Region`, `.Datacenter`, `.Pool`, `.Class`, `.Meta`, `.CAFile`, `.CertFile`, `.KeyFile` and the functions `hcl` (a quoted string) and `hclmap` (a map as an HCL object). |
+| `trust_domain` | The SPIFFE trust domain; the node gets `spiffe://<domain>/region/<region>/node/<name>`. |
+| `validity` | The validity of a node certificate (`60d`). |
+| `tls_dir`, `config_file`, `service` | Where the files go and the unit of the agent (`/etc/norca/tls`, `/etc/norca/norca.hcl`, `norca`). |
+
+For each instance the operator issues a certificate with the node CA (the
+file holds the leaf and the node CA), renders the agent configuration with
+the node's name, datacenter, pool, class and meta (`spec.node.meta` and the
+marks `norca.created_by`, `norca.node_group`, `norca.instance`,
+`norca.request`, `norca.created_at`), and sends a cloud-init document that
+writes the files and starts the agent. Every certificate is an event
+(`CertificateIssued`: serial and expiry). Without the Variable no instance is
+asked for (`Provisioned` False, `NoBootstrap`); `-bootstrap=false` sends only
+the names, for a provider that brings its own machines.
+
 **Orphans.** Every `-orphan-sweep` (5 minutes) the leader looks at the groups
 of the available providers: an instance of this region whose node group is
 gone, or no longer names that provider and group, is deleted after
@@ -66,7 +93,7 @@ and logged.
 
 The status is shared with the autoscaler (`status.decision`): the operator
 changes only its own fields and writes with the index it read. Scale down
-and the bootstrap of a machine come next.
+comes next.
 
 ```shell
 norca-nodescaler -region eu -provider-ttl 3m -token-namespace default
@@ -84,7 +111,9 @@ POST   {endpoint}/v1/groups/{group}/instances       create instances (idempotent
 DELETE {endpoint}/v1/groups/{group}/instances/{id}  delete one instance
 ```
 
-with a bearer token. A request that cannot be served fails with a reason:
+with a bearer token. A create request lists the instances, each with its
+name and its bootstrap (`user_data`); the provider gives the machine that
+name. A request that cannot be served fails with a reason:
 `quota`, `no_capacity`, `invalid` or `error`. See the package documentation
 of `nodescaler/provider`.
 

@@ -93,7 +93,7 @@ func (r *Reconciler) orphan(ctx context.Context, providerName, group string, ins
 		return false
 	}
 	for _, n := range nodes {
-		if n.ProviderID == inst.ID {
+		if n.Instance != "" && n.Instance == instanceKey(inst) {
 			r.log.Warn("orphaned instance has a node, left alone", "provider", providerName, "instance", inst.ID,
 				"node", n.ID, "node_group", ng)
 			return false

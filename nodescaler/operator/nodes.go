@@ -14,9 +14,9 @@ import (
 type Node struct {
 	ID string
 
-	// ProviderID is the ID of the instance the node runs on (the meta key
-	// norca.provider_id); empty for a node the operator did not create.
-	ProviderID string
+	// Instance is the name of the instance the node runs on (the meta key
+	// norca.instance); empty for a node the operator did not create.
+	Instance string
 
 	// Ready is a ready node.
 	Ready bool
@@ -28,13 +28,13 @@ type NodeLister interface {
 }
 
 // APINodes lists the nodes with the Norca API. The node list has no meta, so
-// a node is read once for its provider ID, which does not change; the IDs are
-// cached by node.
+// a node is read once for its instance name, which does not change; the
+// names are cached by node.
 type APINodes struct {
 	Client *api.Client
 
-	mu         sync.Mutex
-	providerID map[string]string // by node ID
+	mu       sync.Mutex
+	instance map[string]string // by node ID
 }
 
 // Nodes implements NodeLister.
@@ -49,18 +49,18 @@ func (n *APINodes) Nodes(ctx context.Context, datacenter, pool, class string) ([
 		if s.Datacenter != datacenter || s.NodePool != pool || (class != "" && s.NodeClass != class) {
 			continue
 		}
-		id, err := n.providerIDOf(ctx, s.ID)
+		id, err := n.instanceOf(ctx, s.ID)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Node{ID: s.ID, ProviderID: id, Ready: s.Status == api.NodeStatusReady})
+		out = append(out, Node{ID: s.ID, Instance: id, Ready: s.Status == api.NodeStatusReady})
 	}
 	return out, nil
 }
 
-func (n *APINodes) providerIDOf(ctx context.Context, nodeID string) (string, error) {
+func (n *APINodes) instanceOf(ctx context.Context, nodeID string) (string, error) {
 	n.mu.Lock()
-	id, ok := n.providerID[nodeID]
+	id, ok := n.instance[nodeID]
 	n.mu.Unlock()
 	if ok {
 		return id, nil
@@ -69,12 +69,12 @@ func (n *APINodes) providerIDOf(ctx context.Context, nodeID string) (string, err
 	if err != nil {
 		return "", err
 	}
-	id = node.Meta[MetaProviderID]
+	id = node.Meta[MetaInstance]
 	n.mu.Lock()
-	if n.providerID == nil {
-		n.providerID = map[string]string{}
+	if n.instance == nil {
+		n.instance = map[string]string{}
 	}
-	n.providerID[nodeID] = id
+	n.instance[nodeID] = id
 	n.mu.Unlock()
 	return id, nil
 }

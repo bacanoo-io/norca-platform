@@ -183,8 +183,8 @@ func TestReconcile_ScaleUpAndJoin(t *testing.T) {
 	}
 
 	// Two nodes join: two ready, one joining.
-	e.nodes.set(Node{ID: "n1", ProviderID: insts[0].ID, Ready: true}, Node{ID: "n2", ProviderID: insts[1].ID, Ready: true},
-		Node{ID: "other", ProviderID: "", Ready: true})
+	e.nodes.set(Node{ID: "n1", Instance: insts[0].Name, Ready: true}, Node{ID: "n2", Instance: insts[1].Name, Ready: true},
+		Node{ID: "other", Instance: "", Ready: true})
 	e.reconcile()
 	st = e.status()
 	if st["replicas"] != 2.0 || st["joining"] != 1.0 {

@@ -11,14 +11,16 @@ import (
 	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
 )
 
-// createRaw creates an instance in the mock provider with the labels.
+// createRaw creates an instance in the mock provider with the labels, named
+// after the request.
 func (e *env) createRaw(requestID string, labels map[string]string) string {
 	e.t.Helper()
-	insts, err := e.mock.Create(context.Background(), "dc1", provider.CreateRequest{RequestID: requestID, Count: 1, Labels: labels})
+	insts, err := e.mock.Create(context.Background(), "dc1", provider.CreateRequest{RequestID: requestID,
+		Instances: []provider.InstanceRequest{{Name: requestID}}, Labels: labels})
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	return insts[0].ID
+	return insts[0].Name
 }
 
 func (e *env) sweep() int {
@@ -30,9 +32,9 @@ func (e *env) sweep() int {
 	return n
 }
 
-func (e *env) has(id string) bool {
+func (e *env) has(name string) bool {
 	for _, inst := range e.instances() {
-		if inst.ID == id {
+		if inst.Name == name {
 			return true
 		}
 	}
@@ -43,13 +45,13 @@ func TestOrphans(t *testing.T) {
 	e := newEnv(t, "")
 	e.putGroup(1, nil)
 	e.reconcile()
-	owned := e.instances()[0].ID
+	owned := e.instances()[0].Name
 
 	gone := e.createRaw("r-gone", map[string]string{LabelRegion: "eu", LabelNodeGroup: "deleted-group", LabelDatacenter: "dc1", LabelPool: "workers"})
 	withNode := e.createRaw("r-node", map[string]string{LabelRegion: "eu", LabelNodeGroup: "deleted-group", LabelDatacenter: "dc1", LabelPool: "workers"})
 	otherRegion := e.createRaw("r-us", map[string]string{LabelRegion: "us", LabelNodeGroup: "deleted-group"})
 	unlabelled := e.createRaw("r-hand", nil)
-	e.nodes.set(Node{ID: "n9", ProviderID: withNode, Ready: true})
+	e.nodes.set(Node{ID: "n9", Instance: withNode, Ready: true})
 
 	// Younger than the orphan age: nothing is deleted.
 	if n := e.sweep(); n != 0 {
