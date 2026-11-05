@@ -1,0 +1,358 @@
+// SPDX-FileCopyrightText: 2026 Norca contributors
+// SPDX-License-Identifier: MPL-2.0
+
+// Package operator is the node scaling operator (norca-nodescaler): it makes
+// the machines of a NodeGroup match its scale. The core decides the scale
+// (spec.replicas, written by the built-in autoscaler, an external one or a
+// person); the operator asks the group's provider for the instances that are
+// missing, matches the nodes that join with their instances, and reports
+// what there is in the status of the group: the ready nodes (replicas), the
+// instances whose node has not joined (joining), the failed ones, the size of
+// a machine (capacity, allocatable), the instances (nodes) and the
+// conditions ProviderAvailable and Provisioned.
+//
+// A request to the provider is idempotent by its ID (region/group/number):
+// a request repeated after a failure or a restart creates nothing more. This
+// version only adds instances; removing them (scale down, the join deadline,
+// orphans) comes with the next steps.
+package operator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca/norca/api"
+	"github.com/bacanoo-io/norca/norca/controller"
+)
+
+// Config are the settings of the operator.
+type Config struct {
+	// Region is the region of the cluster: a label of the instances and the
+	// first part of the request IDs.
+	Region string
+
+	// ProviderTTL is how old the heartbeat of a provider may be (default 3
+	// minutes).
+	ProviderTTL time.Duration
+
+	// TokenNamespace is the namespace of the Variables with the tokens of the
+	// providers (default "default").
+	TokenNamespace string
+
+	// AllowHTTP accepts http endpoints of providers (development only).
+	AllowHTTP bool
+
+	// HTTP is the client of the calls to the providers; nil uses one with a
+	// 30 second timeout.
+	HTTP *http.Client
+
+	// RetryAfter is the wait after a failure of the provider (default 30
+	// seconds); JoinCheck the wait while instances join (default 15
+	// seconds).
+	RetryAfter time.Duration
+	JoinCheck  time.Duration
+
+	Logger *slog.Logger
+	Now    func() time.Time
+}
+
+// Reconciler reconciles NodeGroup objects.
+type Reconciler struct {
+	Objects controller.ObjectsAPI
+	Nodes   NodeLister
+
+	cfg       Config
+	providers *providers
+	log       *slog.Logger
+	now       func() time.Time
+}
+
+// NewReconciler returns the reconciler of node groups.
+func NewReconciler(backend controller.Backend, nodes NodeLister, cfg Config) *Reconciler {
+	if cfg.ProviderTTL <= 0 {
+		cfg.ProviderTTL = 3 * time.Minute
+	}
+	if cfg.TokenNamespace == "" {
+		cfg.TokenNamespace = "default"
+	}
+	if cfg.RetryAfter <= 0 {
+		cfg.RetryAfter = 30 * time.Second
+	}
+	if cfg.JoinCheck <= 0 {
+		cfg.JoinCheck = 15 * time.Second
+	}
+	if cfg.HTTP == nil {
+		cfg.HTTP = &http.Client{Timeout: 30 * time.Second}
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return &Reconciler{
+		Objects: backend,
+		Nodes:   nodes,
+		cfg:     cfg,
+		log:     cfg.Logger,
+		now:     cfg.Now,
+		providers: &providers{
+			objs: backend, vars: backend, ttl: cfg.ProviderTTL, tokenNamespace: cfg.TokenNamespace,
+			allowHTTP: cfg.AllowHTTP, http: cfg.HTTP, now: cfg.Now, cacheFor: 3 * time.Second,
+		},
+	}
+}
+
+// observed is what the operator found for a group.
+type observed struct {
+	instances []provider.Instance // of this group
+	capacity  *provider.Capacity
+	nodeOf    map[string]Node // the joined node of an instance, by instance ID
+}
+
+// counts returns the ready nodes, the instances whose node has not joined,
+// the failed instances and the live instances (creating or running).
+func (o *observed) counts() (ready, joining, failed, live int64) {
+	for _, inst := range o.instances {
+		switch inst.State {
+		case provider.StateFailed:
+			failed++
+			continue
+		case provider.StateCreating, provider.StateRunning:
+			live++
+		default:
+			continue
+		}
+		if n, ok := o.nodeOf[inst.ID]; ok && n.Ready {
+			ready++
+		} else {
+			joining++
+		}
+	}
+	return ready, joining, failed, live
+}
+
+// Reconcile implements controller.Reconciler.
+func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (time.Duration, error) {
+	obj, err := r.Objects.ReadObject(ctx, NodeGroupKind, key.Namespace, key.Name)
+	if errors.Is(err, controller.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if obj.DeletionTime != 0 {
+		// The deletion of a group (spec.deletion) comes with scale down.
+		return 0, nil
+	}
+	spec, err := decodeSpec(obj.Spec)
+	if err != nil {
+		r.log.Warn("node group skipped", "group", obj.Name, "error", err)
+		return 0, nil
+	}
+	if !spec.enabled() || spec.Provider == "" {
+		// A disabled group, or one without a provider (an external engine
+		// that brings its own machines), is left alone.
+		return 0, nil
+	}
+	group := spec.providerGroup()
+	now := r.now()
+
+	client, err := r.providers.client(ctx, spec.Provider, group)
+	if un, ok := errors.AsType[*errUnavailable](err); ok {
+		return r.unavailable(ctx, obj, un.reason, un.message)
+	}
+	if err != nil {
+		return 0, err
+	}
+	pg, err := client.Group(ctx, group, spec.Node.Parameters)
+	if errors.Is(err, provider.ErrUnknownGroup) {
+		return r.unavailable(ctx, obj, "UnknownGroup", fmt.Sprintf("provider %q has no group %q", spec.Provider, group))
+	}
+	if err != nil {
+		return r.unavailable(ctx, obj, "ProviderUnavailable", fmt.Sprintf("provider %q: %v", spec.Provider, err))
+	}
+
+	o := &observed{capacity: pg.Capacity, nodeOf: map[string]Node{}}
+	for _, inst := range pg.Instances {
+		if inst.Labels[LabelNodeGroup] == obj.Name && (inst.Labels[LabelRegion] == "" || inst.Labels[LabelRegion] == r.cfg.Region) {
+			o.instances = append(o.instances, inst)
+		}
+	}
+	nodes, err := r.Nodes.Nodes(ctx, spec.Datacenter, spec.Pool, spec.NodeClass)
+	if err != nil {
+		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
+	}
+	for _, n := range nodes {
+		if n.ProviderID != "" {
+			o.nodeOf[n.ProviderID] = n
+		}
+	}
+
+	// Ask for the instances that are missing.
+	want := spec.replicas()
+	_, _, _, live := o.counts()
+	seq := r.nextRequest(obj, o.instances)
+	provisioned := condition{Type: CondProvisioned, Status: "True", Reason: "Requested",
+		Message: fmt.Sprintf("%d instances for a scale of %d", live, want)}
+	requested, createFailed := false, false
+	if want > live {
+		req := provider.CreateRequest{
+			RequestID:  r.requestID(obj.Name, seq),
+			Count:      int(want - live),
+			Parameters: spec.Node.Parameters,
+			Labels: map[string]string{
+				LabelRegion: r.cfg.Region, LabelPool: spec.Pool, LabelDatacenter: spec.Datacenter,
+				LabelClass: spec.NodeClass, LabelNodeGroup: obj.Name, LabelRequest: r.requestID(obj.Name, seq),
+			},
+		}
+		created, err := client.Create(ctx, group, req)
+		if err != nil {
+			createFailed = true
+			reason := provider.ReasonOf(err)
+			provisioned = condition{Type: CondProvisioned, Status: "False", Reason: reasonName(reason),
+				Message: fmt.Sprintf("provider %q could not create %d instances: %v", spec.Provider, req.Count, err)}
+			r.event(ctx, obj, api.ObjectEventTypeWarning, "CreateFailed", provisioned.Message)
+		} else {
+			requested = true
+			for _, inst := range created {
+				if !slices.ContainsFunc(o.instances, func(i provider.Instance) bool { return i.ID == inst.ID }) {
+					o.instances = append(o.instances, inst)
+				}
+			}
+			_, _, _, live = o.counts()
+			provisioned.Message = fmt.Sprintf("%d instances for a scale of %d", live, want)
+			r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
+				fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, req.Count, req.RequestID))
+		}
+	}
+
+	ready, joining, failed, _ := o.counts()
+	err = r.writeStatus(ctx, obj, func(status map[string]any) {
+		status["replicas"] = ready
+		status["joining"] = joining
+		status["failed"] = failed
+		status["nodes"] = nodeRecords(o)
+		if o.capacity != nil {
+			status["capacity"] = map[string]any{"cpu": o.capacity.CPU, "memory": o.capacity.Memory, "disk": o.capacity.Disk}
+			status["allocatable"] = allocatable(*o.capacity, spec.Node.Reserved)
+		}
+		if requested {
+			status["lastRequest"] = seq
+		}
+		status["observedGeneration"] = obj.Generation
+		setCondition(status, condition{Type: CondProviderAvailable, Status: "True", Reason: "Available"}, now)
+		setCondition(status, provisioned, now)
+	})
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case createFailed:
+		// The failure is in the condition and the event; the provider is
+		// asked again after a while, not at the pace of the error backoff.
+		return r.cfg.RetryAfter, nil
+	case joining > 0:
+		return r.cfg.JoinCheck, nil
+	}
+	return 0, nil
+}
+
+// unavailable reports a provider that can't be used and tries again later.
+func (r *Reconciler) unavailable(ctx context.Context, obj *api.CustomObject, reason, message string) (time.Duration, error) {
+	now := r.now()
+	err := r.writeStatus(ctx, obj, func(status map[string]any) {
+		status["observedGeneration"] = obj.Generation
+		setCondition(status, condition{Type: CondProviderAvailable, Status: "False", Reason: reason, Message: message}, now)
+	})
+	return r.cfg.RetryAfter, err
+}
+
+// requestID is the ID of the request with the number.
+func (r *Reconciler) requestID(group string, seq int64) string {
+	return r.cfg.Region + "/" + group + "/" + strconv.FormatInt(seq, 10)
+}
+
+// nextRequest is the number of the next request: one more than the last in
+// the status and the last one an instance was created by. When a request
+// created instances and its number could not be written to the status, the
+// instances still carry it, so a later request gets a new number; when the
+// instances are not listed yet, the number is used again, and the provider
+// answers with the instances of the first request.
+func (r *Reconciler) nextRequest(obj *api.CustomObject, instances []provider.Instance) int64 {
+	last := lastRequest(normalize(obj.Status))
+	prefix := r.cfg.Region + "/" + obj.Name + "/"
+	for _, inst := range instances {
+		if n, err := strconv.ParseInt(strings.TrimPrefix(inst.RequestID, prefix), 10, 64); err == nil &&
+			strings.HasPrefix(inst.RequestID, prefix) && n > last {
+			last = n
+		}
+	}
+	return last + 1
+}
+
+// nodeRecords is status.nodes: an entry per instance with its node.
+func nodeRecords(o *observed) []any {
+	insts := slices.Clone(o.instances)
+	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.ID, b.ID) })
+	out := make([]any, 0, len(insts))
+	for _, inst := range insts {
+		rec := map[string]any{
+			"instance": inst.ID, "state": inst.State, "request": inst.RequestID,
+			"created": inst.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		if inst.Reason != "" {
+			rec["reason"] = inst.Reason
+		}
+		if n, ok := o.nodeOf[inst.ID]; ok {
+			rec["node"] = n.ID
+			rec["ready"] = n.Ready
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// allocatable is the capacity less the reserved resources.
+func allocatable(c provider.Capacity, reserved *nodeResource) map[string]any {
+	var res nodeResource
+	if reserved != nil {
+		res = *reserved
+	}
+	return map[string]any{
+		"cpu":    max(c.CPU-res.CPU, 0),
+		"memory": max(c.Memory-res.Memory, 0),
+		"disk":   max(c.Disk-res.Disk, 0),
+	}
+}
+
+// reasonName is the CamelCase reason of a condition for a provider reason.
+func reasonName(reason string) string {
+	switch reason {
+	case provider.ReasonQuota:
+		return "Quota"
+	case provider.ReasonNoCapacity:
+		return "NoCapacity"
+	case provider.ReasonInvalid:
+		return "Invalid"
+	}
+	return "ProviderError"
+}
+
+// event writes an event to the log of the group; a failure is logged only.
+func (r *Reconciler) event(ctx context.Context, obj *api.CustomObject, typ, reason, message string) {
+	err := r.Objects.RecordObjectEvents(ctx, NodeGroupKind, obj.Namespace, obj.Name,
+		[]*api.ObjectEvent{{Type: typ, Reason: reason, Message: message}})
+	if err != nil {
+		r.log.Warn("writing an event failed", "group", obj.Name, "reason", reason, "error", err)
+	}
+}

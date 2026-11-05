@@ -1,0 +1,159 @@
+// SPDX-FileCopyrightText: 2026 Norca contributors
+// SPDX-License-Identifier: MPL-2.0
+
+// Command norca-nodescaler is the node scaling operator: it makes the
+// machines of every NodeGroup match its scale, through the group's node
+// provider (a registered NodeProvider). It runs as a job of the cluster,
+// outside the pools it scales, with two instances and leader election.
+//
+// The Norca API is read from the environment (NORCA_ADDR, NORCA_TOKEN); as a
+// job, NORCA_ADDR=unix://${NORCA_SECRETS_DIR}/api.sock with the workload
+// identity. The token needs read and write-status (and write-events) on the
+// objects of norca.io/NodeGroup, read on norca.io/NodeProvider, node read,
+// and read on the Variables with the tokens of the providers.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/bacanoo-io/norca-platform/nodescaler/operator"
+	"github.com/bacanoo-io/norca/norca/controller"
+)
+
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "norca-nodescaler:", err)
+		os.Exit(1)
+	}
+}
+
+type flags struct {
+	region         string
+	providerTTL    time.Duration
+	allowHTTP      bool
+	tokenNamespace string
+	workers        int
+	resync         time.Duration
+	leaderElection bool
+	leaseNamespace string
+	metricsAddr    string
+	logLevel       string
+	showVersion    bool
+}
+
+func parseFlags(args []string) (*flags, error) {
+	var f flags
+	fs := flag.NewFlagSet("norca-nodescaler", flag.ContinueOnError)
+	fs.StringVar(&f.region, "region", envOr("NORCA_REGION", "global"), "region of the cluster: a label of the instances and part of the request IDs")
+	fs.DurationVar(&f.providerTTL, "provider-ttl", 3*time.Minute, "how old the heartbeat of a NodeProvider may be")
+	fs.BoolVar(&f.allowHTTP, "provider-allow-http", false, "accept http endpoints of providers (development only)")
+	fs.StringVar(&f.tokenNamespace, "token-namespace", "default", "namespace of the Variables with the tokens of the providers")
+	fs.IntVar(&f.workers, "workers", 2, "concurrent reconciles")
+	fs.DurationVar(&f.resync, "resync", 5*time.Minute, "period of full resynchronization")
+	fs.BoolVar(&f.leaderElection, "leader-election", true, "reconcile only on the elected leader")
+	fs.StringVar(&f.leaseNamespace, "lease-namespace", "default", "namespace of the lease Variable")
+	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "address of the /metrics endpoint (disabled if empty)")
+	fs.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn or error")
+	fs.BoolVar(&f.showVersion, "version", false, "print the version and exit")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	if f.region == "" {
+		return nil, errors.New("-region must not be empty")
+	}
+	if f.workers < 1 {
+		return nil, errors.New("-workers must be at least 1")
+	}
+	return &f, nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func run(ctx context.Context, args []string) error {
+	f, err := parseFlags(args)
+	if err != nil {
+		return err
+	}
+	if f.showVersion {
+		fmt.Println(version)
+		return nil
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(f.logLevel)); err != nil {
+		return fmt.Errorf("-log-level: %w", err)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+
+	client, err := controller.NewAPIClient()
+	if err != nil {
+		return err
+	}
+	backend := controller.NewBackend(client)
+	metrics := controller.NewTextMetrics()
+	if f.metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics)
+		srv := &http.Server{Addr: f.metricsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics endpoint failed", "error", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			_ = srv.Close()
+		}()
+	}
+
+	rec := operator.NewReconciler(backend, &operator.APINodes{Client: client}, operator.Config{
+		Region:         f.region,
+		ProviderTTL:    f.providerTTL,
+		TokenNamespace: f.tokenNamespace,
+		AllowHTTP:      f.allowHTTP,
+		Logger:         logger,
+	})
+	var election *controller.LeaderElectionConfig
+	if f.leaderElection {
+		election = &controller.LeaderElectionConfig{Namespace: f.leaseNamespace, ReleaseOnCancel: true}
+	}
+	ctrl, err := controller.New(backend, rec, controller.Options{
+		Name:    "nodescaler",
+		Kind:    operator.NodeGroupKind,
+		Storage: controller.StorageNative,
+		// Node groups are cluster-scoped.
+		Namespace:      "*",
+		Workers:        f.workers,
+		ResyncPeriod:   f.resync,
+		LeaderElection: election,
+		Metrics:        metrics,
+		Logger:         logger,
+	})
+	if err != nil {
+		return err
+	}
+	logger.Info("starting the node scaling operator", "version", version, "region", f.region)
+	if err := ctrl.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}

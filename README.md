@@ -24,11 +24,37 @@ nodescaler/provider/        the contract between the node scaling operator and a
                             the types, the HTTP server a provider uses, the client the operator uses
 nodescaler/provider/mock/   a node provider in memory, for trials and tests
 nodescaler/registrar/       the NodeProvider object of a provider and its heartbeat
+nodescaler/operator/         the operator: reconciles the NodeGroup objects with their providers
 cmd/nodeprovider/           a node provider program (type mock)
+cmd/norca-nodescaler/       the operator program
 ```
 
-The operator itself (`nodescaler/operator/`, `cmd/norca-nodescaler/`) comes
-next.
+## The operator
+
+`norca-nodescaler` reconciles every `norca.io/NodeGroup` with a `provider`:
+it asks the provider for the instances the scale (`spec.replicas`) is
+missing, in a request that is idempotent by its ID (`<region>/<group>/<n>`),
+matches the nodes that join with their instances by the meta key
+`norca.provider_id`, and writes the status of the group:
+
+| Field | Meaning |
+| --- | --- |
+| `replicas` | Ready nodes of the group's instances. |
+| `joining` | Live instances whose node has not joined yet. |
+| `failed` | Instances the provider reports as failed. |
+| `capacity`, `allocatable` | The size of a machine from the provider, less `spec.node.reserved`. |
+| `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, and `node`, `ready` once it joined. |
+| `lastRequest` | The number of the last request. |
+| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`) and `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`). |
+
+The status is shared with the autoscaler (`status.decision`): the operator
+changes only its own fields and writes with the index it read. This version
+adds instances; the join deadline, orphans, scale down and the bootstrap of
+a machine come next.
+
+```shell
+norca-nodescaler -region eu -provider-ttl 3m -token-namespace default
+```
 
 ## The node provider contract
 
