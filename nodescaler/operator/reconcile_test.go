@@ -21,8 +21,27 @@ import (
 
 // fakeNodes is a NodeLister with the nodes set by the test.
 type fakeNodes struct {
-	mu    sync.Mutex
-	nodes []Node
+	mu         sync.Mutex
+	nodes      []Node
+	ineligible []string
+}
+
+func (f *fakeNodes) SetIneligible(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ineligible = append(f.ineligible, id)
+	for i := range f.nodes {
+		if f.nodes[i].ID == id {
+			f.nodes[i].Eligible = false
+		}
+	}
+	return nil
+}
+
+func (f *fakeNodes) madeIneligible() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ineligible...)
 }
 
 func (f *fakeNodes) Nodes(context.Context, string, string, string) ([]Node, error) {

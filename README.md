@@ -50,7 +50,8 @@ The operator writes the status of the group:
 | `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
 | `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
-| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`) and `JoinFailing` (`TooManyFailures`). |
+| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`), `JoinFailing` (`TooManyFailures`) and `ForeignNode`. |
+| `strayNodes` | Nodes of the group without an instance: `node`, `name`, `instance`, `kind` (`gone`: down, what is left of a deleted instance; `foreign`: ready). |
 
 **The join of the nodes.** An instance whose node has not joined by
 `join.deadline` (15 minutes) is deleted, and so is one the provider reports
@@ -85,6 +86,16 @@ writes the files and starts the agent. Every certificate is an event
 (`CertificateIssued`: serial and expiry). Without the Variable no instance is
 asked for (`Provisioned` False, `NoBootstrap`); `-bootstrap=false` sends only
 the names, for a provider that brings its own machines.
+
+**Nodes without an instance.** A node with the marks of the group whose
+instance the provider does not have is reported: down, it is what is left of
+a deleted instance (`NodeWithoutInstance`); ready, it runs without a machine
+the operator asked for, with a bootstrap that left through the user data for
+example, and is foreign (`ForeignNode`): the operator makes it ineligible
+for new work. So is a second ready node with the name of an instance that
+has one (the first that registered is the node of the instance; a machine
+that came up again leaves its old node down and is not foreign). Nodes
+without the marks are left alone. This detects; it does not prevent.
 
 **Orphans.** Every `-orphan-sweep` (5 minutes) the leader looks at the groups
 of the available providers: an instance of this region whose node group is

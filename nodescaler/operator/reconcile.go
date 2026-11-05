@@ -208,15 +208,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
-	for _, n := range nodes {
-		if n.Instance != "" {
-			o.nodeOf[n.Instance] = n
-		}
-	}
+	strays := matchNodes(obj.Name, o, nodes)
+
+	// Nodes without an instance: reported, the foreign ones made ineligible.
+	prevStatus := normalize(obj.Status)
+	strayRecords, foreignCond := r.handleStrays(ctx, obj, strays, prevStatus)
 
 	// The join of the nodes: failed and late instances are deleted, slow ones
 	// marked.
-	prevStatus := normalize(obj.Status)
 	js := r.trackJoins(ctx, obj, client, group, spec, o, prevStatus, now)
 	failing := js.Failures >= spec.maxFailures()
 	if failing && readJoinState(prevStatus).Failures < spec.maxFailures() {
@@ -292,6 +291,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 			status["lastRequest"] = seq
 		}
 		status["join"] = js.doc()
+		status["strayNodes"] = strayRecords
+		setCondition(status, foreignCond, now)
 		setCondition(status, joinCondition(js, spec.maxFailures()), now)
 		status["observedGeneration"] = obj.Generation
 		setCondition(status, condition{Type: CondProviderAvailable, Status: "True", Reason: "Available"}, now)

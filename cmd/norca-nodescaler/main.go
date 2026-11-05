@@ -9,7 +9,8 @@
 // The Norca API is read from the environment (NORCA_ADDR, NORCA_TOKEN); as a
 // job, NORCA_ADDR=unix://${NORCA_SECRETS_DIR}/api.sock with the workload
 // identity. The token needs read and write-status (and write-events) on the
-// objects of norca.io/NodeGroup, read on norca.io/NodeProvider, node read,
+// objects of norca.io/NodeGroup, read on norca.io/NodeProvider, node read
+// and write (a foreign node is made ineligible),
 // and read on the Variables with the tokens of the providers and on the
 // bootstrap Variable (nodescaler/bootstrap/<region>), which holds the key of
 // the node CA and must be readable by the operator only.
