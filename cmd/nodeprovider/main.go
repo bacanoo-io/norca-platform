@@ -3,7 +3,9 @@
 
 // Command nodeprovider is a node provider: it serves the provider contract
 // of the node scaling operator over HTTP and registers itself in Norca as a
-// NodeProvider object with a heartbeat. The type "mock" keeps the instances
+// NodeProvider object with a heartbeat. The type "docker" runs each instance
+// as a container on this host with the agent of its bootstrap (the lab); the
+// type "mock" keeps the instances
 // in memory and creates no machine, for trials and tests.
 //
 //	nodeprovider -name mock -listen :8480 -endpoint http://10.0.0.5:8480 \
@@ -29,6 +31,7 @@ import (
 	"time"
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca-platform/nodescaler/provider/docker"
 	"github.com/bacanoo-io/norca-platform/nodescaler/provider/mock"
 	"github.com/bacanoo-io/norca-platform/nodescaler/registrar"
 )
@@ -77,7 +80,11 @@ func run(args []string) error {
 	var (
 		groups        groupFlags
 		name          = fs.String("name", "", "name of the NodeProvider object (required)")
-		typ           = fs.String("type", "mock", "the provider type (mock)")
+		typ           = fs.String("type", "mock", "the provider type: mock or docker")
+		dockerImage   = fs.String("docker-image", "debian:bookworm-slim", "docker: the image of the containers")
+		dockerBinary  = fs.String("docker-binary", "/usr/local/bin/norca", "docker: the norca binary of the host, mounted into the containers")
+		dockerState   = fs.String("docker-state-dir", "/var/lib/norca-nodeprovider", "docker: where the files of the nodes are written")
+		dockerNetwork = fs.String("docker-network", "bridge", "docker: the network of the containers")
 		listen        = fs.String("listen", ":8480", "address to serve the provider contract on")
 		endpoint      = fs.String("endpoint", "", "the URL the operator calls (default http://<listen>)")
 		tokenFile     = fs.String("token-file", "", "file with the bearer token the operator must send")
@@ -97,8 +104,8 @@ func run(args []string) error {
 	if *name == "" {
 		return errors.New("-name is required")
 	}
-	if *typ != "mock" {
-		return fmt.Errorf("unknown type %q (linked types: mock)", *typ)
+	if *typ != "mock" && *typ != "docker" {
+		return fmt.Errorf("unknown type %q (linked types: mock, docker)", *typ)
 	}
 	if len(groups) == 0 {
 		return errors.New("at least one -group is required")
@@ -136,12 +143,26 @@ func run(args []string) error {
 		*endpoint = "http://" + host
 	}
 
+	var impl provider.Provider = mock.New(configs)
+	if *typ == "docker" {
+		groups := map[string]docker.GroupConfig{}
+		for name, cfg := range configs {
+			groups[name] = docker.GroupConfig{Capacity: cfg.Capacity, Max: cfg.Max}
+		}
+		d, err := docker.New(docker.Config{Groups: groups, Image: *dockerImage, Binary: *dockerBinary,
+			StateDir: *dockerState, Network: *dockerNetwork})
+		if err != nil {
+			return err
+		}
+		impl = d
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           provider.NewHandler(mock.New(configs), token, log),
+		Handler:           provider.NewHandler(impl, token, log),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)

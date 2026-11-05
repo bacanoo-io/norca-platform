@@ -143,3 +143,46 @@ func TestParse(t *testing.T) {
 		t.Fatal("an unknown field is rendered")
 	}
 }
+
+func TestDecodeReadsRender(t *testing.T) {
+	items, _ := bootstraptest.Items(t)
+	tmpl, err := Parse("eu", items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := tmpl.Render(Node{Name: "workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Decode(r.UserData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Hostname != "workers-dc1-1-1" || len(d.Files) != 4 || len(d.RunCmd) != 1 {
+		t.Fatalf("document: %+v", d)
+	}
+	want := files(t, r.UserData)
+	for _, f := range d.Files {
+		if string(f.Content) != string(want[f.Path]) {
+			t.Errorf("%s: content differs", f.Path)
+		}
+		if f.Path == "/etc/norca/tls/client-key.pem" && f.Mode != 0o600 {
+			t.Errorf("the key has mode %o", f.Mode)
+		}
+	}
+	if cfg, err := d.ConfigFile(); err != nil || cfg != "/etc/norca/norca.hcl" {
+		t.Fatalf("config file %q %v", cfg, err)
+	}
+
+	for name, doc := range map[string]string{
+		"not cloud-config": "hostname: x\n",
+		"unknown key":      "#cloud-config\nusers:\n  - a\n",
+		"other encoding":   "#cloud-config\nwrite_files:\n  - path: /a\n    encoding: gzip\n",
+		"relative path":    "#cloud-config\nwrite_files:\n  - path: a\n",
+		"bad base64":       "#cloud-config\nwrite_files:\n  - path: /a\n    content: !!!\n",
+	} {
+		if _, err := Decode(doc); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

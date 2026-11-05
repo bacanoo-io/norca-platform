@@ -23,10 +23,11 @@ keeps its credentials.
 nodescaler/provider/        the contract between the node scaling operator and a node provider:
                             the types, the HTTP server a provider uses, the client the operator uses
 nodescaler/provider/mock/   a node provider in memory, for trials and tests
+nodescaler/provider/docker/ a node provider whose machines are containers on its host, for the lab
 nodescaler/registrar/       the NodeProvider object of a provider and its heartbeat
 nodescaler/operator/        the operator: reconciles the NodeGroup objects with their providers
 nodescaler/bootstrap/       the bootstrap of a machine: the node's certificate and agent configuration, as cloud-init
-cmd/nodeprovider/           a node provider program (type mock)
+cmd/nodeprovider/           a node provider program (types mock and docker)
 cmd/norca-nodescaler/       the operator program
 ```
 
@@ -120,6 +121,19 @@ of `nodescaler/provider`.
 ```shell
 nodeprovider -name mock -listen :8480 -endpoint http://10.0.0.5:8480 \
   -group dc1:4000:8192:40000:10 -token-file /secrets/token
+```
+
+**The docker provider** (`-type docker`) runs each instance as a container on
+the host it runs on: it reads the files back from the cloud-init document of
+the instance, writes them under `-docker-state-dir` and mounts them read-only
+at their paths, mounts the norca binary of the host (`-docker-binary`), and
+runs `norca agent -config <the .hcl file>` in `-docker-image` (a privileged
+container with the host's cgroups, named after the instance). The containers
+carry the labels of the request, so a restart of the provider loses nothing.
+It is for the lab and for trials, not for production.
+
+```shell
+nodeprovider -name lab -type docker -listen :8480 -endpoint http://10.0.0.5:8480   -group dc2:2000:1024:10000:3 -docker-state-dir /var/lib/norca-nodeprovider
 ```
 
 ## Development
