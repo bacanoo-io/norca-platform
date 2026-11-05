@@ -119,3 +119,15 @@ func lastRequest(status map[string]any) int64 {
 	}
 	return 0
 }
+
+// conditionStatusOf returns the status of a condition of a status.
+func conditionStatusOf(status map[string]any, typ string) string {
+	list, _ := status["conditions"].([]any)
+	for _, item := range list {
+		if m, ok := item.(map[string]any); ok && m["type"] == typ {
+			s, _ := m["status"].(string)
+			return s
+		}
+	}
+	return ""
+}

@@ -61,6 +61,7 @@ type flags struct {
 	bootstrap      bool
 	bootstrapVar   string
 	bootstrapNS    string
+	networkVar     string
 }
 
 func parseFlags(args []string) (*flags, error) {
@@ -82,6 +83,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.bootstrap, "bootstrap", true, "send each instance a bootstrap with the certificate and the configuration of its node")
 	fs.StringVar(&f.bootstrapVar, "bootstrap-variable", "", "Variable with the bootstrap template of the region (default nodescaler/bootstrap/<region>)")
 	fs.StringVar(&f.bootstrapNS, "bootstrap-namespace", "default", "namespace of the bootstrap Variable")
+	fs.StringVar(&f.networkVar, "network-variable", "", "Variable with the cluster ranges of the region, in the namespace of the bootstrap (default nodescaler/network/<region>)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -93,6 +95,9 @@ func parseFlags(args []string) (*flags, error) {
 	}
 	if f.bootstrapVar == "" {
 		f.bootstrapVar = "nodescaler/bootstrap/" + f.region
+	}
+	if f.networkVar == "" {
+		f.networkVar = "nodescaler/network/" + f.region
 	}
 	return &f, nil
 }
@@ -147,6 +152,7 @@ func run(ctx context.Context, args []string) error {
 	}
 	rec := operator.NewReconciler(backend, &operator.APINodes{Client: client}, operator.Config{
 		Bootstrap:      boot,
+		Network:        &operator.VariableNetwork{Vars: backend, Namespace: f.bootstrapNS, Path: f.networkVar},
 		Region:         f.region,
 		ProviderTTL:    f.providerTTL,
 		TokenNamespace: f.tokenNamespace,

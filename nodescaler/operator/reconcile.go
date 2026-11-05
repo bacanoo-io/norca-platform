@@ -71,6 +71,10 @@ type Config struct {
 	// no bootstrap, only the names of the instances.
 	Bootstrap BootstrapSource
 
+	// Network gives the cluster ranges of the region, which the network of
+	// a group is checked against; nil leaves the check out.
+	Network NetworkSource
+
 	Logger *slog.Logger
 	Now    func() time.Time
 }
@@ -213,6 +217,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// Nodes without an instance: reported, the foreign ones made ineligible.
 	prevStatus := normalize(obj.Status)
 	strayRecords, foreignCond := r.handleStrays(ctx, obj, strays, prevStatus)
+	netCond := r.networkCondition(ctx, spec)
+	if netCond.Status == "False" && conditionStatusOf(prevStatus, CondNetworkCovered) != "False" {
+		r.event(ctx, obj, api.ObjectEventTypeWarning, "NetworkNotCovered", netCond.Message)
+	}
 
 	// The join of the nodes: failed and late instances are deleted, slow ones
 	// marked.
@@ -293,6 +301,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		status["join"] = js.doc()
 		status["strayNodes"] = strayRecords
 		setCondition(status, foreignCond, now)
+		setCondition(status, netCond, now)
 		setCondition(status, joinCondition(js, spec.maxFailures()), now)
 		status["observedGeneration"] = obj.Generation
 		setCondition(status, condition{Type: CondProviderAvailable, Status: "True", Reason: "Available"}, now)

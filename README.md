@@ -50,7 +50,7 @@ The operator writes the status of the group:
 | `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
 | `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
-| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`), `JoinFailing` (`TooManyFailures`) and `ForeignNode`. |
+| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`), `JoinFailing` (`TooManyFailures`), `ForeignNode` and `NetworkCovered` (`Covered`, `NotCovered`, `NetworkUnchecked`, `NoNetwork`). |
 | `strayNodes` | Nodes of the group without an instance: `node`, `name`, `instance`, `kind` (`gone`: down, what is left of a deleted instance; `foreign`: ready). |
 
 **The join of the nodes.** An instance whose node has not joined by
@@ -96,6 +96,14 @@ for new work. So is a second ready node with the name of an instance that
 has one (the first that registered is the node of the instance; a machine
 that came up again leaves its old node down and is not foreign). Nodes
 without the marks are left alone. This detects; it does not prevent.
+
+**The network of a group.** The firewall of the servers must let the nodes
+in: the range of a group (`spec.network`) must be inside the cluster ranges
+of the region, which the deployer publishes in the Variable
+`nodescaler/network/<region>` (`-network-variable`). The condition
+`NetworkCovered` says whether it is (an event `NetworkNotCovered` when it
+turns false); without the Variable it is `NetworkUnchecked`. It only warns:
+the instances are asked for anyway.
 
 **Orphans.** Every `-orphan-sweep` (5 minutes) the leader looks at the groups
 of the available providers: an instance of this region whose node group is

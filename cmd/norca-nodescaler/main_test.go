@@ -16,7 +16,7 @@ func TestParseFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if f.region != "eu" || f.providerTTL != 3*time.Minute || !f.leaderElection || f.workers != 2 ||
-		!f.bootstrap || f.bootstrapVar != "nodescaler/bootstrap/eu" {
+		!f.bootstrap || f.bootstrapVar != "nodescaler/bootstrap/eu" || f.networkVar != "nodescaler/network/eu" {
 		t.Fatalf("defaults: %+v", f)
 	}
 	for args, want := range map[string]string{

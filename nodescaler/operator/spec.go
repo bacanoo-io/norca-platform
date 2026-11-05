@@ -60,6 +60,7 @@ type groupSpec struct {
 	Max        int64  `json:"max"`
 	Provider   string `json:"provider"`
 	Group      string `json:"group"`
+	Network    string `json:"network"`
 	Node       struct {
 		Meta       map[string]string `json:"meta"`
 		Reserved   *nodeResource     `json:"reserved"`
