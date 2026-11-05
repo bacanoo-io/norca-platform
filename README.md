@@ -24,7 +24,7 @@ nodescaler/provider/        the contract between the node scaling operator and a
                             the types, the HTTP server a provider uses, the client the operator uses
 nodescaler/provider/mock/   a node provider in memory, for trials and tests
 nodescaler/registrar/       the NodeProvider object of a provider and its heartbeat
-nodescaler/operator/         the operator: reconciles the NodeGroup objects with their providers
+nodescaler/operator/        the operator: reconciles the NodeGroup objects with their providers
 cmd/nodeprovider/           a node provider program (type mock)
 cmd/norca-nodescaler/       the operator program
 ```
