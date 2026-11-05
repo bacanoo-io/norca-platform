@@ -29,6 +29,13 @@ type fakeDocker struct {
 	containers map[string]*container
 	runs       [][]string
 	failRun    error
+	logs       map[string]string
+}
+
+func (f *fakeDocker) Logs(_ context.Context, name string, _ int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logs[name], nil
 }
 
 func (f *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
@@ -215,8 +222,10 @@ func TestDocker_LimitsAndFailures(t *testing.T) {
 	}
 	fd.containers["c-1"].State.Status = "exited"
 	fd.containers["c-1"].State.ExitCode = 1
+	fd.logs = map[string]string{"c-1": "==> Loaded configuration\nError starting agent: client setup failed\n"}
 	g, _ := p.Group(ctx, "dc1", nil)
-	if g.Instances[0].State != provider.StateFailed || !strings.Contains(g.Instances[0].Message, "exit code 1") {
+	if g.Instances[0].State != provider.StateFailed || !strings.Contains(g.Instances[0].Message, "exit code 1") ||
+		!strings.Contains(g.Instances[0].Message, "last output: ==> Loaded configuration | Error starting agent: client setup failed") {
 		t.Fatalf("instance: %+v", g.Instances[0])
 	}
 

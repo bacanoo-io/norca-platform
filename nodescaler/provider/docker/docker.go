@@ -45,6 +45,10 @@ const (
 // Runner runs the docker command line.
 type Runner interface {
 	Run(ctx context.Context, args ...string) (string, error)
+
+	// Logs returns the last lines a container wrote, its output and its
+	// errors together.
+	Logs(ctx context.Context, name string, lines int) (string, error)
 }
 
 // CLI runs the docker binary.
@@ -64,6 +68,26 @@ func (c CLI) Run(ctx context.Context, args ...string) (string, error) {
 	}
 	return stdout.String(), nil
 }
+
+// Logs implements Runner.
+func (c CLI) Logs(ctx context.Context, name string, lines int) (string, error) {
+	bin := c.Bin
+	if bin == "" {
+		bin = "docker"
+	}
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, bin, "logs", "--tail", fmt.Sprint(lines), name) //nolint:gosec // G204: as Run
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// failureLogLines and failureLogBytes bound what the message of a failed
+// instance carries of the output of its container.
+const (
+	failureLogLines = 8
+	failureLogBytes = 800
+)
 
 // GroupConfig is a group of the provider.
 type GroupConfig struct {
@@ -162,10 +186,34 @@ func (p *Provider) instances(ctx context.Context, group string) ([]provider.Inst
 	}
 	insts := make([]provider.Instance, 0, len(cs))
 	for _, c := range cs {
-		insts = append(insts, instanceOf(c))
+		inst := instanceOf(c)
+		if inst.State == provider.StateFailed {
+			// The operator deletes a failed instance, and the output of the
+			// container with it: the reason goes into the message.
+			if logs, err := p.cfg.Docker.Logs(ctx, inst.ID, failureLogLines); err == nil && strings.TrimSpace(logs) != "" {
+				inst.Message += "; last output: " + lastOutput(logs)
+			}
+		}
+		insts = append(insts, inst)
 	}
 	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.ID, b.ID) })
 	return insts, nil
+}
+
+// lastOutput joins the lines of the output of a container into one line,
+// bounded, the last part kept.
+func lastOutput(logs string) string {
+	var lines []string
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	out := strings.Join(lines, " | ")
+	if len(out) > failureLogBytes {
+		out = "..." + out[len(out)-failureLogBytes:]
+	}
+	return out
 }
 
 // instanceOf maps a container to an instance.
