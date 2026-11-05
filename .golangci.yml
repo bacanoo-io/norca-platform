@@ -1,0 +1,67 @@
+# golangci-lint v2. A baseline, not the strictest set: it looks for bugs and
+# security problems. Style linters (wsl, paralleltest, gocyclo, revive, ...) are
+# left out on purpose; the full list is in the golang-lint skill.
+#
+# The code base is clean under this set: every finding is fixed, or an exception
+# with a //nolint and the reason. A new finding fails CI.
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # correctness
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - errcheck
+    - errorlint
+    - nilerr
+    - forcetypeassert
+    - copyloopvar
+    # security and resources
+    - gosec
+    - noctx
+    - bodyclose
+    # hygiene
+    - misspell
+    - unconvert
+    - usestdlibvars
+    - intrange
+    - modernize
+    - nolintlint
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gosec:
+      excludes:
+        - G304 # the programs read the files their flags name
+    staticcheck:
+      # The QF checks are quick-fix suggestions (fmt.Fprintf instead of
+      # WriteString(Sprintf), De Morgan), not bugs.
+      checks: ["all", "-QF*", "-ST1000", "-ST1003", "-ST1005", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+          - forcetypeassert
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

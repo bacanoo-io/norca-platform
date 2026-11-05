@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# go.mod takes the Norca API from the checkout next to this repository
+# (replace => ../norca/norca/api): every job checks out both side by side.
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: norca-platform
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: norca-platform
+
+      - uses: actions/checkout@v6
+        with:
+          repository: bacanoo-io/norca
+          path: norca
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: norca-platform/go.mod
+          cache-dependency-path: norca-platform/go.sum
+
+      - name: Verify dependencies
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -shuffle=on -count=1 ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: norca-platform
+
+      - uses: actions/checkout@v6
+        with:
+          repository: bacanoo-io/norca
+          path: norca
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: norca-platform/go.mod
+          cache-dependency-path: norca-platform/go.sum
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          working-directory: norca-platform
+
+  vulncheck:
+    name: Vulnerability check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: norca-platform
+
+      - uses: actions/checkout@v6
+        with:
+          repository: bacanoo-io/norca
+          path: norca
+
+      # The Go directive of go.mod names the patched toolchain: the standard
+      # library of an older patch release carries the vulnerabilities.
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: norca-platform/go.mod
+          work-dir: norca-platform
+          go-package: ./...

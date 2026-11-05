@@ -1,0 +1,6 @@
+# Text files are LF in the repository and in the working tree, on every
+# platform: gofmt, the shell scripts and the diffs depend on it.
+* text=auto eol=lf
+
+# Keys are kept byte for byte.
+*.asc -text
