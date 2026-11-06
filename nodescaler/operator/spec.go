@@ -90,6 +90,9 @@ type groupSpec struct {
 		Policy       string `json:"policy"`
 		DrainTimeout string `json:"drain_timeout"`
 	} `json:"deletion"`
+	Edge struct {
+		MinShutdownDelay string `json:"min_shutdown_delay"`
+	} `json:"edge"`
 	Rolling struct {
 		Mode           string `json:"mode"`
 		Generation     int64  `json:"generation"`
@@ -98,6 +101,13 @@ type groupSpec struct {
 		MaxSurge       *int64 `json:"max_surge"`
 		Jitter         string `json:"jitter"`
 	} `json:"rolling"`
+}
+
+// minShutdownDelay is the shortest shutdown_delay of an instance behind a load
+// balancer that raises no ShortShutdownDelay (edge.min_shutdown_delay, 30
+// seconds by default).
+func (s *groupSpec) minShutdownDelay() time.Duration {
+	return durationOr(s.Edge.MinShutdownDelay, 30*time.Second)
 }
 
 // paused reports rolling.mode = "paused": no replacement starts, except for

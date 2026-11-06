@@ -30,6 +30,7 @@ import (
 //   - when no node may go, the condition ScaleDownBlocked is set with a
 //     retryAfter time that doubles with each veto (10 minutes to 6 hours); the
 //     autoscaler sets the scale back and does not lower it before that time;
+//   - a node behind a load balancer leaves it before its drain (edge.go);
 //   - when the drain is complete (or the node still empty), the instance is
 //     deleted, and the node, once it is down, is purged; a drain that does not
 //     finish within its deadline and a grace time is stopped, the node made
@@ -49,6 +50,7 @@ const (
 	selectorLeastBusy = "least_busy"
 	selectorEmpty     = "empty"
 
+	phaseLeaving  = "leaving" // an edge node leaves the load balancers (edge.go)
 	phaseDraining = "draining"
 	phaseSettling = "settling"
 	phaseDeleting = "deleting"
@@ -233,6 +235,20 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 			fmt.Sprintf("node %s of instance %s is empty and made ineligible, for a scale of %d", node.Name, inst.ID, want))
 		res.requeue = settleTime
 	default:
+		if done, _ := r.leaveTraffic(ctx, obj, spec, node.ID, node.Name, now, now); !done {
+			// An edge node leaves the load balancers first.
+			if err := r.Nodes.SetIneligible(ctx, node.ID); err != nil {
+				r.downFailed(ctx, obj, "making a node ineligible failed", node.ID, err)
+				res.requeue = r.cfg.RetryAfter
+				return res
+			}
+			m.Phase = phaseLeaving
+			r.event(ctx, obj, api.ObjectEventTypeNormal, "ScaleDown",
+				fmt.Sprintf("node %s of instance %s leaves the load balancers, then it is drained (deadline %s), for a scale of %d",
+					node.Name, inst.ID, spec.drainDeadline(), want))
+			res.requeue = leaveCheck
+			break
+		}
 		if err := r.Nodes.Drain(ctx, node.ID, spec.drainDeadline()); err != nil {
 			r.downFailed(ctx, obj, "starting a drain failed", node.ID, err)
 			res.requeue = r.cfg.RetryAfter
@@ -334,7 +350,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 
 	// The scale was raised again before the instance was deleted: the node
 	// stays.
-	if inst != nil && (m.Phase == phaseDraining || m.Phase == phaseSettling) && live <= want {
+	if inst != nil && (m.Phase == phaseLeaving || m.Phase == phaseDraining || m.Phase == phaseSettling) && live <= want {
 		if m.Node != "" {
 			var err error
 			if m.Phase == phaseDraining {
@@ -346,6 +362,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 				r.downFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
 				return
 			}
+			r.backToTraffic(ctx, m.Node)
 		}
 		r.event(ctx, obj, api.ObjectEventTypeNormal, "ScaleDownCanceled",
 			fmt.Sprintf("the scale is %d again: node %s of instance %s stays", want, m.Node, m.Instance))
@@ -381,6 +398,19 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 
 	case m.Phase == phaseDeleting:
 		r.deleteInstance(ctx, obj, client, group, o, m, now)
+
+	case m.Phase == phaseLeaving:
+		if done, _ := r.leaveTraffic(ctx, obj, spec, m.Node, m.Name, m.Started, now); !done {
+			res.requeue = leaveCheck
+			return
+		}
+		if err := r.Nodes.Drain(ctx, m.Node, spec.drainDeadline()); err != nil {
+			r.downFailed(ctx, obj, "starting a drain failed", m.Node, err)
+			return
+		}
+		m.Phase, m.Started = phaseDraining, now
+		r.event(ctx, obj, api.ObjectEventTypeNormal, "ScaleDown",
+			fmt.Sprintf("node %s of instance %s is drained (deadline %s)", m.Name, m.Instance, spec.drainDeadline()))
 
 	case m.Phase == phaseSettling:
 		d, err := r.Nodes.Detail(ctx, m.Node)
@@ -422,6 +452,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 				r.downFailed(ctx, obj, "stopping a drain failed", m.Node, err)
 				return
 			}
+			r.backToTraffic(ctx, m.Node)
 			why := fmt.Sprintf("the drain of node %s did not finish in %s", m.Node, spec.drainDeadline()+drainGrace)
 			if !d.Draining {
 				why = fmt.Sprintf("the drain of node %s was stopped (%s)", m.Node, d.LastDrain)

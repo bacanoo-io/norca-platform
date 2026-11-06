@@ -211,6 +211,16 @@ func (r *Reconciler) drainForDeletion(ctx context.Context, obj *api.CustomObject
 		// Drained, and not made eligible again since.
 		return true, ""
 	}
+	// An edge node leaves the load balancers first (edge.go), without new
+	// work meanwhile.
+	if done, why := r.leaveTraffic(ctx, obj, spec, node.ID, node.Name, time.Unix(0, obj.DeletionTime), r.now()); !done {
+		if d.Eligible {
+			if err := r.Nodes.SetIneligible(ctx, node.ID); err != nil {
+				r.deletionFailed(ctx, obj, "making a node ineligible failed", node.ID, err)
+			}
+		}
+		return false, why
+	}
 	if err := r.Nodes.Drain(ctx, node.ID, spec.drainDeadline()); err != nil {
 		r.deletionFailed(ctx, obj, "starting a drain failed", node.ID, err)
 		return false, fmt.Sprintf("node %s: %v", node.Name, err)

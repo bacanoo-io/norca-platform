@@ -42,7 +42,8 @@ import (
 // emptied first and its instance replaced once deleted. Emptied means drained
 // with the drain_deadline of the scale down, except for a node outdated only
 // by age, or of a group with the selector empty, which only gets no new work
-// and goes when it is empty; a node at its hard limit is always drained.
+// and goes when it is empty; a node at its hard limit is always drained. A
+// node behind a load balancer leaves it before its drain (edge.go).
 //
 // The scale and status.replicas do not see a replacement: the old node does
 // not count, the new one counts once ready, and the autoscaler does not act
@@ -68,7 +69,8 @@ const (
 	reasonAge        = "age"
 	reasonExpiry     = "expiry"
 
-	phaseSurging  = "surging"  // the old node is ineligible, the new one joins
+	phaseSurging = "surging" // the old node is ineligible, the new one joins
+	// phaseLeaving (scaledown.go): the old node leaves the load balancers.
 	phaseEmptying = "emptying" // the old node gets no new work, waiting for it to be empty
 
 	// rollWarn is how long before its hard limit a node of a backed off
@@ -313,8 +315,11 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 			m.Phase = phaseSurging
 			err = r.Nodes.SetIneligible(ctx, c.node.ID)
 		case drain:
-			m.Phase = phaseDraining
-			err = r.Nodes.Drain(ctx, c.node.ID, spec.drainDeadline())
+			// An edge node leaves the load balancers before the drain.
+			m.Phase = phaseLeaving
+			if err = r.Nodes.SetIneligible(ctx, c.node.ID); err == nil {
+				r.startDrain(ctx, obj, spec, m, now)
+			}
 		default:
 			m.Phase = phaseEmptying
 			err = r.Nodes.SetIneligible(ctx, c.node.ID)
@@ -450,14 +455,14 @@ func (r *Reconciler) continueReplacement(ctx context.Context, obj *api.CustomObj
 			r.deleteOld(ctx, obj, client, group, o, m, now)
 		case !m.Expires.IsZero() && !now.Before(m.Expires):
 			// The hard limit came while it emptied by itself: drained.
-			if err := r.Nodes.Drain(ctx, m.Node, spec.drainDeadline()); err != nil {
-				r.rollFailed(ctx, obj, "starting a drain failed", m.Node, err)
-				return
-			}
-			m.Drain, m.Phase, m.Started = true, phaseDraining, now
 			r.event(ctx, obj, api.ObjectEventTypeNormal, "Replacing",
 				fmt.Sprintf("node %s reached its hard age limit and is drained", m.NodeName))
+			m.Drain, m.Phase, m.Started = true, phaseLeaving, now
+			r.startDrain(ctx, obj, spec, m, now)
 		}
+
+	case phaseLeaving:
+		r.startDrain(ctx, obj, spec, m, now)
 
 	case phaseDraining:
 		d, err := r.Nodes.Detail(ctx, m.Node)
@@ -473,6 +478,7 @@ func (r *Reconciler) continueReplacement(ctx context.Context, obj *api.CustomObj
 				r.rollFailed(ctx, obj, "stopping a drain failed", m.Node, err)
 				return
 			}
+			r.backToTraffic(ctx, m.Node)
 			why := fmt.Sprintf("the drain of node %s did not finish in %s", m.NodeName, spec.drainDeadline()+drainGrace)
 			if !d.Draining {
 				why = fmt.Sprintf("the drain of node %s was stopped (%s)", m.NodeName, d.LastDrain)
@@ -510,13 +516,23 @@ func (r *Reconciler) emptyOld(ctx context.Context, obj *api.CustomObject, spec *
 		m.Phase, m.Started = phaseEmptying, now
 		return
 	}
+	m.Phase, m.Started = phaseLeaving, now
+	r.startDrain(ctx, obj, spec, m, now)
+}
+
+// startDrain drains the old node of a replacement in phase leaving, once it
+// left the load balancers (edge.go).
+func (r *Reconciler) startDrain(ctx context.Context, obj *api.CustomObject, spec *groupSpec, m *replacement, now time.Time) {
+	if done, _ := r.leaveTraffic(ctx, obj, spec, m.Node, m.NodeName, m.Started, now); !done {
+		return
+	}
 	if err := r.Nodes.Drain(ctx, m.Node, spec.drainDeadline()); err != nil {
 		r.rollFailed(ctx, obj, "starting a drain failed", m.Node, err)
 		return
 	}
 	m.Phase, m.Started = phaseDraining, now
 	r.event(ctx, obj, api.ObjectEventTypeNormal, "Replacing",
-		fmt.Sprintf("the new node is ready: node %s is drained (deadline %s)", m.NodeName, spec.drainDeadline()))
+		fmt.Sprintf("node %s is drained (deadline %s)", m.NodeName, spec.drainDeadline()))
 }
 
 // deleteOld deletes the old instance; the replacement goes on with its node.
@@ -542,6 +558,7 @@ func (r *Reconciler) cancelReplacement(ctx context.Context, obj *api.CustomObjec
 		r.rollFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
 		return
 	}
+	r.backToTraffic(ctx, m.Node)
 	ro.Backoff.block(now, reason, why+"; node "+m.NodeName+" stays and is eligible again")
 	r.event(ctx, obj, api.ObjectEventTypeWarning, "ReplacementCanceled", ro.Backoff.Message)
 	ro.drop(m)

@@ -54,6 +54,14 @@ type NodeLister interface {
 	// without the node: an allocation under distinct_hosts needs another
 	// node that holds none of its job (or group). The reason says why not.
 	Replaceable(ctx context.Context, alloc NodeAlloc, nodeID string) (bool, string, error)
+
+	// SetMeta changes the dynamic meta of a node: a nil value removes a key.
+	SetMeta(ctx context.Context, nodeID string, meta map[string]*string) error
+	// AllocServices returns the names of the services an allocation
+	// registers (of its group and of its tasks) and the time it keeps
+	// running after their deregistration: the larger of the shutdown_delay
+	// of its group and of its tasks.
+	AllocServices(ctx context.Context, alloc NodeAlloc) ([]string, time.Duration, error)
 }
 
 // ErrNodeNotFound is returned for a node that does not exist.
@@ -181,6 +189,51 @@ func (n *APINodes) SetEligible(ctx context.Context, nodeID string) error {
 	return err
 }
 
+// SetMeta implements NodeLister.
+func (n *APINodes) SetMeta(ctx context.Context, nodeID string, meta map[string]*string) error {
+	_, err := n.Client.Nodes().Meta().Apply(&api.NodeMetaApplyRequest{NodeID: nodeID, Meta: meta},
+		(&api.QueryOptions{}).WithContext(ctx))
+	return err
+}
+
+// AllocServices implements NodeLister.
+func (n *APINodes) AllocServices(ctx context.Context, a NodeAlloc) ([]string, time.Duration, error) {
+	alloc, _, err := n.Client.Allocations().Info(a.ID, (&api.QueryOptions{Namespace: a.Namespace}).WithContext(ctx))
+	if err != nil {
+		return nil, 0, err
+	}
+	if alloc.Job == nil {
+		return nil, 0, nil
+	}
+	var names []string
+	var delay time.Duration
+	for _, tg := range alloc.Job.TaskGroups {
+		if tg == nil || tg.Name == nil || *tg.Name != alloc.TaskGroup {
+			continue
+		}
+		if tg.ShutdownDelay != nil {
+			delay = max(delay, *tg.ShutdownDelay)
+		}
+		for _, s := range tg.Services {
+			if s != nil && s.Name != "" {
+				names = append(names, s.Name)
+			}
+		}
+		for _, t := range tg.Tasks {
+			if t == nil {
+				continue
+			}
+			delay = max(delay, t.ShutdownDelay)
+			for _, s := range t.Services {
+				if s != nil && s.Name != "" {
+					names = append(names, s.Name)
+				}
+			}
+		}
+	}
+	return names, delay, nil
+}
+
 // Purge implements NodeLister.
 func (n *APINodes) Purge(ctx context.Context, nodeID string) error {
 	_, _, err := n.Client.Nodes().Purge(nodeID, (&api.QueryOptions{}).WithContext(ctx))
@@ -264,6 +317,12 @@ func hasDistinctHosts(cs []*api.Constraint) bool {
 		}
 	}
 	return false
+}
+
+// isStatus reports an API error with the HTTP status code.
+func isStatus(err error, code int) bool {
+	ue, ok := errors.AsType[api.UnexpectedResponseError](err)
+	return ok && ue.StatusCode() == code
 }
 
 // isNotFound reports a 404 of the API.

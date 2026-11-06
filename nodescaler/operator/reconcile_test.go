@@ -33,6 +33,38 @@ type fakeNodes struct {
 	// irreplaceable names the jobs whose allocations could not be placed
 	// again without their node.
 	irreplaceable map[string]bool
+	// services are the services of the allocations, by allocation ID.
+	services map[string]allocServices
+}
+
+// allocServices are the services of an allocation and its shutdown_delay.
+type allocServices struct {
+	names []string
+	delay time.Duration
+}
+
+func (f *fakeNodes) SetMeta(_ context.Context, id string, meta map[string]*string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.detail(id)
+	if d.Meta == nil {
+		d.Meta = map[string]string{}
+	}
+	for k, v := range meta {
+		if v == nil {
+			delete(d.Meta, k)
+		} else {
+			d.Meta[k] = *v
+		}
+	}
+	return nil
+}
+
+func (f *fakeNodes) AllocServices(_ context.Context, a NodeAlloc) ([]string, time.Duration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.services[a.ID]
+	return s.names, s.delay, nil
 }
 
 func (f *fakeNodes) SetIneligible(_ context.Context, id string) error {
