@@ -90,6 +90,7 @@ func TestRender(t *testing.T) {
 	cfg := string(f["/etc/norca/norca.hcl"])
 	for _, want := range []string{`name       = "workers-dc1-3-1"`, `region     = "eu"`, `datacenter = "dc1"`,
 		`node_pool  = "workers"`, `node_class = "gpu"`, `"norca.instance" = "workers-dc1-3-1"`,
+		`"norca.cert_expires" = "` + leaf.NotAfter.UTC().Format(time.RFC3339) + `"`,
 		`cert_file = "/etc/norca/tls/client.pem"`} {
 		if !strings.Contains(cfg, want) {
 			t.Errorf("the configuration has no %s:\n%s", want, cfg)

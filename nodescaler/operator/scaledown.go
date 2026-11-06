@@ -169,7 +169,7 @@ type downResult struct {
 
 // scaleDown removes instances above the scale, one at a time.
 func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, client *provider.Client, group string,
-	spec *groupSpec, o *observed, status map[string]any, now time.Time) downResult {
+	spec *groupSpec, o *observed, status map[string]any, rolling bool, now time.Time) downResult {
 
 	res := downResult{removal: readRemoval(status), veto: readVeto(status)}
 	want := spec.replicas()
@@ -179,7 +179,9 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 		r.continueRemoval(ctx, obj, client, group, spec, o, &res, want, live, now)
 		return res
 	}
-	if live <= want {
+	if live <= want || rolling {
+		// No removal starts while nodes are replaced: the scale counts
+		// neither the old nodes nor the new ones that join.
 		return res
 	}
 

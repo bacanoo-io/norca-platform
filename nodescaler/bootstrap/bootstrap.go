@@ -56,6 +56,11 @@ const (
 	ItemService    = "service"
 )
 
+// MetaCertExpires is the meta key of a node with the expiry of its
+// certificate (RFC 3339), which Render adds: the hard age limit of the node
+// comes from it.
+const MetaCertExpires = "norca.cert_expires"
+
 // DefaultValidity is the validity of a node certificate: the soft and hard
 // age limits of a node (45 and 55 days) replace it before it expires.
 const DefaultValidity = 60 * 24 * time.Hour
@@ -174,6 +179,10 @@ func (t *Template) Render(n Node) (*Rendered, error) {
 	if err != nil {
 		return nil, err
 	}
+	meta := make(map[string]string, len(n.Meta)+1)
+	maps.Copy(meta, n.Meta)
+	meta[MetaCertExpires] = leaf.NotAfter.UTC().Format(time.RFC3339)
+	n.Meta = meta
 
 	var agent bytes.Buffer
 	if err := t.agent.Execute(&agent, n); err != nil {

@@ -141,6 +141,9 @@ type observed struct {
 	capacity  *provider.Capacity
 	nodeOf    map[string]Node // the joined node of an instance, by instanceKey
 	slow      map[string]bool // instances still joining after join.slow_after
+	// retiring are the old instances of replacements that surge: they no
+	// longer count in the scale (rollout.go).
+	retiring map[string]bool
 }
 
 // observe takes the instances of the group from the provider's group.
@@ -159,6 +162,9 @@ func (r *Reconciler) observe(group string, pg *provider.Group) *observed {
 // instances and the live instances (creating or running).
 func (o *observed) counts() (ready, joining, failed, live int64) {
 	for _, inst := range o.instances {
+		if o.retiring[inst.ID] {
+			continue
+		}
 		switch inst.State {
 		case provider.StateFailed:
 			failed++
@@ -242,11 +248,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
 	prevStatus := normalize(obj.Status)
-	// The node of an instance a scale down deleted is not a stray: it goes
-	// down and is purged.
-	var removing string
+	// The node of an instance a scale down or a replacement deleted is not a
+	// stray: it goes down and is purged.
+	removing := map[string]bool{}
 	if m := readRemoval(prevStatus); m != nil {
-		removing = m.Name
+		removing[m.Name] = true
+	}
+	for _, m := range readRollout(prevStatus).Replacing {
+		removing[m.Name] = true
 	}
 	strays := matchNodes(obj.Name, o, nodes, removing)
 
@@ -265,8 +274,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		r.event(ctx, obj, api.ObjectEventTypeWarning, CondJoinFailing, joinCondition(js, spec.maxFailures()).Message)
 	}
 
+	// Replace the outdated nodes; the old node of a replacement that surges
+	// no longer counts in the scale.
+	roll := r.roll(ctx, obj, client, group, spec, o, prevStatus, failing, now)
+
 	// Remove the instances above the scale, one at a time.
-	down := r.scaleDown(ctx, obj, client, group, spec, o, prevStatus, now)
+	down := r.scaleDown(ctx, obj, client, group, spec, o, prevStatus, len(roll.state.Replacing) > 0, now)
 
 	// Ask for the instances that are missing.
 	want := spec.replicas()
@@ -303,6 +316,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 				provisioned = condition{Type: CondProvisioned, Status: "False", Reason: reasonName(reason),
 					Message: fmt.Sprintf("provider %q could not create %d instances: %v", spec.Provider, len(req.Instances), err)}
 				r.event(ctx, obj, api.ObjectEventTypeWarning, "CreateFailed", provisioned.Message)
+				// A new node of a replacement that is refused: the old node
+				// stays.
+				r.surgeRefused(ctx, obj, roll.state, provisioned.Message, now)
+				o.retiring = roll.state.retiring()
 			} else {
 				requested = true
 				for _, inst := range created {
@@ -328,7 +345,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		status["replicas"] = ready
 		status["joining"] = joining
 		status["failed"] = failed
-		status["nodes"] = nodeRecords(o, down.removal)
+		status["nodes"] = nodeRecords(o, down.removal, roll.state)
+		if d := roll.state.doc(); d != nil {
+			status["rollout"] = d
+		} else {
+			delete(status, "rollout")
+		}
+		rolling, rollBlocked := roll.state.conditions(spec, now)
+		setCondition(status, rolling, now)
+		setCondition(status, rollBlocked, now)
 		if down.removal != nil {
 			status["removal"] = down.removal.doc()
 		} else {
@@ -368,8 +393,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	case joining > 0 || len(o.slow) > 0:
 		requeue = r.cfg.JoinCheck
 	}
-	if down.requeue > 0 && (requeue == 0 || down.requeue < requeue) {
-		requeue = down.requeue
+	for _, d := range []time.Duration{down.requeue, roll.requeue} {
+		if d > 0 && (requeue == 0 || d < requeue) {
+			requeue = d
+		}
 	}
 	if v := down.veto; v.Vetoes > 0 && now.Before(v.RetryAfter) && requeue == 0 {
 		// The condition turns False at retryAfter.
@@ -405,6 +432,7 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 			maps.Copy(meta, map[string]string{
 				MetaCreatedBy: "nodescaler", MetaNodeGroup: obj.Name, MetaInstance: name,
 				MetaRequest: r.requestID(obj.Name, seq), MetaCreatedAt: now.UTC().Format(time.RFC3339),
+				MetaRevision: spec.templateRevision(), MetaGeneration: strconv.FormatInt(spec.Rolling.Generation, 10),
 			})
 			rd, err := tmpl.Render(bootstrap.Node{Name: name, Datacenter: spec.Datacenter, Pool: spec.Pool,
 				Class: spec.NodeClass, Meta: meta})
@@ -485,9 +513,10 @@ func (r *Reconciler) nextRequest(obj *api.CustomObject, instances []provider.Ins
 	return last + 1
 }
 
-// nodeRecords is status.nodes: an entry per instance with its node, and the
-// phase of the one a scale down removes.
-func nodeRecords(o *observed, m *removal) []any {
+// nodeRecords is status.nodes: an entry per instance with its node, the phase
+// of the one a scale down removes (removing) and of those being replaced
+// (replacing).
+func nodeRecords(o *observed, m *removal, ro *rollout) []any {
 	insts := slices.Clone(o.instances)
 	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.ID, b.ID) })
 	out := make([]any, 0, len(insts))
@@ -508,6 +537,11 @@ func nodeRecords(o *observed, m *removal) []any {
 		}
 		if m != nil && m.Instance == inst.ID {
 			rec["removing"] = m.Phase
+		}
+		if ro != nil {
+			if rep := ro.find(inst.ID); rep != nil {
+				rec["replacing"] = rep.Phase
+			}
 		}
 		out = append(out, rec)
 	}

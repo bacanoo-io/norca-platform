@@ -35,11 +35,17 @@ const (
 	// known when the machine is described, so the name is the operator's.
 	MetaInstance = "norca.instance"
 
-	// The other marks of a node the operator created.
-	MetaCreatedBy = "norca.created_by"
-	MetaNodeGroup = "norca.node_group"
-	MetaRequest   = "norca.request"
-	MetaCreatedAt = "norca.created_at"
+	// The other marks of a node the operator created: the revision of the
+	// template and the rolling generation of the group it was created with.
+	MetaCreatedBy  = "norca.created_by"
+	MetaNodeGroup  = "norca.node_group"
+	MetaRequest    = "norca.request"
+	MetaCreatedAt  = "norca.created_at"
+	MetaRevision   = "norca.node_group_revision"
+	MetaGeneration = "norca.node_group_generation"
+
+	// MetaReplace on a node asks for its replacement.
+	MetaReplace = "norca.scale.replace"
 )
 
 // nodeResource is a size: CPU in MHz, memory and disk in MB.
@@ -55,6 +61,7 @@ type groupSpec struct {
 	Datacenter string `json:"datacenter"`
 	NodeClass  string `json:"node_class"`
 	Enabled    *bool  `json:"enabled"`
+	Enforce    bool   `json:"enforce"`
 	Replicas   *int64 `json:"replicas"`
 	Min        int64  `json:"min"`
 	Max        int64  `json:"max"`
@@ -83,6 +90,43 @@ type groupSpec struct {
 		Policy       string `json:"policy"`
 		DrainTimeout string `json:"drain_timeout"`
 	} `json:"deletion"`
+	Rolling struct {
+		Mode           string `json:"mode"`
+		Generation     int64  `json:"generation"`
+		MaxNodeAge     string `json:"max_node_age"`
+		MaxUnavailable *int64 `json:"max_unavailable"`
+		MaxSurge       *int64 `json:"max_surge"`
+		Jitter         string `json:"jitter"`
+	} `json:"rolling"`
+}
+
+// paused reports rolling.mode = "paused": no replacement starts, except for
+// a node at its hard age limit.
+func (s *groupSpec) paused() bool { return s.Rolling.Mode == "paused" }
+
+// maxUnavailable is how many nodes of the group are replaced at the same
+// time (rolling.max_unavailable, 1 by default).
+func (s *groupSpec) maxUnavailable() int {
+	if s.Rolling.MaxUnavailable != nil && *s.Rolling.MaxUnavailable > 0 {
+		return int(*s.Rolling.MaxUnavailable)
+	}
+	return 1
+}
+
+// surge reports whether the new node is asked for before the old one goes
+// (rolling.max_surge, 1 by default; 0 removes first).
+func (s *groupSpec) surge() bool {
+	return s.Rolling.MaxSurge == nil || *s.Rolling.MaxSurge > 0
+}
+
+// jitter is the share of the age limit by which a node may be replaced
+// earlier (rolling.jitter, 15% by default).
+func (s *groupSpec) jitter() float64 {
+	var pct float64
+	if _, err := fmt.Sscanf(s.Rolling.Jitter, "%g%%", &pct); err != nil || pct < 0 || pct >= 100 {
+		return 0.15
+	}
+	return pct / 100
 }
 
 // deletionPolicy is what the deletion of the group does with its instances:

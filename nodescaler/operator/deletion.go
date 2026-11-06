@@ -128,7 +128,7 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
-	strays := matchNodes(obj.Name, o, nodes, "")
+	strays := matchNodes(obj.Name, o, nodes, nil)
 
 	for _, inst := range slices.Clone(o.instances) {
 		name := instanceKey(inst)
@@ -241,9 +241,10 @@ func (r *Reconciler) deletionStatus(ctx context.Context, obj *api.CustomObject, 
 		if o != nil {
 			ready, joining, failed, _ := o.counts()
 			status["replicas"], status["joining"], status["failed"] = ready, joining, failed
-			status["nodes"] = nodeRecords(o, nil)
+			status["nodes"] = nodeRecords(o, nil, nil)
 		}
 		delete(status, "removal")
+		delete(status, "rollout")
 		setCondition(status, blocked, now)
 	})
 	if errors.Is(err, controller.ErrNotFound) {
