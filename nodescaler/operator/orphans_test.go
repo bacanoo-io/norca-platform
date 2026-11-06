@@ -158,3 +158,32 @@ func TestOrphans_Metrics(t *testing.T) {
 		t.Fatalf("gauges %v counters %v", m.gauges, m.counters)
 	}
 }
+
+func TestOrphans_MetricsOfAnUnfinishedSweep(t *testing.T) {
+	e := newEnv(t, "")
+	m := newRecMetrics()
+	e.r.cfg.Metrics = m
+	labels := map[string]string{LabelRegion: "eu", LabelNodeGroup: "deleted-group", LabelDatacenter: "dc1", LabelPool: "workers"}
+	withNode := e.createRaw("r-node", labels)
+	e.nodes.set(Node{ID: "n9", Name: "node-9", Instance: withNode, Ready: true})
+	e.advance(16 * time.Minute)
+	e.sweep()
+	orphans := metricKey(metricOrphans, []string{"provider", "mock"})
+	if m.gauges[orphans] != 1 {
+		t.Fatalf("gauges %v", m.gauges)
+	}
+
+	// The provider names a group it cannot list: the sweep does not get to
+	// the end of the provider, so the count of its last complete sweep stays,
+	// though the orphan it saw is gone.
+	if err := e.mock.Delete(context.Background(), "dc1", e.instances()[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	obj := e.backend.GetObject(NodeProviderKind, "", "mock")
+	obj.Spec["groups"] = []any{map[string]any{"name": "dc1"}, map[string]any{"name": "dc9"}}
+	e.backend.PutObject(obj)
+	e.sweep()
+	if m.gauges[orphans] != 1 {
+		t.Fatalf("an unfinished sweep changed the count: %v", m.gauges)
+	}
+}

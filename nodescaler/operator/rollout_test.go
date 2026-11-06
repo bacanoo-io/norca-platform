@@ -138,7 +138,9 @@ func TestRollout_MarkedSurge(t *testing.T) {
 		t.Fatalf("%d instances, drains %v", len(e.instances()), e.nodes.drains)
 	}
 
-	// The new node is ready: the old one is drained, then deleted and purged.
+	// The new node is ready 3 minutes later: the old one is drained, then
+	// deleted and purged.
+	e.advance(3 * time.Minute)
 	e.joinAll(nil)
 	e.reconcile()
 	if !slices.Equal(e.nodes.drains, []string{old}) {
@@ -158,7 +160,10 @@ func TestRollout_MarkedSurge(t *testing.T) {
 		t.Fatalf("purged: %v", e.nodes.purged)
 	}
 	st = e.status()
-	if st["rollout"] != nil || st["replicas"] != 2.0 || e.eventCount("ForeignNode")+e.eventCount("NodeWithoutInstance") != 0 {
+	// Done: nothing replaced or outdated, and how long it took is kept.
+	ro = e.rollout()
+	if len(ro.Replacing) != 0 || len(ro.Outdated) != 0 || ro.Took != 3*time.Minute || st["replicas"] != 2.0 ||
+		e.eventCount("ForeignNode")+e.eventCount("NodeWithoutInstance") != 0 {
 		t.Fatalf("rollout %v replicas %v, stray events %d", st["rollout"], st["replicas"],
 			e.eventCount("ForeignNode")+e.eventCount("NodeWithoutInstance"))
 	}
@@ -435,10 +440,20 @@ func TestRollout_HeadroomRemovesFirst(t *testing.T) {
 	// The mock group holds 5 instances: the new node of a group of 5 is
 	// refused. A node at its soft age limit then waits, unless the headroom
 	// of the group covers a node.
-	for _, headroom := range []int{0, 1} {
-		t.Run(fmt.Sprint("headroom ", headroom), func(t *testing.T) {
-			e := rollEnv(t, 5, map[string]any{"headroom_nodes": headroom,
-				"rolling": map[string]any{"max_node_age": "10d", "jitter": "0%"}})
+	for _, tc := range []struct {
+		name    string
+		extra   map[string]any
+		removed bool
+	}{
+		{"no headroom", nil, false},
+		{"headroom_nodes 1", map[string]any{"headroom_nodes": 1}, true},
+		{"headroom_percent 20 of 5", map[string]any{"headroom_percent": 20.0}, true},
+		{"headroom_percent 10 of 5, rounded down to 0", map[string]any{"headroom_percent": 10.0}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := map[string]any{"rolling": map[string]any{"max_node_age": "10d", "jitter": "0%"}}
+			maps.Copy(extra, tc.extra)
+			e := rollEnv(t, 5, extra)
 			old := e.firstNode()
 			e.setMeta(old, map[string]string{MetaCreatedAt: e.now.Add(-11 * 24 * time.Hour).Format(time.RFC3339)})
 			e.reconcile() // the surge is refused: backed off
@@ -447,7 +462,7 @@ func TestRollout_HeadroomRemovesFirst(t *testing.T) {
 			}
 			e.reconcile()
 			ro := e.rollout()
-			if headroom == 0 {
+			if !tc.removed {
 				if len(ro.Replacing) != 0 {
 					t.Fatalf("started without a headroom: %+v", ro.Replacing)
 				}
