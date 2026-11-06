@@ -1,7 +1,5 @@
-github.com/bacanoo-io/norca-pki v0.2.0 h1:TeaLifrTCZkist9wM52Ari+dumEhevxWSRjDHcR4xEY=
-github.com/bacanoo-io/norca-pki v0.2.0/go.mod h1:m2S6hRaxLiIXqJnsGreom/gcEZrSGH0a8KyCVIcytZk=
-github.com/bacanoo-io/norca-pki v0.2.1-0.20261106144637-a8119f725773 h1:xrjsTUzwOXPKUlzZWcUBSyG/H7xiAeS31Xqk+/1f8ac=
-github.com/bacanoo-io/norca-pki v0.2.1-0.20261106144637-a8119f725773/go.mod h1:m2S6hRaxLiIXqJnsGreom/gcEZrSGH0a8KyCVIcytZk=
+github.com/bacanoo-io/norca-pki v0.3.0 h1:oZRH03Vbovy+ca2/x/TcKCM1cYRVBI1349Py8Kj+KaM=
+github.com/bacanoo-io/norca-pki v0.3.0/go.mod h1:m2S6hRaxLiIXqJnsGreom/gcEZrSGH0a8KyCVIcytZk=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4=
