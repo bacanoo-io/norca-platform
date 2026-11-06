@@ -14,8 +14,9 @@
 // A request to the provider is idempotent by its ID (region/group/number):
 // a request repeated after a failure or a restart creates nothing more. The
 // join of the nodes is tracked (join.go), the instances of groups that are
-// gone are swept (orphans.go), and the instances above the scale are removed
-// one at a time (scaledown.go).
+// gone are swept (orphans.go), the instances above the scale are removed one
+// at a time (scaledown.go), and a deleted group keeps its object until its
+// instances are dealt with by spec.deletion (deletion.go).
 package operator
 
 import (
@@ -67,6 +68,10 @@ type Config struct {
 	// OrphanAfter is the age after which an orphaned instance without a
 	// node is deleted (default 15 minutes, the default join deadline).
 	OrphanAfter time.Duration
+
+	// DeleteOrphans deletes orphaned instances that run a node too; without
+	// it they are only reported (orphans.go).
+	DeleteOrphans bool
 
 	// Bootstrap gives the template of the bootstrap of a node; nil sends
 	// no bootstrap, only the names of the instances.
@@ -138,6 +143,17 @@ type observed struct {
 	slow      map[string]bool // instances still joining after join.slow_after
 }
 
+// observe takes the instances of the group from the provider's group.
+func (r *Reconciler) observe(group string, pg *provider.Group) *observed {
+	o := &observed{capacity: pg.Capacity, nodeOf: map[string]Node{}}
+	for _, inst := range pg.Instances {
+		if inst.Labels[LabelNodeGroup] == group && (inst.Labels[LabelRegion] == "" || inst.Labels[LabelRegion] == r.cfg.Region) {
+			o.instances = append(o.instances, inst)
+		}
+	}
+	return o
+}
+
 // counts returns the ready nodes, the instances whose node has not joined
 // (the slow ones left out: they no longer count as capacity), the failed
 // instances and the live instances (creating or running).
@@ -172,8 +188,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		return 0, err
 	}
 	if obj.DeletionTime != 0 {
-		// The deletion of a group (spec.deletion) comes with scale down.
-		return 0, nil
+		// The finalizer keeps the group until its instances are dealt with
+		// by spec.deletion (deletion.go).
+		return r.deleteGroup(ctx, obj)
 	}
 	spec, err := decodeSpec(obj.Spec)
 	if err != nil {
@@ -184,6 +201,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		// A disabled group, or one without a provider (an external engine
 		// that brings its own machines), is left alone.
 		return 0, nil
+	}
+	if !slices.Contains(obj.Finalizers, Finalizer) {
+		// Before the first instance: a deletion of the group waits for the
+		// operator from now on.
+		// Without the capability (manage-finalizers) the group is still
+		// scaled; a deletion then leaves its instances to the orphan sweep.
+		withFinalizer, err := r.Objects.UpdateObjectFinalizers(ctx, NodeGroupKind, obj.Namespace, obj.Name, []string{Finalizer}, nil, 0)
+		switch {
+		case errors.Is(err, controller.ErrConflict) || errors.Is(err, controller.ErrNotFound):
+			return 0, nil // deleted meanwhile: the deletion is reconciled next
+		case err != nil:
+			r.log.Warn("adding the finalizer failed; a deletion of the group will not wait for its instances",
+				"group", obj.Name, "error", err)
+		default:
+			obj = withFinalizer
+		}
 	}
 	group := spec.providerGroup()
 	now := r.now()
@@ -203,12 +236,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		return r.unavailable(ctx, obj, "ProviderUnavailable", fmt.Sprintf("provider %q: %v", spec.Provider, err))
 	}
 
-	o := &observed{capacity: pg.Capacity, nodeOf: map[string]Node{}}
-	for _, inst := range pg.Instances {
-		if inst.Labels[LabelNodeGroup] == obj.Name && (inst.Labels[LabelRegion] == "" || inst.Labels[LabelRegion] == r.cfg.Region) {
-			o.instances = append(o.instances, inst)
-		}
-	}
+	o := r.observe(obj.Name, pg)
 	nodes, err := r.Nodes.Nodes(ctx, spec.Datacenter, spec.Pool, spec.NodeClass)
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)

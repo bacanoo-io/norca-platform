@@ -90,3 +90,29 @@ func TestOrphans_UnavailableProviderIsLeftAlone(t *testing.T) {
 		t.Fatalf("deleted %d through an unavailable provider", n)
 	}
 }
+
+func TestOrphans_WithNodeReportedOrDeleted(t *testing.T) {
+	e := newEnv(t, "")
+	labels := map[string]string{LabelRegion: "eu", LabelNodeGroup: "deleted-group", LabelDatacenter: "dc1", LabelPool: "workers"}
+	withNode := e.createRaw("r-node", labels)
+	e.nodes.set(Node{ID: "n9", Name: "node-9", Instance: withNode, Ready: true})
+	e.advance(16 * time.Minute)
+
+	// Reported in the log of the provider, and left.
+	if n := e.sweep(); n != 0 || !e.has(withNode) {
+		t.Fatalf("deleted %d", n)
+	}
+	reported := false
+	for _, ev := range e.backend.ObjectEvents(NodeProviderKind, "", "mock") {
+		reported = reported || ev.Reason == "OrphanedInstance"
+	}
+	if !reported {
+		t.Fatal("no OrphanedInstance event in the log of the provider")
+	}
+
+	// With DeleteOrphans it is deleted.
+	e.r.cfg.DeleteOrphans = true
+	if n := e.sweep(); n != 1 || e.has(withNode) {
+		t.Fatalf("deleted %d, the instance is there: %t", n, e.has(withNode))
+	}
+}

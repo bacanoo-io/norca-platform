@@ -6,11 +6,13 @@ package operator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"time"
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
 )
 
@@ -18,9 +20,11 @@ import (
 // node group) whose node group is gone, or no longer names the provider and
 // the group the instance is in, is an orphan: no reconcile of a group sees
 // it. The sweep deletes an orphan that has no node once it is older than the
-// join deadline. An orphan with a node is left alone and logged: it runs work,
-// and what happens to the nodes of a deleted group is decided by the deletion
-// policy of the group, not by the sweep.
+// join deadline. An orphan with a node runs work: it is left as it is and
+// reported (an OrphanedInstance event in the log of its NodeProvider), and
+// deleted only when the operator runs with -delete-orphans (Config
+// DeleteOrphans). Orphans with a node come from a group deleted with the
+// deletion policy orphan, or whose finalizer was removed by force.
 
 // SweepOrphans looks at every group of every available provider once and
 // deletes the orphans without a node. It returns the number deleted.
@@ -48,7 +52,12 @@ func (r *Reconciler) SweepOrphans(ctx context.Context) (int, error) {
 				continue
 			}
 			for _, inst := range pg.Instances {
-				if !r.orphan(ctx, name, group, inst, now) {
+				orphan, node := r.orphan(ctx, name, group, inst, now)
+				if !orphan {
+					continue
+				}
+				if node != nil && !r.cfg.DeleteOrphans {
+					r.reportOrphan(ctx, name, inst, *node)
 					continue
 				}
 				if err := client.Delete(ctx, group, inst.ID); err != nil {
@@ -57,49 +66,61 @@ func (r *Reconciler) SweepOrphans(ctx context.Context) (int, error) {
 				}
 				deleted++
 				r.log.Info("orphaned instance deleted", "provider", name, "group", group, "instance", inst.ID,
-					"node_group", inst.Labels[LabelNodeGroup])
+					"node_group", inst.Labels[LabelNodeGroup], "with_node", node != nil)
 			}
 		}
 	}
 	return deleted, nil
 }
 
-// orphan reports whether an instance is an orphan to delete: of this region,
-// of a node group that is gone or no longer this provider's group, older
-// than the orphan age, and without a node.
-func (r *Reconciler) orphan(ctx context.Context, providerName, group string, inst provider.Instance, now time.Time) bool {
+// orphan reports whether an instance is an orphan: of this region, of a node
+// group that is gone or no longer this provider's group, and older than the
+// orphan age. The node of the instance is returned when it has one.
+func (r *Reconciler) orphan(ctx context.Context, providerName, group string, inst provider.Instance, now time.Time) (bool, *Node) {
 	ng := inst.Labels[LabelNodeGroup]
 	if ng == "" || inst.Labels[LabelRegion] != r.cfg.Region || inst.State == provider.StateDeleting {
-		return false
+		return false, nil
 	}
 	if inst.CreatedAt.IsZero() || now.Sub(inst.CreatedAt) < r.cfg.OrphanAfter {
-		return false
+		return false, nil
 	}
 	obj, err := r.Objects.ReadObject(ctx, NodeGroupKind, "", ng)
 	switch {
 	case errors.Is(err, controller.ErrNotFound):
 	case err != nil:
-		return false // not known: nothing is deleted on a guess
+		return false, nil // not known: nothing is done on a guess
 	case obj.DeletionTime != 0:
-		return false // the deletion of the group deals with it
+		return false, nil // the deletion of the group deals with it
 	default:
 		spec, err := decodeSpec(obj.Spec)
 		if err != nil || (spec.Provider == providerName && spec.providerGroup() == group) {
-			return false
+			return false, nil
 		}
 	}
 	nodes, err := r.Nodes.Nodes(ctx, inst.Labels[LabelDatacenter], inst.Labels[LabelPool], inst.Labels[LabelClass])
 	if err != nil {
-		return false
+		return false, nil
 	}
 	for _, n := range nodes {
 		if n.Instance != "" && n.Instance == instanceKey(inst) {
-			r.log.Warn("orphaned instance has a node, left alone", "provider", providerName, "instance", inst.ID,
-				"node", n.ID, "node_group", ng)
-			return false
+			return true, &n
 		}
 	}
-	return true
+	return true, nil
+}
+
+// reportOrphan writes an OrphanedInstance event to the log of the provider:
+// the instance runs a node, and is left as it is.
+func (r *Reconciler) reportOrphan(ctx context.Context, providerName string, inst provider.Instance, node Node) {
+	msg := fmt.Sprintf("instance %s of node group %s, which is gone, runs node %s; it is left as it is "+
+		"(delete it, or run the operator with -delete-orphans)", inst.ID, inst.Labels[LabelNodeGroup], node.Name)
+	r.log.Warn("orphaned instance has a node, left alone", "provider", providerName, "instance", inst.ID,
+		"node", node.ID, "node_group", inst.Labels[LabelNodeGroup])
+	err := r.Objects.RecordObjectEvents(ctx, NodeProviderKind, "", providerName,
+		[]*api.ObjectEvent{{Type: api.ObjectEventTypeWarning, Reason: "OrphanedInstance", Message: msg}})
+	if err != nil {
+		r.log.Warn("writing an event failed", "provider", providerName, "reason", "OrphanedInstance", "error", err)
+	}
 }
 
 // OrphanSweep is a source of the controller that sweeps the orphans every

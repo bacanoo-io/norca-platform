@@ -79,6 +79,27 @@ type groupSpec struct {
 			DrainDeadline string `json:"drain_deadline"`
 		} `json:"scale_down"`
 	} `json:"policy"`
+	Deletion struct {
+		Policy       string `json:"policy"`
+		DrainTimeout string `json:"drain_timeout"`
+	} `json:"deletion"`
+}
+
+// deletionPolicy is what the deletion of the group does with its instances:
+// drain (the default), orphan or terminate.
+func (s *groupSpec) deletionPolicy() string {
+	switch s.Deletion.Policy {
+	case deletionOrphan, deletionTerminate:
+		return s.Deletion.Policy
+	}
+	return deletionDrain
+}
+
+// drainTimeout is how long the deletion of a group may wait for its nodes
+// before DeletionBlocked asks a person (deletion.drain_timeout, 1 hour by
+// default).
+func (s *groupSpec) drainTimeout() time.Duration {
+	return durationOr(s.Deletion.DrainTimeout, time.Hour)
 }
 
 // selector chooses the node of a scale down: least_busy (the default) or
