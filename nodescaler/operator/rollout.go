@@ -39,7 +39,8 @@ import (
 // node comes first: the old node is made ineligible and no longer counts in
 // the scale, so the operator asks for one more instance, and when the new
 // node is ready the old one is emptied. With max_surge = 0 the old node is
-// emptied first and its instance replaced once deleted. Emptied means drained
+// emptied first and its instance replaced once deleted. At most max_surge
+// replacements surge at a time; the others remove first. Emptied means drained
 // with the drain_deadline of the scale down, except for a node outdated only
 // by age, or of a group with the selector empty, which only gets no new work
 // and goes when it is empty; a node at its hard limit is always drained. A
@@ -50,8 +51,19 @@ import (
 // on them. A refused new node (the provider's quota or capacity) or a new
 // node that does not join gives the old node back its eligibility and backs
 // the rollout off, as a veto of a scale down does (10 minutes, doubling to 6
-// hours); a node at its hard limit is then replaced remove first. A backed off
-// rollout whose nodes are close to their hard limit raises RollBlocked.
+// hours); a node at its hard limit is then replaced remove first, and so is a
+// node at its soft age limit when the group keeps a headroom of a node or more
+// (headroom_nodes, headroom_percent) and nothing has to be drained for it. A
+// backed off rollout whose nodes are close to their hard limit raises
+// RollBlocked.
+//
+// A week before its hard limit (an eighth of its life for a short one) a node
+// not being replaced raises a Rolling event, once. RollBehind is raised early
+// when the queue cannot be done in time: the nodes with a hard limit, in the
+// order of their limits, each no sooner than its soft limit, max_unavailable
+// at a time, each taking as long as the last replacement took
+// (status.rollout.took; the slow_after of the join and the drain deadline
+// before the first).
 // rolling.mode = "paused" starts no replacement except at the hard limit, and
 // enforce = false starts none: the outdated nodes are reported only. The
 // state is status.rollout, so another operator instance goes on with it.
@@ -62,6 +74,9 @@ const (
 	// CondRollBlocked is True while a backed off rollout has a node close to
 	// its hard age limit.
 	CondRollBlocked = "RollBlocked"
+	// CondRollBehind is True when the outdated nodes would not all be
+	// replaced before their hard age limits.
+	CondRollBehind = "RollBehind"
 
 	reasonMarked     = "marked"
 	reasonRevision   = "revision"
@@ -129,6 +144,12 @@ type rollout struct {
 	// backed off rollout raises RollBlocked for it: a week before, or an
 	// eighth of the life of the node for a short one.
 	Due, Warn time.Time
+	// Warned are the nodes that raised the Rolling event of their hard limit.
+	Warned []string
+	// Took is how long the last replacement took.
+	Took time.Duration
+	// Behind is RollBehind, nil when the nodes were not looked at.
+	Behind *condition
 }
 
 func readRollout(status map[string]any) *rollout {
@@ -146,6 +167,10 @@ func readRollout(status map[string]any) *rollout {
 		ro.Backoff = readVeto(map[string]any{"scaleDown": b})
 	}
 	ro.Outdated = append(ro.Outdated, asList(d["outdated"])...)
+	ro.Warned = asList(d["warned"])
+	if s, ok := d["took"].(string); ok {
+		ro.Took, _ = time.ParseDuration(s)
+	}
 	return ro
 }
 
@@ -161,7 +186,7 @@ func asList(v any) []string {
 }
 
 func (ro *rollout) doc() map[string]any {
-	if len(ro.Replacing) == 0 && ro.Backoff.Vetoes == 0 && len(ro.Outdated) == 0 {
+	if len(ro.Replacing) == 0 && ro.Backoff.Vetoes == 0 && len(ro.Outdated) == 0 && len(ro.Warned) == 0 && ro.Took == 0 {
 		return nil
 	}
 	replacing := make([]any, 0, len(ro.Replacing))
@@ -175,6 +200,16 @@ func (ro *rollout) doc() map[string]any {
 	d := map[string]any{"replacing": replacing, "outdated": outdated}
 	if b := ro.Backoff.doc(); b != nil {
 		d["backoff"] = b
+	}
+	if len(ro.Warned) > 0 {
+		warned := make([]any, 0, len(ro.Warned))
+		for _, name := range ro.Warned {
+			warned = append(warned, name)
+		}
+		d["warned"] = warned
+	}
+	if ro.Took > 0 {
+		d["took"] = ro.Took.Round(time.Second).String()
 	}
 	return d
 }
@@ -276,14 +311,17 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 	if failing || joining > 0 || ready < want || live > want || readRemoval(status) != nil {
 		return res
 	}
-	outdated := r.outdatedNodes(ctx, obj, spec, o, ro, now)
+	outdated, ages := r.outdatedNodes(ctx, obj, spec, o, ro, now)
 	for _, c := range outdated {
 		ro.Outdated = append(ro.Outdated, c.node.Name)
 		if !c.expires.IsZero() && (ro.Due.IsZero() || c.expires.Before(ro.Due)) {
 			ro.Due = c.expires
-			ro.Warn = c.expires.Add(-min(rollWarn, c.expires.Sub(c.created)/8))
+			ro.Warn = warnAt(c.created, c.expires)
 		}
 	}
+	r.warnHardLimits(ctx, obj, ro, ages, now)
+	backedOff := ro.Backoff.Vetoes > 0 && now.Before(ro.Backoff.RetryAfter)
+	ro.Behind = r.behind(ctx, obj, spec, ro, ages, status, backedOff, now)
 	if !spec.Enforce {
 		if len(outdated) > 0 && !slices.Equal(ro.Outdated, readRollout(status).Outdated) {
 			r.event(ctx, obj, api.ObjectEventTypeNormal, "WouldReplace",
@@ -291,16 +329,27 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 		}
 		return res
 	}
-	backedOff := ro.Backoff.Vetoes > 0 && now.Before(ro.Backoff.RetryAfter)
+	surging := 0
+	for _, m := range ro.Replacing {
+		if m.Surge && m.Phase != phaseDeleted {
+			surging++
+		}
+	}
 	for _, c := range outdated {
 		if len(ro.Replacing) >= spec.maxUnavailable() {
 			break
 		}
 		atLimit := c.reason == reasonExpiry
-		if !atLimit && (spec.paused() || backedOff) {
+		// At the soft limit, a refused surge does not make the node wait when
+		// the headroom of the group covers it: it is removed first.
+		covered := c.reason == reasonAge && spec.headroomNodes() >= 1
+		if !atLimit && (spec.paused() || (backedOff && !covered)) {
 			continue
 		}
-		surge := spec.surge() && !backedOff
+		surge := surging < spec.maxSurge() && !backedOff
+		if surge {
+			surging++
+		}
 		drain := atLimit || (spec.selector() == selectorLeastBusy && c.reason != reasonAge)
 		if !surge && drain && !atLimit {
 			if why := r.irreplaceable(ctx, c.allocs, c.node.ID); why != "" {
@@ -329,7 +378,11 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 			break
 		}
 		how := "a new node is asked for first"
-		if !surge {
+		switch {
+		case !surge && backedOff && !atLimit:
+			how = fmt.Sprintf("it is removed first: new nodes are backed off (%s), and the headroom of %d nodes covers it",
+				ro.Backoff.Reason, spec.headroomNodes())
+		case !surge:
 			how = "it is removed first"
 		}
 		r.event(ctx, obj, api.ObjectEventTypeNormal, "Replacing",
@@ -342,12 +395,20 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 	return res
 }
 
+// nodeAge is a node of the group with a hard age limit, not being replaced.
+type nodeAge struct {
+	name                string
+	created, soft, hard time.Time
+}
+
 // outdatedNodes lists the ready nodes of the group to replace, those at their
-// hard limit first, then the oldest.
+// hard limit first, then the oldest, and the age limits of the nodes that
+// have a hard one.
 func (r *Reconciler) outdatedNodes(ctx context.Context, obj *api.CustomObject, spec *groupSpec, o *observed,
-	ro *rollout, now time.Time) []outdatedNode {
+	ro *rollout, now time.Time) ([]outdatedNode, []nodeAge) {
 
 	var out []outdatedNode
+	var ages []nodeAge
 	for _, inst := range o.instances {
 		node, ok := o.nodeOf[instanceKey(inst)]
 		if !isLive(inst) || !ok || !node.Ready || ro.find(inst.ID) != nil {
@@ -375,6 +436,13 @@ func (r *Reconciler) outdatedNodes(ctx context.Context, obj *api.CustomObject, s
 		if c.reason != "" {
 			out = append(out, c)
 		}
+		if !c.expires.IsZero() {
+			soft := c.created.Add(softAge(spec, instanceKey(inst), c.created, certExpires))
+			if c.reason != "" && c.reason != reasonAge {
+				soft = now // outdated for another reason: due now
+			}
+			ages = append(ages, nodeAge{name: node.Name, created: c.created, soft: soft, hard: c.expires})
+		}
 	}
 	slices.SortStableFunc(out, func(a, b outdatedNode) int {
 		if (a.reason == reasonExpiry) != (b.reason == reasonExpiry) {
@@ -385,7 +453,7 @@ func (r *Reconciler) outdatedNodes(ctx context.Context, obj *api.CustomObject, s
 		}
 		return a.created.Compare(b.created)
 	})
-	return out
+	return out, ages
 }
 
 // outdatedReason says why a node is outdated, or "" when it is not.
@@ -401,17 +469,116 @@ func outdatedReason(spec *groupSpec, meta map[string]string, name string, create
 	if gen, err := strconv.ParseInt(meta[MetaGeneration], 10, 64); spec.Rolling.Generation > 0 && (err != nil || gen < spec.Rolling.Generation) {
 		return reasonGeneration
 	}
+	if soft := softAge(spec, name, created, certExpires); soft > 0 && !created.IsZero() && now.Sub(created) >= soft {
+		return reasonAge
+	}
+	return ""
+}
+
+// softAge is the soft age limit of a node: rolling.max_node_age, or three
+// quarters of the life of its certificate, less its jitter; 0 when it has
+// none.
+func softAge(spec *groupSpec, name string, created, certExpires time.Time) time.Duration {
 	maxAge, err := parseDuration(spec.Rolling.MaxNodeAge)
 	if (err != nil || maxAge <= 0) && !certExpires.IsZero() {
 		maxAge = certExpires.Sub(created) * 3 / 4
 	}
-	if maxAge > 0 && !created.IsZero() {
-		soft := time.Duration(float64(maxAge) * (1 - spec.jitter()*jitterOf(name)))
-		if now.Sub(created) >= soft {
-			return reasonAge
+	if maxAge <= 0 {
+		return 0
+	}
+	return time.Duration(float64(maxAge) * (1 - spec.jitter()*jitterOf(name)))
+}
+
+// warnAt is when a node raises the warnings of its hard limit: a week before
+// it, or an eighth of its life for a short one.
+func warnAt(created, hard time.Time) time.Time {
+	return hard.Add(-min(rollWarn, hard.Sub(created)/8))
+}
+
+// warnHardLimits raises a Rolling event, once, for each node that is not
+// being replaced and whose hard limit is close: it is drained then.
+func (r *Reconciler) warnHardLimits(ctx context.Context, obj *api.CustomObject, ro *rollout, ages []nodeAge, now time.Time) {
+	var warned []string
+	for _, a := range ages {
+		if now.Before(warnAt(a.created, a.hard)) {
+			continue
+		}
+		warned = append(warned, a.name)
+		if !slices.Contains(ro.Warned, a.name) {
+			r.event(ctx, obj, api.ObjectEventTypeWarning, CondRolling,
+				fmt.Sprintf("node %s reaches its hard age limit at %s and is drained then, if it is not replaced before",
+					a.name, a.hard.UTC().Format(time.RFC3339)))
 		}
 	}
-	return ""
+	ro.Warned = warned
+}
+
+// behind is the condition RollBehind: whether the nodes with a hard limit can
+// be replaced before it, max_unavailable at a time. It turning True raises
+// an event.
+func (r *Reconciler) behind(ctx context.Context, obj *api.CustomObject, spec *groupSpec, ro *rollout, ages []nodeAge,
+	status map[string]any, backedOff bool, now time.Time) *condition {
+
+	c := &condition{Type: CondRollBehind, Status: "False", Reason: "OnTime"}
+	if !spec.Enforce || spec.paused() {
+		c.Reason, c.Message = "NotRolling", "no replacement starts before the hard limit (enforce = false or rolling.mode = paused)"
+		return c
+	}
+	per := ro.Took
+	if per <= 0 {
+		per = spec.slowAfter() + spec.drainDeadline()
+	}
+	start := now
+	if backedOff {
+		start = ro.Backoff.RetryAfter
+	}
+	late := lateNodes(ages, ro.Replacing, spec.maxUnavailable(), per, start)
+	if len(late) == 0 {
+		return c
+	}
+	c.Status, c.Reason = "True", "Behind"
+	c.Message = fmt.Sprintf("%d nodes would reach their hard age limit before they are replaced, %d at a time, %s each "+
+		"(first: %s at %s); raise rolling.max_unavailable",
+		len(late), spec.maxUnavailable(), per.Round(time.Second), late[0].name, late[0].hard.UTC().Format(time.RFC3339))
+	if conditionStatusOf(status, CondRollBehind) != "True" {
+		r.event(ctx, obj, api.ObjectEventTypeWarning, CondRollBehind, c.Message)
+	}
+	return c
+}
+
+// lateNodes plays the queue of replacements: the nodes in the order of their
+// hard limits, each no sooner than its soft limit, on slots replacements at a
+// time (the ones in progress hold a slot until they are done), each taking
+// per. It returns the nodes that would be done after their hard limit.
+func lateNodes(ages []nodeAge, replacing []*replacement, slots int, per time.Duration, start time.Time) []nodeAge {
+	free := make([]time.Time, max(slots, 1))
+	for i := range free {
+		free[i] = start
+		if i < len(replacing) {
+			if done := replacing[i].Since.Add(per); done.After(start) {
+				free[i] = done
+			}
+		}
+	}
+	queue := slices.SortedFunc(slices.Values(ages), func(a, b nodeAge) int { return a.hard.Compare(b.hard) })
+	var late []nodeAge
+	for _, a := range queue {
+		k := 0
+		for i := range free {
+			if free[i].Before(free[k]) {
+				k = i
+			}
+		}
+		begin := free[k]
+		if a.soft.After(begin) {
+			begin = a.soft
+		}
+		free[k] = begin.Add(per)
+		if free[k].After(a.hard) {
+			late = append(late, a)
+		}
+	}
+	return late
 }
 
 // jitterOf is a fixed number in [0, 1) from the name of a node.
@@ -505,6 +672,7 @@ func (r *Reconciler) continueReplacement(ctx context.Context, obj *api.CustomObj
 			}
 			r.event(ctx, obj, api.ObjectEventTypeNormal, "Replaced",
 				fmt.Sprintf("node %s (%s) is replaced", m.NodeName, m.Reason))
+			ro.Took = now.Sub(m.Since)
 			ro.drop(m)
 		}
 	}

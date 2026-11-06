@@ -68,7 +68,12 @@ type groupSpec struct {
 	Provider   string `json:"provider"`
 	Group      string `json:"group"`
 	Network    string `json:"network"`
-	Node       struct {
+
+	// The spare capacity the autoscaler keeps in the group.
+	HeadroomNodes   int64   `json:"headroom_nodes"`
+	HeadroomPercent float64 `json:"headroom_percent"`
+
+	Node struct {
 		Meta       map[string]string `json:"meta"`
 		Reserved   *nodeResource     `json:"reserved"`
 		Capacity   *nodeResource     `json:"capacity"`
@@ -123,10 +128,22 @@ func (s *groupSpec) maxUnavailable() int {
 	return 1
 }
 
-// surge reports whether the new node is asked for before the old one goes
-// (rolling.max_surge, 1 by default; 0 removes first).
-func (s *groupSpec) surge() bool {
-	return s.Rolling.MaxSurge == nil || *s.Rolling.MaxSurge > 0
+// maxSurge is how many new nodes may be asked for before the old ones go
+// (rolling.max_surge, 1 by default; 0 removes first). The group then has at
+// most max + max_surge instances; the maximum of the pool is not checked (the
+// operator does not know it).
+func (s *groupSpec) maxSurge() int {
+	if s.Rolling.MaxSurge == nil {
+		return 1
+	}
+	return int(max(*s.Rolling.MaxSurge, 0))
+}
+
+// headroomNodes is the spare capacity the autoscaler keeps in the group, in
+// nodes: headroom_nodes, or headroom_percent of the scale rounded down,
+// whichever is more.
+func (s *groupSpec) headroomNodes() int64 {
+	return max(s.HeadroomNodes, int64(float64(s.replicas())*s.HeadroomPercent/100))
 }
 
 // jitter is the share of the age limit by which a node may be replaced

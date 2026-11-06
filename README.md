@@ -158,7 +158,9 @@ the instances are asked for anyway.
 of the available providers: an instance of this region whose node group is
 gone, or no longer names that provider and group, is deleted after
 `-orphan-after` (15 minutes) if it has no node; one with a node is left alone
-and logged.
+and logged. With `-metrics-addr`, `norca_nodescaler_orphaned_instances` (the
+orphans the last sweep left) and `norca_nodescaler_orphans_deleted_total`
+count them by provider.
 
 The status is shared with the autoscaler (`status.decision`): the operator
 changes only its own fields and writes with the index it read. Scale down

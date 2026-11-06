@@ -392,3 +392,168 @@ func TestRollout_RollBlockedNearTheHardLimit(t *testing.T) {
 		t.Fatalf("RollBlocked: %+v", c)
 	}
 }
+
+// eventsOf returns the messages of the events of a reason.
+func (e *env) eventsOf(reason string) []string {
+	var out []string
+	for _, ev := range e.backend.ObjectEvents(NodeGroupKind, "", "workers-dc1") {
+		if ev.Reason == reason {
+			out = append(out, ev.Message)
+		}
+	}
+	return out
+}
+
+func TestRollout_SurgeLimit(t *testing.T) {
+	// Two at a time, one of them ahead: the second is removed first.
+	e := rollEnv(t, 3, map[string]any{"rolling": map[string]any{"max_unavailable": 2, "max_surge": 1}})
+	ids := e.nodeIDs()
+	for _, id := range ids[:2] {
+		e.setMeta(id, map[string]string{MetaReplace: "true"})
+	}
+	e.reconcile()
+	ro := e.rollout()
+	if len(ro.Replacing) != 2 {
+		t.Fatalf("replacing %+v", ro.Replacing)
+	}
+	surges := 0
+	for _, m := range ro.Replacing {
+		if m.Surge {
+			surges++
+		}
+	}
+	if surges != 1 {
+		t.Fatalf("%d replacements surge, want 1: %+v", surges, ro.Replacing)
+	}
+	// max + max_surge at most: one instance more than the scale.
+	if n := len(e.instances()); n != 4 {
+		t.Fatalf("%d instances, want 4", n)
+	}
+}
+
+func TestRollout_HeadroomRemovesFirst(t *testing.T) {
+	// The mock group holds 5 instances: the new node of a group of 5 is
+	// refused. A node at its soft age limit then waits, unless the headroom
+	// of the group covers a node.
+	for _, headroom := range []int{0, 1} {
+		t.Run(fmt.Sprint("headroom ", headroom), func(t *testing.T) {
+			e := rollEnv(t, 5, map[string]any{"headroom_nodes": headroom,
+				"rolling": map[string]any{"max_node_age": "10d", "jitter": "0%"}})
+			old := e.firstNode()
+			e.setMeta(old, map[string]string{MetaCreatedAt: e.now.Add(-11 * 24 * time.Hour).Format(time.RFC3339)})
+			e.reconcile() // the surge is refused: backed off
+			if ro := e.rollout(); ro.Backoff.Reason != "SurgeRefused" || len(ro.Replacing) != 0 {
+				t.Fatalf("rollout %+v backoff %+v", ro.Replacing, ro.Backoff)
+			}
+			e.reconcile()
+			ro := e.rollout()
+			if headroom == 0 {
+				if len(ro.Replacing) != 0 {
+					t.Fatalf("started without a headroom: %+v", ro.Replacing)
+				}
+				return
+			}
+			if len(ro.Replacing) != 1 || ro.Replacing[0].Surge || ro.Replacing[0].Phase != phaseEmptying || ro.Replacing[0].Node != old {
+				t.Fatalf("replacing %+v", ro.Replacing)
+			}
+			if n := len(e.instances()); n != 5 {
+				t.Fatalf("%d instances, want 5: removed first", n)
+			}
+			msgs := e.eventsOf("Replacing")
+			if len(msgs) == 0 || !strings.Contains(msgs[len(msgs)-1], "headroom") {
+				t.Fatalf("Replacing events: %q", msgs)
+			}
+		})
+	}
+}
+
+func TestRollout_HardLimitWarning(t *testing.T) {
+	// A node 49 days into a certificate of 60 days: its hard limit is day
+	// 55, a week before is day 48. Its soft limit (max_node_age 100d) is not
+	// reached, so nothing replaces it.
+	e := rollEnv(t, 2, map[string]any{"rolling": map[string]any{"max_node_age": "100d"}})
+	old := e.firstNode()
+	created := e.now.Add(-49 * 24 * time.Hour)
+	e.setMeta(old, map[string]string{MetaCreatedAt: created.Format(time.RFC3339),
+		bootstrap.MetaCertExpires: created.Add(60 * 24 * time.Hour).Format(time.RFC3339)})
+	e.reconcile()
+	e.reconcile()
+	msgs := e.eventsOf(CondRolling)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], old) || !strings.Contains(msgs[0], "drained") {
+		t.Fatalf("Rolling events: %q", msgs)
+	}
+	if ro := e.rollout(); !slices.Equal(ro.Warned, []string{old}) || len(ro.Replacing) != 0 {
+		t.Fatalf("warned %v replacing %+v", ro.Warned, ro.Replacing)
+	}
+}
+
+func TestRollout_RollBehind(t *testing.T) {
+	// Three nodes created together with certificates of 60 days: the soft
+	// limit is day 54 (no jitter), the hard one day 55. A replacement takes
+	// 10h05m (the slow_after of 5m and a drain deadline of 10h): one at a
+	// time, the third is done 30 hours after day 54, past its hard limit.
+	for _, tc := range []struct {
+		unavailable int
+		behind      string
+	}{{1, "True"}, {3, "False"}} {
+		t.Run(fmt.Sprint("max_unavailable ", tc.unavailable), func(t *testing.T) {
+			e := rollEnv(t, 3, map[string]any{
+				"rolling": map[string]any{"max_node_age": "54d", "jitter": "0%", "max_unavailable": tc.unavailable},
+				"policy":  map[string]any{"scale_down": map[string]any{"drain_deadline": "10h"}},
+			})
+			for _, id := range e.nodeIDs() {
+				e.setMeta(id, map[string]string{bootstrap.MetaCertExpires: e.now.Add(60 * 24 * time.Hour).Format(time.RFC3339)})
+			}
+			e.reconcile()
+			e.reconcile()
+			c := conditionOf(e.status(), CondRollBehind)
+			if c["status"] != tc.behind {
+				t.Fatalf("RollBehind: %+v", c)
+			}
+			want := 0
+			if tc.behind == "True" {
+				want = 1
+			}
+			if n := len(e.eventsOf(CondRollBehind)); n != want {
+				t.Fatalf("%d RollBehind events, want %d", n, want)
+			}
+		})
+	}
+}
+
+func TestLateNodes(t *testing.T) {
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	ages := []nodeAge{
+		{name: "c", soft: start, hard: start.Add(3 * day)},
+		{name: "a", soft: start, hard: start.Add(day)},
+		{name: "b", soft: start, hard: start.Add(2 * day)},
+	}
+	// One at a time, a day each: a is done at day 1 (on time), b at day 2,
+	// c at day 3.
+	if late := lateNodes(ages, nil, 1, day, start); len(late) != 0 {
+		t.Fatalf("late %+v", late)
+	}
+	// A replacement in progress that started now holds the only slot for a
+	// day: every node is a day late.
+	inProgress := []*replacement{{Since: start}}
+	if late := lateNodes(ages, inProgress, 1, day, start); len(late) != 3 || late[0].name != "a" {
+		t.Fatalf("late %+v", late)
+	}
+	// Two slots, one held for a day: a on the free one (day 1), b after the
+	// one in progress (day 2), c after a (day 2): all on time.
+	if late := lateNodes(ages, inProgress, 2, day, start); len(late) != 0 {
+		t.Fatalf("late %+v", late)
+	}
+	// Two slots and a node due at day 1 too: one of the two due at day 1
+	// waits for the slot in progress.
+	twoDue := append(slices.Clone(ages), nodeAge{name: "a2", soft: start, hard: start.Add(day)})
+	if late := lateNodes(twoDue, inProgress, 2, day, start); len(late) != 1 || !strings.HasPrefix(late[0].name, "a") {
+		t.Fatalf("late %+v", late)
+	}
+	// A node waits for its soft limit.
+	late := lateNodes([]nodeAge{{name: "d", soft: start.Add(2 * day), hard: start.Add(2*day + time.Hour)}}, nil, 1, day, start)
+	if len(late) != 1 {
+		t.Fatalf("late %+v", late)
+	}
+}

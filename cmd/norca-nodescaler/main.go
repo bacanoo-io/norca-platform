@@ -202,6 +202,7 @@ func run(ctx context.Context, args []string) error {
 		AllowHTTP:      f.allowHTTP,
 		OrphanAfter:    f.orphanAfter,
 		DeleteOrphans:  f.deleteOrphans,
+		Metrics:        metrics,
 		Logger:         logger,
 	})
 	var election *controller.LeaderElectionConfig

@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -114,5 +115,46 @@ func TestOrphans_WithNodeReportedOrDeleted(t *testing.T) {
 	e.r.cfg.DeleteOrphans = true
 	if n := e.sweep(); n != 1 || e.has(withNode) {
 		t.Fatalf("deleted %d, the instance is there: %t", n, e.has(withNode))
+	}
+}
+
+// recMetrics records the operator's own metrics.
+type recMetrics struct{ gauges, counters map[string]float64 }
+
+func newRecMetrics() *recMetrics {
+	return &recMetrics{gauges: map[string]float64{}, counters: map[string]float64{}}
+}
+
+func metricKey(name string, labels []string) string { return name + fmt.Sprint(labels) }
+
+func (m *recMetrics) SetGauge(name string, v float64, labels ...string) {
+	m.gauges[metricKey(name, labels)] = v
+}
+
+func (m *recMetrics) AddCounter(name string, v float64, labels ...string) {
+	m.counters[metricKey(name, labels)] += v
+}
+
+func TestOrphans_Metrics(t *testing.T) {
+	e := newEnv(t, "")
+	m := newRecMetrics()
+	e.r.cfg.Metrics = m
+	labels := map[string]string{LabelRegion: "eu", LabelNodeGroup: "deleted-group", LabelDatacenter: "dc1", LabelPool: "workers"}
+	e.createRaw("r-gone", labels)
+	withNode := e.createRaw("r-node", labels)
+	e.nodes.set(Node{ID: "n9", Name: "node-9", Instance: withNode, Ready: true})
+	e.advance(16 * time.Minute)
+
+	// The orphan without a node is deleted, the one with a node is left.
+	e.sweep()
+	orphans, deleted := metricKey(metricOrphans, []string{"provider", "mock"}), metricKey(metricOrphansDeleted, []string{"provider", "mock"})
+	if m.gauges[orphans] != 1 || m.counters[deleted] != 1 {
+		t.Fatalf("gauges %v counters %v", m.gauges, m.counters)
+	}
+	// It goes too: none left.
+	e.r.cfg.DeleteOrphans = true
+	e.sweep()
+	if m.gauges[orphans] != 0 || m.counters[deleted] != 2 {
+		t.Fatalf("gauges %v counters %v", m.gauges, m.counters)
 	}
 }

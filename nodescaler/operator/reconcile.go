@@ -73,6 +73,10 @@ type Config struct {
 	// it they are only reported (orphans.go).
 	DeleteOrphans bool
 
+	// Metrics receives the operator's own measurements, such as the orphans
+	// a sweep found (controller.TextMetrics); nil drops them.
+	Metrics OwnMetrics
+
 	// Bootstrap gives the template of the bootstrap of a node; nil sends
 	// no bootstrap, only the names of the instances.
 	Bootstrap BootstrapSource
@@ -89,6 +93,13 @@ type Config struct {
 
 	Logger *slog.Logger
 	Now    func() time.Time
+}
+
+// OwnMetrics receives the measurements of the operator itself. The labels
+// are name and value pairs.
+type OwnMetrics interface {
+	SetGauge(name string, v float64, labels ...string)
+	AddCounter(name string, v float64, labels ...string)
 }
 
 // Reconciler reconciles NodeGroup objects.
@@ -369,6 +380,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		rolling, rollBlocked := roll.state.conditions(spec, now)
 		setCondition(status, rolling, now)
 		setCondition(status, rollBlocked, now)
+		if roll.state.Behind != nil {
+			// Kept as it was while the group grows or shrinks.
+			setCondition(status, *roll.state.Behind, now)
+		}
 		if down.removal != nil {
 			status["removal"] = down.removal.doc()
 		} else {

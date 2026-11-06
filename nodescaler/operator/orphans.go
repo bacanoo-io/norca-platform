@@ -45,10 +45,12 @@ func (r *Reconciler) SweepOrphans(ctx context.Context) (int, error) {
 			r.log.Warn("orphan sweep: provider skipped", "provider", name, "error", err)
 			continue
 		}
+		left, complete := 0, true
 		for _, group := range slices.Sorted(maps.Keys(reg.Groups)) {
 			pg, err := client.Group(ctx, group, nil)
 			if err != nil {
 				r.log.Warn("orphan sweep: group skipped", "provider", name, "group", group, "error", err)
+				complete = false
 				continue
 			}
 			for _, inst := range pg.Instances {
@@ -58,19 +60,49 @@ func (r *Reconciler) SweepOrphans(ctx context.Context) (int, error) {
 				}
 				if node != nil && !r.cfg.DeleteOrphans {
 					r.reportOrphan(ctx, name, inst, *node)
+					left++
 					continue
 				}
 				if err := client.Delete(ctx, group, inst.ID); err != nil {
 					r.log.Warn("orphan sweep: deleting an instance failed", "provider", name, "instance", inst.ID, "error", err)
+					left++
 					continue
 				}
 				deleted++
+				r.addCounter(metricOrphansDeleted, 1, "provider", name)
 				r.log.Info("orphaned instance deleted", "provider", name, "group", group, "instance", inst.ID,
 					"node_group", inst.Labels[LabelNodeGroup], "with_node", node != nil)
 			}
 		}
+		if complete {
+			// A provider not swept to the end keeps the count of its last
+			// complete sweep.
+			r.setGauge(metricOrphans, float64(left), "provider", name)
+		}
 	}
 	return deleted, nil
+}
+
+// The metrics of the orphan sweep, by provider.
+const (
+	// metricOrphans is the number of orphaned instances the last sweep
+	// left: those with a node (without -delete-orphans) and those whose
+	// deletion failed.
+	metricOrphans = "norca_nodescaler_orphaned_instances"
+	// metricOrphansDeleted counts the orphaned instances deleted.
+	metricOrphansDeleted = "norca_nodescaler_orphans_deleted_total"
+)
+
+func (r *Reconciler) setGauge(name string, v float64, labels ...string) {
+	if r.cfg.Metrics != nil {
+		r.cfg.Metrics.SetGauge(name, v, labels...)
+	}
+}
+
+func (r *Reconciler) addCounter(name string, v float64, labels ...string) {
+	if r.cfg.Metrics != nil {
+		r.cfg.Metrics.AddCounter(name, v, labels...)
+	}
 }
 
 // orphan reports whether an instance is an orphan: of this region, of a node
