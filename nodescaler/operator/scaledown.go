@@ -196,7 +196,7 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 		slices.SortFunc(unjoined, func(a, b provider.Instance) int { return b.CreatedAt.Compare(a.CreatedAt) })
 		inst := unjoined[0]
 		if err := client.Delete(ctx, group, inst.ID); err != nil {
-			r.log.Warn("deleting an instance for a scale down failed", "group", obj.Name, "instance", inst.ID, "error", err)
+			r.downFailed(ctx, obj, "deleting an instance for a scale down failed", inst.ID, err)
 			res.requeue = r.cfg.RetryAfter
 			return res
 		}
@@ -222,7 +222,7 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 	switch m.Selector {
 	case selectorEmpty:
 		if err := r.Nodes.SetIneligible(ctx, node.ID); err != nil {
-			r.log.Warn("making a node ineligible failed", "group", obj.Name, "node", node.ID, "error", err)
+			r.downFailed(ctx, obj, "making a node ineligible failed", node.ID, err)
 			res.requeue = r.cfg.RetryAfter
 			return res
 		}
@@ -232,7 +232,7 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 		res.requeue = settleTime
 	default:
 		if err := r.Nodes.Drain(ctx, node.ID, spec.drainDeadline()); err != nil {
-			r.log.Warn("starting a drain failed", "group", obj.Name, "node", node.ID, "error", err)
+			r.downFailed(ctx, obj, "starting a drain failed", node.ID, err)
 			res.requeue = r.cfg.RetryAfter
 			return res
 		}
@@ -341,7 +341,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 				err = r.Nodes.SetEligible(ctx, m.Node)
 			}
 			if err != nil {
-				r.log.Warn("making a node eligible again failed", "group", obj.Name, "node", m.Node, "error", err)
+				r.downFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
 				return
 			}
 		}
@@ -366,12 +366,12 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 		case errors.Is(err, ErrNodeNotFound):
 			res.removal, res.requeue = nil, 0
 		case err != nil:
-			r.log.Warn("reading a node failed", "group", obj.Name, "node", m.Node, "error", err)
+			r.downFailed(ctx, obj, "reading a node failed", m.Node, err)
 		case !d.Ready || now.Sub(m.Started) > downWait:
 			if d.Ready {
 				r.log.Warn("the node of a deleted instance is still up, it is left as it is", "group", obj.Name, "node", m.Node)
 			} else if err := r.Nodes.Purge(ctx, m.Node); err != nil {
-				r.log.Warn("purging a node failed", "group", obj.Name, "node", m.Node, "error", err)
+				r.downFailed(ctx, obj, "purging a node failed", m.Node, err)
 				return
 			}
 			res.removal, res.requeue = nil, 0
@@ -383,13 +383,13 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 	case m.Phase == phaseSettling:
 		d, err := r.Nodes.Detail(ctx, m.Node)
 		if err != nil {
-			r.log.Warn("reading a node failed", "group", obj.Name, "node", m.Node, "error", err)
+			r.downFailed(ctx, obj, "reading a node failed", m.Node, err)
 			return
 		}
 		if len(d.Allocs) > 0 {
 			// Work arrived before the ineligibility: the node stays.
 			if err := r.Nodes.SetEligible(ctx, m.Node); err != nil {
-				r.log.Warn("making a node eligible again failed", "group", obj.Name, "node", m.Node, "error", err)
+				r.downFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
 				return
 			}
 			r.event(ctx, obj, api.ObjectEventTypeNormal, "NodeNotEmpty",
@@ -407,7 +407,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 	case m.Phase == phaseDraining:
 		d, err := r.Nodes.Detail(ctx, m.Node)
 		if err != nil {
-			r.log.Warn("reading a node failed", "group", obj.Name, "node", m.Node, "error", err)
+			r.downFailed(ctx, obj, "reading a node failed", m.Node, err)
 			return
 		}
 		switch {
@@ -417,7 +417,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 		case !d.Draining || now.Sub(m.Started) > spec.drainDeadline()+drainGrace:
 			// Canceled by someone else, or stuck: the node stays.
 			if err := r.Nodes.CancelDrain(ctx, m.Node); err != nil {
-				r.log.Warn("stopping a drain failed", "group", obj.Name, "node", m.Node, "error", err)
+				r.downFailed(ctx, obj, "stopping a drain failed", m.Node, err)
 				return
 			}
 			why := fmt.Sprintf("the drain of node %s did not finish in %s", m.Node, spec.drainDeadline()+drainGrace)
@@ -437,7 +437,7 @@ func (r *Reconciler) deleteInstance(ctx context.Context, obj *api.CustomObject, 
 	o *observed, m *removal, now time.Time) {
 
 	if err := client.Delete(ctx, group, m.Instance); err != nil {
-		r.log.Warn("deleting an instance failed", "group", obj.Name, "instance", m.Instance, "error", err)
+		r.downFailed(ctx, obj, "deleting an instance failed", m.Instance, err)
 		return
 	}
 	o.drop(m.Instance)
@@ -448,6 +448,14 @@ func (r *Reconciler) deleteInstance(ctx context.Context, obj *api.CustomObject, 
 	r.event(ctx, obj, api.ObjectEventTypeNormal, "InstanceDeleted",
 		fmt.Sprintf("instance %s is deleted, its node %s %s", m.Instance, m.Node, how))
 	m.Phase, m.Started = phaseDeleted, now
+}
+
+// downFailed reports a step of a scale down that failed: in the log, and as
+// a warning in the log of the group, so it is seen. The step is tried again at
+// the next look.
+func (r *Reconciler) downFailed(ctx context.Context, obj *api.CustomObject, what, target string, err error) {
+	r.log.Warn(what, "group", obj.Name, "target", target, "error", err)
+	r.event(ctx, obj, api.ObjectEventTypeWarning, "ScaleDownFailed", fmt.Sprintf("%s (%s): %v", what, target, err))
 }
 
 // isLive reports an instance that is created or being created.
