@@ -188,6 +188,30 @@ name. A request that cannot be served fails with a reason:
 `quota`, `no_capacity`, `invalid` or `error`. See the package documentation
 of `nodescaler/provider`.
 
+A provider implements `provider.Provider` (`Group`, `Create`, `Delete`),
+serves it with `provider.NewHandler` and registers it with
+`registrar.Registrar`; `cmd/nodeprovider` puts the three together.
+**`nodescaler/provider/providertest`** checks a provider against the
+contract over HTTP, as the operator calls it: the capacity of a group
+without instances, a create that is idempotent by its request ID, the names,
+labels and request IDs of the instances, invalid requests, the quota reason,
+the delete, a restart that loses nothing, and the token. The mock and the
+docker provider run it in their tests; a provider for a cloud runs it
+against a test account:
+
+```go
+func TestContract(t *testing.T) {
+	providertest.Run(t, providertest.Config{
+		New:        func(t *testing.T) provider.Provider { return newProvider(t) },
+		Restart:    func(t *testing.T, _ provider.Provider) provider.Provider { return newProvider(t) },
+		Group:      "fsn1",
+		Params:     map[string]any{"size": "cx22"},
+		QuotaGroup: "fsn1-small", QuotaMax: 2,
+		Settle:     time.Minute, // the lists of the platform lag behind its writes
+	})
+}
+```
+
 ```shell
 nodeprovider -name mock -listen :8480 -endpoint http://10.0.0.5:8480 \
   -group dc1:4000:8192:40000:10 -token-file /secrets/token
