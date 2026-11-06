@@ -12,6 +12,10 @@
 // of the node travels in the user data, so the document is handed to the
 // provider only, and the certificate is short-lived (60 days by default):
 // the node is replaced before it expires.
+//
+// RenderJoin is the hardened bootstrap (package join): no key and no
+// certificate, a one-time token with which norca-join on the machine fetches
+// a certificate for a key it makes, and renews it.
 package bootstrap
 
 import (
@@ -29,6 +33,8 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/bacanoo-io/norca-platform/nodescaler/join"
 
 	pki "github.com/bacanoo-io/norca-pki"
 )
@@ -54,6 +60,9 @@ const (
 	ItemTLSDir     = "tls_dir"
 	ItemConfigFile = "config_file"
 	ItemService    = "service"
+	// ItemJoinBinary is where norca-join is on the machines of the nodes
+	// that join with a key of their own (default /usr/local/bin/norca-join).
+	ItemJoinBinary = "join_binary"
 )
 
 // MetaCertExpires is the meta key of a node with the expiry of its
@@ -75,7 +84,13 @@ type Template struct {
 	TLSDir      string
 	ConfigFile  string
 	Service     string
+	JoinBinary  string
 	agent       *template.Template
+}
+
+// JoinAuthority is what the join endpoint signs with.
+func (t *Template) JoinAuthority() *join.Authority {
+	return &join.Authority{CAPEM: t.CAPEM, NodeCA: t.NodeCA, TrustDomain: t.TrustDomain}
 }
 
 // Parse reads a template from the items of the bootstrap Variable.
@@ -104,6 +119,7 @@ func Parse(region string, items map[string]string) (*Template, error) {
 	t := &Template{
 		Region: region, CAPEM: []byte(items[ItemCA]), NodeCA: nodeCA, agent: agent,
 		Validity: DefaultValidity, TLSDir: "/etc/norca/tls", ConfigFile: "/etc/norca/norca.hcl", Service: "norca",
+		JoinBinary: "/usr/local/bin/norca-join",
 	}
 	if td := items[ItemTrustDomain]; td != "" {
 		if t.TrustDomain, err = pki.TrustDomain(td); err != nil {
@@ -117,7 +133,8 @@ func Parse(region string, items map[string]string) (*Template, error) {
 		}
 		t.Validity = d
 	}
-	for item, field := range map[string]*string{ItemTLSDir: &t.TLSDir, ItemConfigFile: &t.ConfigFile, ItemService: &t.Service} {
+	for item, field := range map[string]*string{ItemTLSDir: &t.TLSDir, ItemConfigFile: &t.ConfigFile, ItemService: &t.Service,
+		ItemJoinBinary: &t.JoinBinary} {
 		if v := strings.TrimSpace(items[item]); v != "" {
 			*field = v
 		}

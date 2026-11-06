@@ -110,6 +110,12 @@ type Config struct {
 	// /usr/local/bin/norca (default /usr/local/bin/norca).
 	Binary string
 
+	// JoinBinary is the path of norca-join on the host, mounted at
+	// /usr/local/bin/norca-join into the container of a node that joins with
+	// a key of its own; norca-join then runs the agent (default
+	// /usr/local/bin/norca-join).
+	JoinBinary string
+
 	// StateDir is where the files of the nodes are written, one directory
 	// per instance.
 	StateDir string
@@ -137,6 +143,9 @@ func New(cfg Config) (*Provider, error) {
 	}
 	if cfg.Binary == "" {
 		cfg.Binary = "/usr/local/bin/norca"
+	}
+	if cfg.JoinBinary == "" {
+		cfg.JoinBinary = "/usr/local/bin/norca-join"
 	}
 	if cfg.Network == "" {
 		cfg.Network = "bridge"
@@ -342,7 +351,15 @@ func (p *Provider) start(ctx context.Context, group string, req provider.CreateR
 		}
 		args = append(args, "-v", host+":"+f.Path+":ro")
 	}
-	args = append(args, "--entrypoint", "/usr/local/bin/norca", p.cfg.Image, "agent", "-config", config)
+	if joinConfig := doc.JoinConfig(); joinConfig != "" {
+		// The node makes its key and gets its certificate itself:
+		// norca-join runs the agent once it has one, and renews it.
+		args = append(args, "-v", p.cfg.JoinBinary+":/usr/local/bin/norca-join:ro",
+			"--entrypoint", "/usr/local/bin/norca-join", p.cfg.Image,
+			"run", "-config", joinConfig, "--", "/usr/local/bin/norca", "agent", "-config", config)
+	} else {
+		args = append(args, "--entrypoint", "/usr/local/bin/norca", p.cfg.Image, "agent", "-config", config)
+	}
 	if _, err := p.cfg.Docker.Run(ctx, args...); err != nil {
 		_ = os.RemoveAll(dir)
 		return provider.Instance{}, err

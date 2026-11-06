@@ -81,6 +81,12 @@ type Config struct {
 	// a group is checked against; nil leaves the check out.
 	Network NetworkSource
 
+	// Join makes the new nodes join with a key of their own (package join):
+	// their bootstrap carries a one-time token and the join endpoints, no
+	// key and no certificate. nil puts the key and the certificate into the
+	// bootstrap. It needs Bootstrap.
+	Join JoinIssuer
+
 	Logger *slog.Logger
 	Now    func() time.Time
 }
@@ -243,6 +249,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	}
 
 	o := r.observe(obj.Name, pg)
+	if r.cfg.Join != nil {
+		live := make(map[string]bool, len(o.instances))
+		for _, inst := range o.instances {
+			live[instanceKey(inst)] = true
+		}
+		if err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(obj.Name), live); err != nil {
+			r.log.Warn("pruning the join records failed", "group", obj.Name, "error", err)
+		}
+	}
 	nodes, err := r.Nodes.Nodes(ctx, spec.Datacenter, spec.Pool, spec.NodeClass)
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
@@ -434,8 +449,22 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 				MetaRequest: r.requestID(obj.Name, seq), MetaCreatedAt: now.UTC().Format(time.RFC3339),
 				MetaRevision: spec.templateRevision(), MetaGeneration: strconv.FormatInt(spec.Rolling.Generation, 10),
 			})
-			rd, err := tmpl.Render(bootstrap.Node{Name: name, Datacenter: spec.Datacenter, Pool: spec.Pool,
-				Class: spec.NodeClass, Meta: meta})
+			node := bootstrap.Node{Name: name, Datacenter: spec.Datacenter, Pool: spec.Pool, Class: spec.NodeClass, Meta: meta}
+			if r.cfg.Join != nil {
+				// The node makes its key and fetches its certificate.
+				ticket, err := r.cfg.Join.Ticket(ctx, obj.Name, name, spec.joinDeadline()+joinSlack)
+				if err != nil {
+					return nil, nil, fmt.Errorf("the join of %s: %w", name, err)
+				}
+				rd, err := tmpl.RenderJoin(node, ticket)
+				if err != nil {
+					return nil, nil, err
+				}
+				ir.Bootstrap = &provider.Bootstrap{UserData: rd.UserData}
+				out = append(out, ir)
+				continue
+			}
+			rd, err := tmpl.Render(node)
 			if err != nil {
 				return nil, nil, err
 			}

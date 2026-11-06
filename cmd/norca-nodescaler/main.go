@@ -13,7 +13,9 @@
 // and write (a foreign node is made ineligible),
 // and read on the Variables with the tokens of the providers and on the
 // bootstrap Variable (nodescaler/bootstrap/<region>), which holds the key of
-// the node CA and must be readable by the operator only.
+// the node CA and must be readable by the operator only. With -join-listen
+// it writes and deletes the join records (nodescaler/join/<region>/*) and
+// reads the service of its join endpoint.
 package main
 
 import (
@@ -22,13 +24,17 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/bacanoo-io/norca-platform/nodescaler/join"
 	"github.com/bacanoo-io/norca-platform/nodescaler/operator"
+	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
 )
 
@@ -63,7 +69,18 @@ type flags struct {
 	bootstrapVar   string
 	bootstrapNS    string
 	networkVar     string
+	joinListen     string
+	joinURLs       stringList
+	joinService    string
+	joinServiceNS  string
+	joinValidity   time.Duration
 }
+
+// stringList collects a repeatable flag.
+type stringList []string
+
+func (s *stringList) String() string     { return strings.Join(*s, ",") }
+func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 func parseFlags(args []string) (*flags, error) {
 	var f flags
@@ -86,8 +103,24 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.bootstrapVar, "bootstrap-variable", "", "Variable with the bootstrap template of the region (default nodescaler/bootstrap/<region>)")
 	fs.StringVar(&f.bootstrapNS, "bootstrap-namespace", "default", "namespace of the bootstrap Variable")
 	fs.StringVar(&f.networkVar, "network-variable", "", "Variable with the cluster ranges of the region, in the namespace of the bootstrap (default nodescaler/network/<region>)")
+	fs.StringVar(&f.joinListen, "join-listen", "", "address of the join endpoint; set, the new nodes make their own keys and fetch and renew their certificates there (norca-join), and the bootstrap carries a one-time token instead of a key")
+	fs.Var(&f.joinURLs, "join-url", "an https URL of the join endpoint the nodes call (a stable name or a load balancer); repeatable; default: the instances of -join-service")
+	fs.StringVar(&f.joinService, "join-service", "nodescaler-join", "service of the native catalog whose instances are the join endpoints, without -join-url")
+	fs.StringVar(&f.joinServiceNS, "join-service-namespace", envOr("NORCA_NAMESPACE", "default"), "namespace of -join-service")
+	fs.DurationVar(&f.joinValidity, "join-validity", 7*24*time.Hour, "validity of the certificate of a node that renews itself (renewed at two thirds)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
+	}
+	if f.joinListen != "" && !f.bootstrap {
+		return nil, errors.New("-join-listen needs -bootstrap")
+	}
+	if f.joinValidity < time.Minute {
+		return nil, errors.New("-join-validity must be at least 1m")
+	}
+	for _, u := range f.joinURLs {
+		if !strings.HasPrefix(u, "https://") {
+			return nil, fmt.Errorf("-join-url %q is not an https URL", u)
+		}
 	}
 	if f.region == "" {
 		return nil, errors.New("-region must not be empty")
@@ -152,8 +185,16 @@ func run(ctx context.Context, args []string) error {
 	if f.bootstrap {
 		boot = &operator.VariableBootstrap{Vars: backend, Namespace: f.bootstrapNS, Path: f.bootstrapVar, Region: f.region}
 	}
+	var joinIssuer operator.JoinIssuer
+	if f.joinListen != "" {
+		joinIssuer, err = startJoin(ctx, f, client, backend, boot, logger)
+		if err != nil {
+			return err
+		}
+	}
 	rec := operator.NewReconciler(backend, &operator.APINodes{Client: client}, operator.Config{
 		Bootstrap:      boot,
+		Join:           joinIssuer,
 		Network:        &operator.VariableNetwork{Vars: backend, Namespace: f.bootstrapNS, Path: f.networkVar},
 		Region:         f.region,
 		ProviderTTL:    f.providerTTL,
@@ -188,4 +229,48 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	return nil
+}
+
+// startJoin serves the join endpoint (on every instance of the operator,
+// not only the leader: the records are shared) and returns the issuer of
+// the tokens.
+func startJoin(ctx context.Context, f *flags, client *api.Client, backend controller.Backend,
+	boot operator.BootstrapSource, logger *slog.Logger) (operator.JoinIssuer, error) {
+
+	store := &join.Store{Vars: backend, Namespace: f.bootstrapNS, Region: f.region}
+	urls := func(context.Context) ([]string, error) { return []string(f.joinURLs), nil }
+	if len(f.joinURLs) == 0 {
+		urls = operator.ServiceURLs(client, f.joinService, f.joinServiceNS)
+	}
+	srv := &join.Server{
+		Store: store, Authority: &operator.TemplateAuthority{Bootstrap: boot}, Region: f.region,
+		Validity: f.joinValidity, URLs: urls, Log: logger,
+		Event: func(ctx context.Context, group, reason, message string) {
+			typ := api.ObjectEventTypeNormal
+			if reason == "RenewalRefused" {
+				typ = api.ObjectEventTypeWarning
+			}
+			if err := backend.RecordObjectEvents(ctx, operator.NodeGroupKind, "", group,
+				[]*api.ObjectEvent{{Type: typ, Reason: reason, Message: message}}); err != nil {
+				logger.Warn("writing an event failed", "group", group, "reason", reason, "error", err)
+			}
+		},
+	}
+	hs := &http.Server{Addr: f.joinListen, Handler: srv.Handler(), TLSConfig: srv.TLSConfig(),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", f.joinListen)
+	if err != nil {
+		return nil, fmt.Errorf("the join endpoint: %w", err)
+	}
+	go func() {
+		if err := hs.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("the join endpoint failed", "error", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = hs.Close()
+	}()
+	logger.Info("serving the join endpoint", "address", ln.Addr().String(), "validity", f.joinValidity)
+	return &operator.StoreJoin{Store: store, URLs: urls}, nil
 }

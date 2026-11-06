@@ -138,6 +138,42 @@ func request(t *testing.T, id string, names ...string) provider.CreateRequest {
 	return req
 }
 
+// A node that joins with a key of its own: norca-join is mounted and runs
+// the agent; no key or certificate is written on the host.
+func TestDocker_CreateRunsNorcaJoin(t *testing.T) {
+	p, fd, dir := newTestProvider(t)
+	items, _ := bootstraptest.Items(t)
+	tmpl, err := bootstrap.Parse("eu", items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := tmpl.RenderJoin(bootstrap.Node{Name: "workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"},
+		bootstrap.JoinTicket{Token: "t", URLs: []string{"https://10.0.0.7:8490"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := provider.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []provider.InstanceRequest{
+		{Name: "workers-dc1-1-1", Bootstrap: &provider.Bootstrap{UserData: r.UserData}}}}
+	if _, err := p.Create(context.Background(), "dc1", req); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(fd.runs[0], " ")
+	for _, want := range []string{
+		"/usr/local/bin/norca-join:/usr/local/bin/norca-join:ro", ":/etc/norca/norca-join.json:ro",
+		"--entrypoint /usr/local/bin/norca-join debian:bookworm-slim run -config /etc/norca/norca-join.json -- " +
+			"/usr/local/bin/norca agent -config /etc/norca/norca.hcl",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("docker run has no %q:\n%s", want, args)
+		}
+	}
+	for _, f := range []string{"client-key.pem", "client.pem"} {
+		if _, err := os.Stat(filepath.Join(dir, "workers-dc1-1-1", "etc", "norca", "tls", f)); err == nil {
+			t.Errorf("%s was written on the host", f)
+		}
+	}
+}
+
 func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	p, fd, dir := newTestProvider(t)
 	ctx := context.Background()

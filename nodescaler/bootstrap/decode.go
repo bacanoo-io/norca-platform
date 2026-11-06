@@ -7,8 +7,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
+
+	"github.com/bacanoo-io/norca-platform/nodescaler/join"
 )
 
 // Document is a cloud-init document as Render writes it, read back by a
@@ -43,6 +46,17 @@ func (d *Document) ConfigFile() (string, error) {
 		return "", errors.New("no agent configuration (.hcl) in the document")
 	}
 	return found, nil
+}
+
+// JoinConfig returns the configuration of norca-join among the files, or ""
+// for a node whose key and certificate are in the document.
+func (d *Document) JoinConfig() string {
+	for _, f := range d.Files {
+		if path.Base(f.Path) == join.ConfigFileName {
+			return f.Path
+		}
+	}
+	return ""
 }
 
 // Decode reads a document written by Render: the hostname, write_files with

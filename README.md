@@ -27,8 +27,10 @@ nodescaler/provider/docker/ a node provider whose machines are containers on its
 nodescaler/registrar/       the NodeProvider object of a provider and its heartbeat
 nodescaler/operator/        the operator: reconciles the NodeGroup objects with their providers
 nodescaler/bootstrap/       the bootstrap of a machine: the node's certificate and agent configuration, as cloud-init
+nodescaler/join/            the hardened node identity: the join endpoint of the operator and norca-join on the node
 cmd/nodeprovider/           a node provider program (types mock and docker)
 cmd/norca-nodescaler/       the operator program
+cmd/norca-join/             the program on a node that makes its key, joins with a one-time token and renews
 ```
 
 ## The operator
@@ -76,6 +78,7 @@ it):
 | `trust_domain` | The SPIFFE trust domain; the node gets `spiffe://<domain>/region/<region>/node/<name>`. |
 | `validity` | The validity of a node certificate (`60d`). |
 | `tls_dir`, `config_file`, `service` | Where the files go and the unit of the agent (`/etc/norca/tls`, `/etc/norca/norca.hcl`, `norca`). |
+| `join_binary` | Where `norca-join` is on the machines, for the join below (`/usr/local/bin/norca-join`). |
 
 For each instance the operator issues a certificate with the node CA (the
 file holds the leaf and the node CA), renders the agent configuration with
@@ -86,6 +89,49 @@ writes the files and starts the agent. Every certificate is an event
 (`CertificateIssued`: serial and expiry). Without the Variable no instance is
 asked for (`Provisioned` False, `NoBootstrap`); `-bootstrap=false` sends only
 the names, for a provider that brings its own machines.
+
+**The join: the key stays on the node.** With `-join-listen` the bootstrap
+carries no key and no certificate: a **one-time token**, the join endpoints,
+the cluster CA, the agent configuration and the unit of `norca-join`.
+`norca-join` makes the key on the machine, sends a certificate request with
+the token to the **join endpoint** of the operator (every instance of the
+operator serves it), and gets a certificate of `-join-validity` (7 days);
+it starts the agent, renews the certificate at two thirds of its life with
+the current one as its client certificate, and sends the agent SIGHUP: the
+agent loads the new pair and keeps its connections. The node carries the
+meta `norca.identity = "join"` and no `norca.cert_expires`, so it is not
+replaced for its age (an explicit `rolling.max_node_age` still applies).
+
+- The endpoint proves itself with a certificate of the node CA whose only
+  name is the URI `spiffe://<trust domain>/region/<region>/nodescaler/join`
+  (`spiffe://no-spiffe.invalid/...` without SPIFFE): no node certificate
+  carries it, so a node, which holds a node certificate, cannot pose as the
+  endpoint. `norca-join` checks the chain against the cluster CA and that
+  URI before it sends the token.
+- A node certificate names its instance (`<instance>.client.<region>.norca`).
+  The record of each instance is a Variable `nodescaler/join/<region>/<instance>`
+  (in the namespace of the bootstrap): first the hash of its token and when
+  it expires (the join deadline of the group and five minutes), after the
+  join the serial of its latest certificate. The writes are check-and-set,
+  so a token is used once, and **only the latest certificate of an instance
+  renews it**: an older copy (a stolen disk) is refused (`RenewalRefused`,
+  a warning in the log of the group). The records of instances that are gone
+  and of tokens that expired unused are deleted at the next reconcile.
+- The endpoints are `-join-url` (repeatable: a stable name or a load
+  balancer) or, without it, the instances of the service `-join-service`
+  (`nodescaler-join`) in the native catalog. Each answer gives the node the
+  endpoints of the moment for its next renewal; a node whose endpoints all
+  moved away between two renewals cannot renew, so give a stable
+  `-join-url` where the operator moves often.
+- Without an endpoint no instance is asked for (`Provisioned` False,
+  `NoBootstrap`). Every join and renewal is an event of the group
+  (`CertificateIssued`, `CertificateRenewed`).
+
+```shell
+norca-nodescaler -region eu -join-listen :8490 -join-validity 168h
+norca-join run -config /etc/norca/norca-join.json                       # the unit of the bootstrap
+norca-join run -config /etc/norca/norca-join.json -- norca agent -config /etc/norca/norca.hcl   # in a container
+```
 
 **Nodes without an instance.** A node with the marks of the group whose
 instance the provider does not have is reported: down, it is what is left of
@@ -149,7 +195,9 @@ at their paths, mounts the norca binary of the host (`-docker-binary`), and
 runs `norca agent -config <the .hcl file>` in `-docker-image` (a privileged
 container with the host's cgroups, named after the instance). The containers
 carry the labels of the request, so a restart of the provider loses nothing.
-It is for the lab and for trials, not for production.
+A node that joins with a key of its own runs `norca-join` of the host
+(`-docker-join-binary`) with the agent as its child. It is for the lab and
+for trials, not for production.
 
 ```shell
 nodeprovider -name lab -type docker -listen :8480 -endpoint http://10.0.0.5:8480   -group dc2:2000:1024:10000:3 -docker-state-dir /var/lib/norca-nodeprovider
@@ -164,7 +212,7 @@ The Norca API client comes from the checkout next to this repository
 ```shell
 make test      # the tests
 make lint      # golangci-lint v2 with .golangci.yml
-make build     # bin/nodeprovider
+make build     # bin/nodeprovider, bin/norca-nodescaler, bin/norca-join
 ```
 
 Commits are signed off (`git commit -s`).

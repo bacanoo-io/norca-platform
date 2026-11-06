@@ -83,6 +83,7 @@ func run(args []string) error {
 		typ           = fs.String("type", "mock", "the provider type: mock or docker")
 		dockerImage   = fs.String("docker-image", "debian:bookworm-slim", "docker: the image of the containers")
 		dockerBinary  = fs.String("docker-binary", "/usr/local/bin/norca", "docker: the norca binary of the host, mounted into the containers")
+		dockerJoin    = fs.String("docker-join-binary", "/usr/local/bin/norca-join", "docker: norca-join of the host, mounted into the containers of nodes that join with a key of their own")
 		dockerState   = fs.String("docker-state-dir", "/var/lib/norca-nodeprovider", "docker: where the files of the nodes are written")
 		dockerNetwork = fs.String("docker-network", "bridge", "docker: the network of the containers")
 		listen        = fs.String("listen", ":8480", "address to serve the provider contract on")
@@ -150,7 +151,7 @@ func run(args []string) error {
 			groups[name] = docker.GroupConfig{Capacity: cfg.Capacity, Max: cfg.Max}
 		}
 		d, err := docker.New(docker.Config{Groups: groups, Image: *dockerImage, Binary: *dockerBinary,
-			StateDir: *dockerState, Network: *dockerNetwork})
+			JoinBinary: *dockerJoin, StateDir: *dockerState, Network: *dockerNetwork})
 		if err != nil {
 			return err
 		}
