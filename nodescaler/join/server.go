@@ -171,14 +171,15 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	pub, err := pki.ParseCSR([]byte(req.CSR))
-	if err != nil {
-		s.fail(w, http.StatusBadRequest, "join", req.Instance, err)
-		return
-	}
+	// The token first: a request without a valid one gets no further.
 	rec, group, err := s.Store.Redeem(ctx, req.Instance, req.Token)
 	if err != nil {
 		s.fail(w, statusOf(err), "join", req.Instance, err)
+		return
+	}
+	pub, err := pki.ParseCSR([]byte(req.CSR))
+	if err != nil {
+		s.fail(w, http.StatusBadRequest, "join", req.Instance, err)
 		return
 	}
 	resp, serial, err := s.issue(ctx, req.Instance, pub)

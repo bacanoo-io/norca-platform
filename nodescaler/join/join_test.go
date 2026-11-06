@@ -191,6 +191,18 @@ func TestJoinRefusals(t *testing.T) {
 	if err := c.Join(ctx, path); err != nil {
 		t.Fatal(err)
 	}
+	// The token is checked before anything else of the request: a used one
+	// is refused whatever the request carries.
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	body := `{"instance":"workers-1-1","token":"` + token + `","csr":"junk"}`
+	res, err := hc.Post(e.srv.URL+"/v1/join", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("a used token with a junk request: %d", res.StatusCode)
+	}
 	c.Config.Token = token
 	var refused *join.RefusedError
 	if err := c.Join(ctx, ""); !errors.As(err, &refused) || refused.Status != http.StatusForbidden {
