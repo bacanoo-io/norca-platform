@@ -29,6 +29,9 @@ type JoinIssuer interface {
 	// provider lists, prefix is the start of the names of the group's
 	// instances.
 	Prune(ctx context.Context, group, prefix string, live map[string]bool) error
+	// Forget drops every record of a group whose instances are gone with
+	// it (a deletion with the policy drain or terminate).
+	Forget(ctx context.Context, group, prefix string) error
 }
 
 // joinSlack is added to the join deadline of a group for the validity of a
@@ -61,6 +64,11 @@ func (s *StoreJoin) Ticket(ctx context.Context, group, instance string, ttl time
 // Prune implements JoinIssuer.
 func (s *StoreJoin) Prune(ctx context.Context, group, prefix string, live map[string]bool) error {
 	return s.Store.Prune(ctx, group, prefix, live)
+}
+
+// Forget implements JoinIssuer.
+func (s *StoreJoin) Forget(ctx context.Context, group, prefix string) error {
+	return s.Store.Forget(ctx, group, prefix)
 }
 
 // TemplateAuthority gives the join endpoint the authority of the bootstrap

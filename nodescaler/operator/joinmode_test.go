@@ -123,6 +123,42 @@ func TestJoin_NoEndpointAsksForNothing(t *testing.T) {
 	}
 }
 
+// A deleted group drops the join records of its instances, which went with
+// it; orphaned instances keep theirs, so their nodes go on renewing.
+func TestJoin_DeletionForgetsTheRecords(t *testing.T) {
+	for policy, keep := range map[string]bool{"terminate": false, "orphan": true} {
+		t.Run(policy, func(t *testing.T) {
+			e := newEnv(t, "")
+			items, _ := bootstraptest.Items(t)
+			e.withBootstrap(items)
+			e.withJoin("https://10.0.0.7:8490")
+			e.putGroup(2, map[string]any{"deletion": map[string]any{"policy": policy}})
+			e.reconcile()
+			records := func() int {
+				n := 0
+				for _, inst := range []string{"workers-dc1-1-1", "workers-dc1-1-2"} {
+					if e.backend.GetVariable("default", "nodescaler/join/eu/"+inst) != nil {
+						n++
+					}
+				}
+				return n
+			}
+			if records() != 2 {
+				t.Fatalf("%d join records, want 2", records())
+			}
+			e.backend.RemoveObject(NodeGroupKind, "", "workers-dc1")
+			e.reconcile()
+			e.reconcile()
+			if !e.gone() {
+				t.Fatal("the group is still there")
+			}
+			if want := map[bool]int{true: 2, false: 0}[keep]; records() != want {
+				t.Fatalf("%d join records after the deletion, want %d", records(), want)
+			}
+		})
+	}
+}
+
 func TestInstancePrefix(t *testing.T) {
 	for _, group := range []string{"workers-dc1", "Edge_Pool", strings.Repeat("a", 80)} {
 		p := instancePrefix(group)

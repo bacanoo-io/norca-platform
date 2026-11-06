@@ -188,6 +188,33 @@ func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[st
 	return errors.Join(errs...)
 }
 
+// Forget deletes every record of a group, used tokens or not: the group is
+// gone with its instances. Only the records of instances whose names start
+// with namePrefix are read.
+func (s *Store) Forget(ctx context.Context, group, namePrefix string) error {
+	list, _, err := s.Vars.ListVariables(ctx, s.Namespace, s.prefix()+namePrefix, 0)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, meta := range list {
+		v, err := s.Vars.ReadVariable(ctx, s.Namespace, meta.Path)
+		if errors.Is(err, controller.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if v.Items[itemGroup] == group {
+			if err := s.Vars.DeleteVariable(ctx, s.Namespace, meta.Path, v.ModifyIndex); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (s *Store) read(ctx context.Context, instance string) (*api.Variable, error) {
 	if !ValidInstance(instance) {
 		return nil, fmt.Errorf("%w: the instance %q is not a host name", ErrRefused, instance)

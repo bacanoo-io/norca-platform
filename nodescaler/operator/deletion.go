@@ -188,6 +188,13 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 
 	if len(state.Waiting) == 0 {
 		r.log.Info("node group deleted, its instances are gone", "group", obj.Name, "policy", policy)
+		// The join records of the instances go with them. Orphaned
+		// instances (above) keep theirs: their nodes go on renewing.
+		if r.cfg.Join != nil {
+			if err := r.cfg.Join.Forget(ctx, obj.Name, instancePrefix(obj.Name)); err != nil {
+				return 0, fmt.Errorf("dropping the join records of node group %s: %w", obj.Name, err)
+			}
+		}
 		return 0, r.release(ctx, obj)
 	}
 	return r.deletionStatus(ctx, obj, spec, state, o, now)

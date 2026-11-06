@@ -116,7 +116,10 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
   so a token is used once, and **only the latest certificate of an instance
   renews it**: an older copy (a stolen disk) is refused (`RenewalRefused`,
   a warning in the log of the group). The records of instances that are gone
-  and of tokens that expired unused are deleted at the next reconcile.
+  and of tokens that expired unused are deleted at the next reconcile, and
+  all records of a group when it is deleted with its instances (`drain`,
+  `terminate`); orphaned instances keep theirs, so their nodes go on
+  renewing.
 - The endpoints are `-join-url` (repeatable: a stable name or a load
   balancer) or, without it, the instances of the service `-join-service`
   (`nodescaler-join`) in the native catalog. Each answer gives the node the
