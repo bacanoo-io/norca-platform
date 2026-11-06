@@ -13,8 +13,9 @@
 //
 // A request to the provider is idempotent by its ID (region/group/number):
 // a request repeated after a failure or a restart creates nothing more. The
-// join of the nodes is tracked (join.go) and the instances of groups that are
-// gone are swept (orphans.go); scale down comes with the next steps.
+// join of the nodes is tracked (join.go), the instances of groups that are
+// gone are swept (orphans.go), and the instances above the scale are removed
+// one at a time (scaledown.go).
 package operator
 
 import (
@@ -212,10 +213,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
-	strays := matchNodes(obj.Name, o, nodes)
+	prevStatus := normalize(obj.Status)
+	// The node of an instance a scale down deleted is not a stray: it goes
+	// down and is purged.
+	var removing string
+	if m := readRemoval(prevStatus); m != nil {
+		removing = m.Name
+	}
+	strays := matchNodes(obj.Name, o, nodes, removing)
 
 	// Nodes without an instance: reported, the foreign ones made ineligible.
-	prevStatus := normalize(obj.Status)
 	strayRecords, foreignCond := r.handleStrays(ctx, obj, strays, prevStatus)
 	netCond := r.networkCondition(ctx, spec)
 	if netCond.Status == "False" && conditionStatusOf(prevStatus, CondNetworkCovered) != "False" {
@@ -229,6 +236,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	if failing && readJoinState(prevStatus).Failures < spec.maxFailures() {
 		r.event(ctx, obj, api.ObjectEventTypeWarning, CondJoinFailing, joinCondition(js, spec.maxFailures()).Message)
 	}
+
+	// Remove the instances above the scale, one at a time.
+	down := r.scaleDown(ctx, obj, client, group, spec, o, prevStatus, now)
 
 	// Ask for the instances that are missing.
 	want := spec.replicas()
@@ -290,7 +300,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		status["replicas"] = ready
 		status["joining"] = joining
 		status["failed"] = failed
-		status["nodes"] = nodeRecords(o)
+		status["nodes"] = nodeRecords(o, down.removal)
+		if down.removal != nil {
+			status["removal"] = down.removal.doc()
+		} else {
+			delete(status, "removal")
+		}
+		if v := down.veto.doc(); v != nil {
+			status["scaleDown"] = v
+		} else {
+			delete(status, "scaleDown")
+		}
+		setCondition(status, down.veto.condition(now), now)
 		if o.capacity != nil {
 			status["capacity"] = map[string]any{"cpu": o.capacity.CPU, "memory": o.capacity.Memory, "disk": o.capacity.Disk}
 			status["allocatable"] = allocatable(*o.capacity, spec.Node.Reserved)
@@ -310,15 +331,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	if err != nil {
 		return 0, err
 	}
+	var requeue time.Duration
 	switch {
 	case createFailed:
 		// The failure is in the condition and the event; the provider is
 		// asked again after a while, not at the pace of the error backoff.
-		return r.cfg.RetryAfter, nil
+		requeue = r.cfg.RetryAfter
 	case joining > 0 || len(o.slow) > 0:
-		return r.cfg.JoinCheck, nil
+		requeue = r.cfg.JoinCheck
 	}
-	return 0, nil
+	if down.requeue > 0 && (requeue == 0 || down.requeue < requeue) {
+		requeue = down.requeue
+	}
+	if v := down.veto; v.Vetoes > 0 && now.Before(v.RetryAfter) && requeue == 0 {
+		// The condition turns False at retryAfter.
+		requeue = v.RetryAfter.Sub(now)
+	}
+	return requeue, nil
 }
 
 // describe names the instances of a request and renders the bootstrap of
@@ -428,8 +457,9 @@ func (r *Reconciler) nextRequest(obj *api.CustomObject, instances []provider.Ins
 	return last + 1
 }
 
-// nodeRecords is status.nodes: an entry per instance with its node.
-func nodeRecords(o *observed) []any {
+// nodeRecords is status.nodes: an entry per instance with its node, and the
+// phase of the one a scale down removes.
+func nodeRecords(o *observed, m *removal) []any {
 	insts := slices.Clone(o.instances)
 	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.ID, b.ID) })
 	out := make([]any, 0, len(insts))
@@ -447,6 +477,9 @@ func nodeRecords(o *observed) []any {
 		}
 		if o.slow[inst.ID] {
 			rec["slow"] = true
+		}
+		if m != nil && m.Instance == inst.ID {
+			rec["removing"] = m.Phase
 		}
 		out = append(out, rec)
 	}

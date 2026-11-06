@@ -49,8 +49,9 @@ type strayNode struct {
 // nodes of the group that have no instance. Of the nodes with the name of
 // one instance, the ready one that registered first is its node, or the one
 // that registered last when none is ready (a machine that came up again
-// registers a new node and leaves the old one down).
-func matchNodes(group string, o *observed, nodes []Node) []strayNode {
+// registers a new node and leaves the old one down). The node of removing,
+// the instance a scale down deleted, is left out.
+func matchNodes(group string, o *observed, nodes []Node, removing string) []strayNode {
 	known := map[string]bool{}
 	for _, inst := range o.instances {
 		known[instanceKey(inst)] = true
@@ -60,6 +61,9 @@ func matchNodes(group string, o *observed, nodes []Node) []strayNode {
 	for _, n := range nodes {
 		if n.Instance == "" || (n.Group != group && !known[n.Instance]) {
 			continue // not a node of this group
+		}
+		if n.Instance == removing && !known[n.Instance] {
+			continue // the node of an instance a scale down deleted
 		}
 		if !known[n.Instance] {
 			if n.Ready {

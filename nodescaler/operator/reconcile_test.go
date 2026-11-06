@@ -8,6 +8,7 @@ import (
 	"errors"
 	"maps"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -19,23 +20,144 @@ import (
 	"github.com/bacanoo-io/norca/norca/controller/fake"
 )
 
-// fakeNodes is a NodeLister with the nodes set by the test.
+// fakeNodes is a NodeLister with the nodes set by the test. A node's detail
+// (meta, allocations, drain) is in details; a node without one is empty.
 type fakeNodes struct {
 	mu         sync.Mutex
 	nodes      []Node
 	ineligible []string
+	details    map[string]*NodeDetail
+	drains     []string
+	canceled   []string
+	purged     []string
+	// irreplaceable names the jobs whose allocations could not be placed
+	// again without their node.
+	irreplaceable map[string]bool
 }
 
 func (f *fakeNodes) SetIneligible(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ineligible = append(f.ineligible, id)
+	f.setEligible(id, false)
+	return nil
+}
+
+func (f *fakeNodes) setEligible(id string, eligible bool) {
 	for i := range f.nodes {
 		if f.nodes[i].ID == id {
-			f.nodes[i].Eligible = false
+			f.nodes[i].Eligible = eligible
 		}
 	}
+	if d := f.details[id]; d != nil {
+		d.Eligible = eligible
+	}
+}
+
+func (f *fakeNodes) detail(id string) *NodeDetail {
+	if f.details == nil {
+		f.details = map[string]*NodeDetail{}
+	}
+	d := f.details[id]
+	if d == nil {
+		d = &NodeDetail{Ready: true, Eligible: true}
+		for _, n := range f.nodes {
+			if n.ID == id {
+				d.Ready, d.Eligible = n.Ready, n.Eligible
+			}
+		}
+		f.details[id] = d
+	}
+	return d
+}
+
+func (f *fakeNodes) Detail(_ context.Context, id string) (*NodeDetail, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	found := false
+	for _, n := range f.nodes {
+		found = found || n.ID == id
+	}
+	if !found {
+		return nil, ErrNodeNotFound
+	}
+	d := *f.detail(id)
+	return &d, nil
+}
+
+func (f *fakeNodes) Drain(_ context.Context, id string, _ time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drains = append(f.drains, id)
+	d := f.detail(id)
+	d.Draining, d.LastDrain = true, "draining"
+	f.setEligible(id, false)
 	return nil
+}
+
+// finishDrain completes the drain of a node: its allocations are gone.
+func (f *fakeNodes) finishDrain(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := f.detail(id)
+	d.Draining, d.LastDrain, d.Allocs = false, "complete", nil
+}
+
+func (f *fakeNodes) CancelDrain(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.canceled = append(f.canceled, id)
+	d := f.detail(id)
+	d.Draining, d.LastDrain = false, "canceled"
+	f.setEligible(id, true)
+	return nil
+}
+
+func (f *fakeNodes) SetEligible(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setEligible(id, true)
+	return nil
+}
+
+func (f *fakeNodes) Purge(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.purged = append(f.purged, id)
+	f.nodes = slices.DeleteFunc(f.nodes, func(n Node) bool { return n.ID == id })
+	delete(f.details, id)
+	return nil
+}
+
+func (f *fakeNodes) Replaceable(_ context.Context, a NodeAlloc, _ string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.irreplaceable[a.JobID] {
+		return false, "job " + a.JobID + " needs a node of its own", nil
+	}
+	return true, "", nil
+}
+
+// setDetail sets what a node reports.
+func (f *fakeNodes) setDetail(id string, d NodeDetail) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.details == nil {
+		f.details = map[string]*NodeDetail{}
+	}
+	f.details[id] = &d
+}
+
+// down marks a node down.
+func (f *fakeNodes) down(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.nodes {
+		if f.nodes[i].ID == id {
+			f.nodes[i].Ready = false
+		}
+	}
+	f.detail(id).Ready = false
 }
 
 func (f *fakeNodes) madeIneligible() []string {

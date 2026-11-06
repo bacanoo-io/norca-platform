@@ -30,9 +30,11 @@ const (
 // maxStatusRetries bounds the writes of a status that lose to another writer.
 const maxStatusRetries = 5
 
-// condition is an entry of status.conditions.
+// condition is an entry of status.conditions. RetryAfter (RFC 3339) is set
+// on ScaleDownBlocked: the autoscaler does not lower the scale before it.
 type condition struct {
 	Type, Status, Reason, Message string
+	RetryAfter                    string
 }
 
 // writeStatus writes the fields the operator owns into the status of the
@@ -93,6 +95,9 @@ func setCondition(status map[string]any, c condition, now time.Time) {
 	}
 	if c.Message != "" {
 		entry["message"] = c.Message
+	}
+	if c.RetryAfter != "" {
+		entry["retryAfter"] = c.RetryAfter
 	}
 	for i, item := range list {
 		old, ok := item.(map[string]any)

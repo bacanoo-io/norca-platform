@@ -73,6 +73,27 @@ type groupSpec struct {
 		MaxFailures      int    `json:"max_failures"`
 		ResumeGeneration int64  `json:"resume_generation"`
 	} `json:"join"`
+	Policy struct {
+		ScaleDown struct {
+			Selector      string `json:"selector"`
+			DrainDeadline string `json:"drain_deadline"`
+		} `json:"scale_down"`
+	} `json:"policy"`
+}
+
+// selector chooses the node of a scale down: least_busy (the default) or
+// empty.
+func (s *groupSpec) selector() string {
+	if s.Policy.ScaleDown.Selector == selectorEmpty {
+		return selectorEmpty
+	}
+	return selectorLeastBusy
+}
+
+// drainDeadline is the deadline of the drain of a scale down
+// (scale_down.drain_deadline, 15 minutes by default).
+func (s *groupSpec) drainDeadline() time.Duration {
+	return durationOr(s.Policy.ScaleDown.DrainDeadline, 15*time.Minute)
 }
 
 // decodeSpec reads the spec of a NodeGroup.
