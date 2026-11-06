@@ -268,8 +268,7 @@ func hasDistinctHosts(cs []*api.Constraint) bool {
 
 // isNotFound reports a 404 of the API.
 func isNotFound(err error) bool {
-	var ue api.UnexpectedResponseError
-	if errors.As(err, &ue) {
+	if ue, ok := errors.AsType[api.UnexpectedResponseError](err); ok {
 		return ue.StatusCode() == http.StatusNotFound
 	}
 	return false

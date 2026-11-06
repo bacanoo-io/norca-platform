@@ -143,9 +143,7 @@ func readRollout(status map[string]any) *rollout {
 	if b, ok := d["backoff"].(map[string]any); ok {
 		ro.Backoff = readVeto(map[string]any{"scaleDown": b})
 	}
-	for _, name := range asList(d["outdated"]) {
-		ro.Outdated = append(ro.Outdated, name)
-	}
+	ro.Outdated = append(ro.Outdated, asList(d["outdated"])...)
 	return ro
 }
 
