@@ -271,3 +271,99 @@ func TestScaleDown_GoesOnAfterARestart(t *testing.T) {
 		t.Fatalf("instances %d, drains %v", len(e.instances()), e.nodes.drains)
 	}
 }
+
+// outByHand makes a node ineligible as a person does (norca node drain, or
+// node eligibility -disable), before the operator touches it.
+func (e *env) outByHand(id string) {
+	e.nodes.mu.Lock()
+	defer e.nodes.mu.Unlock()
+	e.nodes.detail(id)
+	e.nodes.setEligible(id, false)
+}
+
+func (e *env) eligible(id string) bool {
+	e.nodes.mu.Lock()
+	defer e.nodes.mu.Unlock()
+	return e.nodes.detail(id).Eligible
+}
+
+func TestScaleDown_HeldNodeStaysOutOfService(t *testing.T) {
+	for _, selector := range []string{selectorLeastBusy, selectorEmpty} {
+		t.Run(selector, func(t *testing.T) {
+			extra := map[string]any{"policy": map[string]any{"scale_down": map[string]any{"selector": selector}}}
+			e, insts := grown(t, 2, extra)
+			held, other := "node-"+insts[0].Name, "node-"+insts[1].Name
+			e.outByHand(held)
+
+			// The scale down takes the node drained by hand, and says so.
+			e.putGroup(1, extra)
+			e.reconcile()
+			m := removalOf(e.status())
+			if m["node"] != held || m["held"] != true {
+				t.Fatalf("removal: %+v", m)
+			}
+
+			// The scale is raised again: the node stays, ineligible as the
+			// person left it; only the operator's own drain is stopped.
+			e.putGroup(2, extra)
+			e.reconcile()
+			if removalOf(e.status()) != nil || len(e.instances()) != 2 {
+				t.Fatalf("status: %+v", e.status())
+			}
+			if e.eligible(held) || len(e.nodes.canceled) != 0 {
+				t.Fatalf("the node drained by hand was made eligible (canceled %v)", e.nodes.canceled)
+			}
+			if selector == selectorLeastBusy && !slices.Equal(e.nodes.stopped, []string{held}) {
+				t.Fatalf("stopped drains %v, want the operator's own", e.nodes.stopped)
+			}
+			if selector == selectorEmpty && len(e.nodes.stopped) != 0 {
+				t.Fatalf("a drain was stopped, none was started: %v", e.nodes.stopped)
+			}
+			msgs := e.eventsOf("ScaleDownCanceled")
+			if len(msgs) != 1 || !strings.Contains(msgs[0], "stays ineligible") {
+				t.Fatalf("ScaleDownCanceled: %q", msgs)
+			}
+			if !e.eligible(other) {
+				t.Fatal("the other node was touched")
+			}
+		})
+	}
+}
+
+func TestScaleDown_HeldNodeDrainStuck(t *testing.T) {
+	e, insts := grown(t, 2, nil)
+	held := "node-" + insts[0].Name
+	e.outByHand(held)
+	e.putGroup(1, nil)
+	e.reconcile()
+	if e.nodes.drains[0] != held {
+		t.Fatalf("drains: %v", e.nodes.drains)
+	}
+
+	e.advance(15*time.Minute + drainGrace + time.Second)
+	e.reconcile()
+	if e.eligible(held) || len(e.nodes.canceled) != 0 || !slices.Equal(e.nodes.stopped, []string{held}) {
+		t.Fatalf("eligible %t, canceled %v, stopped %v", e.eligible(held), e.nodes.canceled, e.nodes.stopped)
+	}
+	c := conditionOf(e.status(), CondScaleDownBlocked)
+	if msg, _ := c["message"].(string); c["reason"] != "DrainStuck" || !strings.Contains(msg, "stays ineligible") {
+		t.Fatalf("ScaleDownBlocked: %+v", c)
+	}
+}
+
+func TestScaleDown_NodeNotHeldIsGivenBack(t *testing.T) {
+	// A node the operator took eligible is eligible again: the drain is
+	// canceled, not only stopped.
+	e, _ := grown(t, 2, nil)
+	e.putGroup(1, nil)
+	e.reconcile()
+	victim := e.nodes.drains[0]
+	if m := removalOf(e.status()); m["held"] != nil {
+		t.Fatalf("removal: %+v", m)
+	}
+	e.putGroup(2, nil)
+	e.reconcile()
+	if !e.eligible(victim) || len(e.nodes.stopped) != 0 {
+		t.Fatalf("eligible %t, stopped %v", e.eligible(victim), e.nodes.stopped)
+	}
+}

@@ -49,7 +49,8 @@ import (
 // The scale and status.replicas do not see a replacement: the old node does
 // not count, the new one counts once ready, and the autoscaler does not act
 // on them. A refused new node (the provider's quota or capacity) or a new
-// node that does not join gives the old node back its eligibility and backs
+// node that does not join gives the old node back its eligibility (a node
+// that was out of service by hand when it was taken stays ineligible) and backs
 // the rollout off, as a veto of a scale down does (10 minutes, doubling to 6
 // hours); a node at its hard limit is then replaced remove first, and so is a
 // node at its soft age limit when the group keeps a headroom of a node or more
@@ -109,6 +110,9 @@ type replacement struct {
 	Since    time.Time // of the replacement
 	Started  time.Time // of the phase
 	Expires  time.Time // the hard limit of the node, zero when unknown
+	// Held is a node that was out of service by hand (ineligible) when the
+	// replacement took it: given back, it stays so.
+	Held bool
 }
 
 func (m *replacement) doc() map[string]any {
@@ -120,6 +124,9 @@ func (m *replacement) doc() map[string]any {
 	if !m.Expires.IsZero() {
 		d["expires"] = m.Expires.UTC().Format(time.RFC3339)
 	}
+	if m.Held {
+		d["held"] = true
+	}
 	return d
 }
 
@@ -129,6 +136,7 @@ func readReplacement(d map[string]any) *replacement {
 		Reason: str("reason"), Phase: str("phase")}
 	m.Surge, _ = d["surge"].(bool)
 	m.Drain, _ = d["drain"].(bool)
+	m.Held, _ = d["held"].(bool)
 	m.Since, _ = time.Parse(time.RFC3339, str("since"))
 	m.Started, _ = time.Parse(time.RFC3339, str("started"))
 	m.Expires, _ = time.Parse(time.RFC3339, str("expires"))
@@ -366,7 +374,7 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 			}
 		}
 		m := &replacement{Instance: c.inst.ID, Name: instanceKey(c.inst), Node: c.node.ID, NodeName: c.node.Name,
-			Reason: c.reason, Surge: surge, Drain: drain, Since: now, Started: now, Expires: c.expires}
+			Reason: c.reason, Surge: surge, Drain: drain, Since: now, Started: now, Expires: c.expires, Held: !c.node.Eligible}
 		var err error
 		switch {
 		case surge:
@@ -653,7 +661,7 @@ func (r *Reconciler) continueReplacement(ctx context.Context, obj *api.CustomObj
 		case !d.Draining && d.LastDrain == string(api.DrainStatusComplete):
 			r.deleteOld(ctx, obj, client, group, o, m, now)
 		case !d.Draining || now.Sub(m.Started) > spec.drainDeadline()+drainGrace:
-			if err := r.Nodes.CancelDrain(ctx, m.Node); err != nil {
+			if err := r.giveBack(ctx, m.Node, m.Held, d.Draining); err != nil {
 				r.rollFailed(ctx, obj, "stopping a drain failed", m.Node, err)
 				return
 			}
@@ -662,7 +670,7 @@ func (r *Reconciler) continueReplacement(ctx context.Context, obj *api.CustomObj
 			if !d.Draining {
 				why = fmt.Sprintf("the drain of node %s was stopped (%s)", m.NodeName, d.LastDrain)
 			}
-			ro.Backoff.block(now, "DrainStuck", why+"; the node is eligible again")
+			ro.Backoff.block(now, "DrainStuck", why+givenBack(m.Held))
 			r.event(ctx, obj, api.ObjectEventTypeWarning, "DrainStuck", ro.Backoff.Message)
 			ro.drop(m)
 		}
@@ -729,17 +737,21 @@ func (r *Reconciler) deleteOld(ctx context.Context, obj *api.CustomObject, clien
 	m.Phase, m.Started = phaseDeleted, now
 }
 
-// cancelReplacement gives the old node back its eligibility and backs the
-// rollout off.
+// cancelReplacement gives the old node back its eligibility (not to a held
+// node, which stays ineligible) and backs the rollout off.
 func (r *Reconciler) cancelReplacement(ctx context.Context, obj *api.CustomObject, ro *rollout, m *replacement,
 	reason, why string, now time.Time) {
 
-	if err := r.Nodes.SetEligible(ctx, m.Node); err != nil && !errors.Is(err, ErrNodeNotFound) {
+	if err := r.giveBack(ctx, m.Node, m.Held, false); err != nil && !errors.Is(err, ErrNodeNotFound) {
 		r.rollFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
 		return
 	}
 	r.backToTraffic(ctx, m.Node)
-	ro.Backoff.block(now, reason, why+"; node "+m.NodeName+" stays and is eligible again")
+	how := " stays and is eligible again"
+	if m.Held {
+		how = " stays" + heldNote(true)
+	}
+	ro.Backoff.block(now, reason, why+"; node "+m.NodeName+how)
 	r.event(ctx, obj, api.ObjectEventTypeWarning, "ReplacementCanceled", ro.Backoff.Message)
 	ro.drop(m)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -235,5 +236,52 @@ func TestRollout_RollBehindAfterABackoff(t *testing.T) {
 	}
 	if c := e.r.behind(context.Background(), obj, spec, ro, ages, e.status(), false, e.now); c.Status != "False" {
 		t.Fatalf("not backed off: %+v", c)
+	}
+}
+
+func TestRollout_HeldNodeStaysOutOfService(t *testing.T) {
+	// The mock group holds 5 instances: the new node of a group of 5 is
+	// refused, and the replacement is canceled.
+	e := rollEnv(t, 5, nil)
+	held := e.firstNode()
+	e.setMeta(held, map[string]string{MetaReplace: "true"})
+	e.outByHand(held)
+	e.reconcile()
+	ro := e.rollout()
+	if len(ro.Replacing) != 0 || ro.Backoff.Reason != "SurgeRefused" {
+		t.Fatalf("rollout %+v backoff %+v", ro.Replacing, ro.Backoff)
+	}
+	if e.eligible(held) {
+		t.Fatal("the node drained by hand was made eligible")
+	}
+	if !strings.Contains(ro.Backoff.Message, "stays ineligible") {
+		t.Fatalf("message: %s", ro.Backoff.Message)
+	}
+}
+
+func TestRollout_HeldIsKeptInTheStatus(t *testing.T) {
+	// max_surge 0: removed first, drained; the status keeps that the node was
+	// out of service by hand, so another instance of the operator gives it
+	// back the same way.
+	e := rollEnv(t, 2, map[string]any{"rolling": map[string]any{"max_surge": 0}})
+	held := e.firstNode()
+	e.setMeta(held, map[string]string{MetaReplace: "true"})
+	e.outByHand(held)
+	e.reconcile()
+	ro := e.rollout()
+	if len(ro.Replacing) != 1 || !ro.Replacing[0].Held {
+		t.Fatalf("replacing %+v", ro.Replacing)
+	}
+	// The drain is stopped by someone else: the node stays ineligible.
+	e.nodes.mu.Lock()
+	e.nodes.detail(held).Draining = false
+	e.nodes.detail(held).LastDrain = "canceled"
+	e.nodes.mu.Unlock()
+	e.reconcile()
+	if e.eligible(held) || len(e.nodes.canceled) != 0 {
+		t.Fatalf("eligible %t, canceled %v", e.eligible(held), e.nodes.canceled)
+	}
+	if !strings.Contains(e.rollout().Backoff.Message, "stays ineligible") {
+		t.Fatalf("backoff: %+v", e.rollout().Backoff)
 	}
 }

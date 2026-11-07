@@ -34,7 +34,11 @@ import (
 //   - when the drain is complete (or the node still empty), the instance is
 //     deleted, and the node, once it is down, is purged; a drain that does not
 //     finish within its deadline and a grace time is stopped, the node made
-//     eligible again (DrainStuck), and the group backed off the same way.
+//     eligible again (DrainStuck), and the group backed off the same way;
+//   - a node that was out of service by hand when it was chosen (ineligible:
+//     drained or made ineligible by a person) is held: when the removal stops
+//     (the scale raised again, a stuck drain), only the operator's own drain
+//     is stopped and the node stays ineligible, as the person left it.
 //
 // The removal in progress is status.removal, so an operator that restarts, or
 // another instance after a leader change, goes on with it. A raise of the
@@ -81,6 +85,9 @@ type removal struct {
 	Phase       string    // draining, settling, deleting, deleted
 	Started     time.Time // of the phase
 	SettleUntil time.Time
+	// Held is a node that was out of service by hand (ineligible: drained
+	// or made ineligible) when the removal took it: given back, it stays so.
+	Held bool
 }
 
 func (m *removal) doc() map[string]any {
@@ -94,6 +101,9 @@ func (m *removal) doc() map[string]any {
 	if !m.SettleUntil.IsZero() {
 		d["settleUntil"] = m.SettleUntil.UTC().Format(time.RFC3339Nano)
 	}
+	if m.Held {
+		d["held"] = true
+	}
 	return d
 }
 
@@ -106,6 +116,7 @@ func readRemoval(status map[string]any) *removal {
 	m := &removal{Instance: str("instance"), Name: str("name"), Node: str("node"), Selector: str("selector"), Phase: str("phase")}
 	m.Started, _ = time.Parse(time.RFC3339, str("started"))
 	m.SettleUntil, _ = time.Parse(time.RFC3339Nano, str("settleUntil"))
+	m.Held, _ = d["held"].(bool)
 	if m.Instance == "" {
 		return nil
 	}
@@ -222,7 +233,8 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 		r.event(ctx, obj, api.ObjectEventTypeWarning, CondScaleDownBlocked, res.veto.condition(now).Message)
 		return res
 	}
-	m := &removal{Instance: inst.ID, Name: instanceKey(*inst), Node: node.ID, Selector: spec.selector(), Started: now}
+	m := &removal{Instance: inst.ID, Name: instanceKey(*inst), Node: node.ID, Selector: spec.selector(), Started: now,
+		Held: !node.Eligible}
 	switch m.Selector {
 	case selectorEmpty:
 		if err := r.Nodes.SetIneligible(ctx, node.ID); err != nil {
@@ -352,20 +364,14 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 	// stays.
 	if inst != nil && (m.Phase == phaseLeaving || m.Phase == phaseDraining || m.Phase == phaseSettling) && live <= want {
 		if m.Node != "" {
-			var err error
-			if m.Phase == phaseDraining {
-				err = r.Nodes.CancelDrain(ctx, m.Node)
-			} else {
-				err = r.Nodes.SetEligible(ctx, m.Node)
-			}
-			if err != nil {
-				r.downFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
+			if err := r.giveBack(ctx, m.Node, m.Held, m.Phase == phaseDraining); err != nil {
+				r.downFailed(ctx, obj, "giving a node back failed", m.Node, err)
 				return
 			}
 			r.backToTraffic(ctx, m.Node)
 		}
 		r.event(ctx, obj, api.ObjectEventTypeNormal, "ScaleDownCanceled",
-			fmt.Sprintf("the scale is %d again: node %s of instance %s stays", want, m.Node, m.Instance))
+			fmt.Sprintf("the scale is %d again: node %s of instance %s stays%s", want, m.Node, m.Instance, heldNote(m.Held)))
 		res.removal, res.requeue = nil, 0
 		return
 	}
@@ -420,12 +426,16 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 		}
 		if len(d.Allocs) > 0 {
 			// Work arrived before the ineligibility: the node stays.
-			if err := r.Nodes.SetEligible(ctx, m.Node); err != nil {
-				r.downFailed(ctx, obj, "making a node eligible again failed", m.Node, err)
+			if err := r.giveBack(ctx, m.Node, m.Held, false); err != nil {
+				r.downFailed(ctx, obj, "giving a node back failed", m.Node, err)
 				return
 			}
+			how := "it stays and is eligible again"
+			if m.Held {
+				how = "it stays" + heldNote(true)
+			}
 			r.event(ctx, obj, api.ObjectEventTypeNormal, "NodeNotEmpty",
-				fmt.Sprintf("node %s received work while it was made ineligible; it stays and is eligible again", m.Node))
+				fmt.Sprintf("node %s received work while it was made ineligible; %s", m.Node, how))
 			res.removal = nil
 			return
 		}
@@ -448,7 +458,7 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 			r.deleteInstance(ctx, obj, client, group, o, m, now)
 		case !d.Draining || now.Sub(m.Started) > spec.drainDeadline()+drainGrace:
 			// Canceled by someone else, or stuck: the node stays.
-			if err := r.Nodes.CancelDrain(ctx, m.Node); err != nil {
+			if err := r.giveBack(ctx, m.Node, m.Held, d.Draining); err != nil {
 				r.downFailed(ctx, obj, "stopping a drain failed", m.Node, err)
 				return
 			}
@@ -457,11 +467,46 @@ func (r *Reconciler) continueRemoval(ctx context.Context, obj *api.CustomObject,
 			if !d.Draining {
 				why = fmt.Sprintf("the drain of node %s was stopped (%s)", m.Node, d.LastDrain)
 			}
-			res.veto.block(now, "DrainStuck", why+"; the node is eligible again")
+			res.veto.block(now, "DrainStuck", why+givenBack(m.Held))
 			r.event(ctx, obj, api.ObjectEventTypeWarning, "DrainStuck", res.veto.condition(now).Message)
 			res.removal = nil
 		}
 	}
+}
+
+// giveBack undoes what a removal or a replacement did to a node that stays:
+// its drain (draining) or its ineligibility. A node that was out of service
+// by hand when it was taken (held) stays ineligible: only the drain the
+// operator started is stopped, and the eligibility is left as the person set
+// it.
+func (r *Reconciler) giveBack(ctx context.Context, nodeID string, held, draining bool) error {
+	switch {
+	case held && draining:
+		return r.Nodes.StopDrain(ctx, nodeID)
+	case held:
+		return nil
+	case draining:
+		return r.Nodes.CancelDrain(ctx, nodeID)
+	default:
+		return r.Nodes.SetEligible(ctx, nodeID)
+	}
+}
+
+// heldNote tells, in an event, that a node given back stays ineligible.
+func heldNote(held bool) string {
+	if held {
+		return " and stays ineligible, as it was out of service by hand when it was taken"
+	}
+	return ""
+}
+
+// givenBack ends the message of a node given back after a stuck or stopped
+// drain.
+func givenBack(held bool) string {
+	if held {
+		return "; the node stays ineligible, as it was out of service by hand when it was taken"
+	}
+	return "; the node is eligible again"
 }
 
 // deleteInstance deletes the instance of the removal; the removal goes on

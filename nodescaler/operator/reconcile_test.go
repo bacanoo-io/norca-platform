@@ -29,6 +29,7 @@ type fakeNodes struct {
 	details    map[string]*NodeDetail
 	drains     []string
 	canceled   []string
+	stopped    []string // drains stopped, the node left ineligible
 	purged     []string
 	// irreplaceable names the jobs whose allocations could not be placed
 	// again without their node.
@@ -142,6 +143,15 @@ func (f *fakeNodes) CancelDrain(_ context.Context, id string) error {
 	d := f.detail(id)
 	d.Draining, d.LastDrain = false, "canceled"
 	f.setEligible(id, true)
+	return nil
+}
+
+func (f *fakeNodes) StopDrain(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = append(f.stopped, id)
+	d := f.detail(id)
+	d.Draining, d.LastDrain = false, "canceled"
 	return nil
 }
 

@@ -44,9 +44,11 @@ type NodeLister interface {
 	// does not exist is ErrNodeNotFound.
 	Detail(ctx context.Context, nodeID string) (*NodeDetail, error)
 	// Drain starts a drain with the deadline (the node becomes ineligible);
-	// CancelDrain stops one and makes the node eligible again.
+	// CancelDrain stops one and makes the node eligible again; StopDrain
+	// stops one and leaves the node ineligible.
 	Drain(ctx context.Context, nodeID string, deadline time.Duration) error
 	CancelDrain(ctx context.Context, nodeID string) error
+	StopDrain(ctx context.Context, nodeID string) error
 	SetEligible(ctx context.Context, nodeID string) error
 	// Purge removes a node that is down from the cluster.
 	Purge(ctx context.Context, nodeID string) error
@@ -179,6 +181,13 @@ func (n *APINodes) Drain(ctx context.Context, nodeID string, deadline time.Durat
 // CancelDrain implements NodeLister.
 func (n *APINodes) CancelDrain(ctx context.Context, nodeID string) error {
 	_, err := n.Client.Nodes().UpdateDrainOpts(nodeID, &api.DrainOptions{MarkEligible: true, Meta: drainMeta},
+		(&api.WriteOptions{}).WithContext(ctx))
+	return err
+}
+
+// StopDrain implements NodeLister.
+func (n *APINodes) StopDrain(ctx context.Context, nodeID string) error {
+	_, err := n.Client.Nodes().UpdateDrainOpts(nodeID, &api.DrainOptions{MarkEligible: false, Meta: drainMeta},
 		(&api.WriteOptions{}).WithContext(ctx))
 	return err
 }
