@@ -93,7 +93,9 @@ WantedBy=multi-user.target
 	writeFile(&doc, t.ConfigFile, "0640", agent.Bytes())
 	writeFile(&doc, joinFile, "0600", confJSON)
 	writeFile(&doc, "/etc/systemd/system/"+JoinUnit+".service", "0644", []byte(unit))
+	t.writeInstallScript(&doc)
 	doc.WriteString("runcmd:\n")
+	t.runInstallScript(&doc)
 	doc.WriteString("  - [systemctl, daemon-reload]\n")
 	doc.WriteString("  - [systemctl, enable, --now, " + JoinUnit + "]\n")
 	return &Rendered{UserData: doc.String()}, nil

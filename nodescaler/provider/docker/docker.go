@@ -342,6 +342,14 @@ func (p *Provider) start(ctx context.Context, group string, req provider.CreateR
 		}
 	}
 	for _, f := range doc.Files {
+		if f.Path == bootstrap.InstallScriptPath {
+			// The install script of a machine (install_script of the
+			// bootstrap) is not run: a container does not run runcmd, and
+			// the provider brings the binaries itself (the mounts of norca
+			// and norca-join) with an image that needs no unit. The lab uses
+			// images that have everything, so there is no script.
+			continue
+		}
 		host := filepath.Join(dir, filepath.FromSlash(strings.TrimPrefix(f.Path, "/")))
 		if err := os.MkdirAll(filepath.Dir(host), 0o700); err != nil {
 			return provider.Instance{}, err

@@ -79,6 +79,7 @@ it):
 | `validity` | The validity of a node certificate (`60d`). |
 | `tls_dir`, `config_file`, `service` | Where the files go and the unit of the agent (`/etc/norca/tls`, `/etc/norca/norca.hcl`, `norca`). |
 | `join_binary` | Where `norca-join` is on the machines, for the join below (`/usr/local/bin/norca-join`). |
+| `install_script` | Optional: a bash script that installs the `norca` binary, the CNI plugins, `norca-join`, the directories and the unit of the agent (`norca-deployer node-scaling install-script`, written with `node_scaling.machine.install: boot`). The bootstrap writes it to `/usr/local/sbin/norca-node-install.sh` (0700) and runs it before it starts the agent or `norca-join`. Without it the image of the machine has all of that. The docker provider ignores it: it mounts the binaries itself. |
 
 For each instance the operator issues a certificate with the node CA (the
 file holds the leaf and the node CA), renders the agent configuration with

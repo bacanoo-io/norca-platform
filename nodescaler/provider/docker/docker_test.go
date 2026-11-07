@@ -174,6 +174,34 @@ func TestDocker_CreateRunsNorcaJoin(t *testing.T) {
 	}
 }
 
+// The install script of a machine is not mounted nor run: the provider
+// brings the binaries itself.
+func TestDocker_IgnoresTheInstallScript(t *testing.T) {
+	p, fd, dir := newTestProvider(t)
+	items, _ := bootstraptest.Items(t)
+	items[bootstrap.ItemInstallScript] = "#!/usr/bin/env bash\nexit 1\n"
+	tmpl, err := bootstrap.Parse("eu", items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := tmpl.Render(bootstrap.Node{Name: "workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := provider.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []provider.InstanceRequest{
+		{Name: "workers-dc1-1-1", Bootstrap: &provider.Bootstrap{UserData: r.UserData}}}}
+	if _, err := p.Create(context.Background(), "dc1", req); err != nil {
+		t.Fatal(err)
+	}
+	if args := strings.Join(fd.runs[0], " "); strings.Contains(args, bootstrap.InstallScriptPath) ||
+		!strings.Contains(args, "agent -config /etc/norca/norca.hcl") {
+		t.Fatalf("docker run:\n%s", args)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "workers-dc1-1-1", "usr", "local", "sbin", "norca-node-install.sh")); err == nil {
+		t.Fatal("the install script was written on the host")
+	}
+}
+
 func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	p, fd, dir := newTestProvider(t)
 	ctx := context.Background()

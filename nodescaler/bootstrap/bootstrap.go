@@ -63,7 +63,17 @@ const (
 	// ItemJoinBinary is where norca-join is on the machines of the nodes
 	// that join with a key of their own (default /usr/local/bin/norca-join).
 	ItemJoinBinary = "join_binary"
+	// ItemInstallScript is a bash script that installs what the machine
+	// needs before the agent can start: the norca binary, the CNI plugins,
+	// norca-join, the directories and the systemd unit of the agent
+	// (norca-deployer node-scaling install-script, node_scaling.machine.install
+	// = boot). Optional: without it the image of the machine has them.
+	ItemInstallScript = "install_script"
 )
+
+// InstallScriptPath is where the bootstrap writes the install script
+// (ItemInstallScript); it runs it before it starts the agent or norca-join.
+const InstallScriptPath = "/usr/local/sbin/norca-node-install.sh"
 
 // MetaCertExpires is the meta key of a node with the expiry of its
 // certificate (RFC 3339), which Render adds: the hard age limit of the node
@@ -85,7 +95,10 @@ type Template struct {
 	ConfigFile  string
 	Service     string
 	JoinBinary  string
-	agent       *template.Template
+	// InstallScript is the install script of the machine; empty when the
+	// image of the machine has the binaries and the unit.
+	InstallScript string
+	agent         *template.Template
 }
 
 // JoinAuthority is what the join endpoint signs with.
@@ -141,6 +154,12 @@ func Parse(region string, items map[string]string) (*Template, error) {
 	}
 	if !validService.MatchString(t.Service) {
 		return nil, fmt.Errorf("the service %q of the bootstrap is not a systemd unit name", t.Service)
+	}
+	if script := items[ItemInstallScript]; strings.TrimSpace(script) != "" {
+		if !strings.HasPrefix(script, "#!") {
+			return nil, errors.New("the install script of the bootstrap does not start with #!")
+		}
+		t.InstallScript = script
 	}
 	return t, nil
 }
@@ -217,9 +236,28 @@ func (t *Template) Render(n Node) (*Rendered, error) {
 	writeFile(&doc, n.CertFile, "0644", chain)
 	writeFile(&doc, n.KeyFile, "0600", cert.KeyPEM)
 	writeFile(&doc, t.ConfigFile, "0640", agent.Bytes())
+	t.writeInstallScript(&doc)
 	doc.WriteString("runcmd:\n")
+	t.runInstallScript(&doc)
 	doc.WriteString("  - [systemctl, enable, --now, " + t.Service + "]\n")
 	return &Rendered{UserData: doc.String(), Serial: leaf.SerialNumber.Text(16), NotAfter: leaf.NotAfter}, nil
+}
+
+// writeInstallScript writes the install script among the files, if the
+// template has one.
+func (t *Template) writeInstallScript(doc *strings.Builder) {
+	if t.InstallScript != "" {
+		writeFile(doc, InstallScriptPath, "0700", []byte(t.InstallScript))
+	}
+}
+
+// runInstallScript runs the install script first in runcmd, if the template
+// has one: the binaries and the unit of the agent must be there before the
+// agent or norca-join is started.
+func (t *Template) runInstallScript(doc *strings.Builder) {
+	if t.InstallScript != "" {
+		doc.WriteString("  - [" + InstallScriptPath + "]\n")
+	}
 }
 
 // writeFile writes a write_files entry with the content in base64, so no
