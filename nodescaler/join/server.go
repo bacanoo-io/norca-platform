@@ -42,9 +42,10 @@ type AuthoritySource interface {
 const DefaultValidity = 7 * 24 * time.Hour
 
 // Server is the join endpoint of the operator: POST /v1/join (a one-time
-// token and a certificate request) and POST /v1/renew (a certificate request
-// with the current certificate as the client certificate). Every instance of
-// the operator serves it: the records are shared (Store).
+// token and a certificate request), POST /v1/renew (a certificate request
+// with the current certificate as the client certificate) and GET /v1/health
+// (for the service check of the operator's job). Every instance of the
+// operator serves it: the records are shared (Store).
 type Server struct {
 	Store     *Store
 	Authority AuthoritySource
@@ -159,7 +160,26 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/join", s.handleJoin)
 	mux.HandleFunc("POST /v1/renew", s.handleRenew)
+	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	return mux
+}
+
+// HealthResponse is the answer of GET /v1/health.
+type HealthResponse struct {
+	Status string `json:"status"`          // "ok" or "unavailable"
+	Error  string `json:"error,omitempty"` // why it is unavailable
+}
+
+// handleHealth answers 200 while the endpoint can serve a join: the node CA
+// is readable and the certificate of the endpoint is issued; else 503. It
+// needs no client certificate and reads no record.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.certificate(r.Context()); err != nil {
+		s.log().Warn("the join endpoint is unavailable", "error", err)
+		writeJSON(w, http.StatusServiceUnavailable, HealthResponse{Status: "unavailable", Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
 }
 
 const maxBody = 64 << 10

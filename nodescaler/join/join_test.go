@@ -439,3 +439,46 @@ func TestPrune(t *testing.T) {
 		t.Fatal("the expired record stays, or a live one or one of another group went")
 	}
 }
+
+type failingAuthority struct{}
+
+func (failingAuthority) Authority(context.Context) (*join.Authority, error) {
+	return nil, errors.New("the bootstrap Variable is not readable")
+}
+
+func TestHealth(t *testing.T) {
+	e := newEnv(t)
+	// As the service check of the job asks: over TLS, without verifying the
+	// certificate of the endpoint and without a client certificate.
+	hc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} // #nosec G402 -- as tls_skip_verify does
+	resp, err := hc.Get(e.srv.URL + "/v1/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got join.HealthResponse
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || got.Status != "ok" {
+		t.Fatalf("health: %d %+v", resp.StatusCode, got)
+	}
+	// Only GET.
+	resp, err = hc.Post(e.srv.URL+"/v1/health", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /v1/health: %d", resp.StatusCode)
+	}
+
+	// Without a node CA the endpoint cannot serve: 503 with the reason.
+	srv := &join.Server{Store: e.store, Authority: failingAuthority{}, Region: "eu"}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/health", nil))
+	got = join.HealthResponse{}
+	_ = json.NewDecoder(rec.Body).Decode(&got)
+	if rec.Code != http.StatusServiceUnavailable || got.Status != "unavailable" || !strings.Contains(got.Error, "not readable") {
+		t.Fatalf("health without a node CA: %d %+v", rec.Code, got)
+	}
+}
