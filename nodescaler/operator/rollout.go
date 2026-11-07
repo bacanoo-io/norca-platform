@@ -53,7 +53,10 @@ import (
 // the rollout off, as a veto of a scale down does (10 minutes, doubling to 6
 // hours); a node at its hard limit is then replaced remove first, and so is a
 // node at its soft age limit when the group keeps a headroom of a node or more
-// (headroom_nodes, headroom_percent) and nothing has to be drained for it. A
+// (headroom_nodes, headroom_percent) and nothing has to be drained for it: as
+// many such nodes at a time as the headroom holds, less the nodes already
+// being removed first, because the provider may refuse their new instances
+// too and leave the group that many nodes short until it accepts again. A
 // backed off rollout whose nodes are close to their hard limit raises
 // RollBlocked.
 //
@@ -329,10 +332,13 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 		}
 		return res
 	}
-	surging := 0
+	surging, removing := 0, int64(0)
 	for _, m := range ro.Replacing {
 		if m.Surge && m.Phase != phaseDeleted {
 			surging++
+		}
+		if !m.Surge {
+			removing++ // a node short until its new instance joins
 		}
 	}
 	for _, c := range outdated {
@@ -341,8 +347,11 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 		}
 		atLimit := c.reason == reasonExpiry
 		// At the soft limit, a refused surge does not make the node wait when
-		// the headroom of the group covers it: it is removed first.
-		covered := c.reason == reasonAge && spec.headroomNodes() >= 1
+		// the headroom of the group covers it: it is removed first. The
+		// headroom covers as many nodes as it holds, those removed first
+		// already included: while the provider refuses, their new instances
+		// may not come, and the group stays that many nodes short.
+		covered := c.reason == reasonAge && spec.headroomNodes() > removing
 		if !atLimit && (spec.paused() || (backedOff && !covered)) {
 			continue
 		}
@@ -388,6 +397,9 @@ func (r *Reconciler) roll(ctx context.Context, obj *api.CustomObject, client *pr
 		r.event(ctx, obj, api.ObjectEventTypeNormal, "Replacing",
 			fmt.Sprintf("node %s of instance %s is replaced (%s): %s", c.node.Name, c.inst.ID, c.reason, how))
 		ro.Replacing = append(ro.Replacing, m)
+		if !surge {
+			removing++
+		}
 		ro.Outdated = slices.DeleteFunc(ro.Outdated, func(n string) bool { return n == c.node.Name })
 		res.requeue = r.cfg.JoinCheck
 	}

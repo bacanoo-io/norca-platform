@@ -57,6 +57,44 @@ func TestRollout_HeadroomDoesNotOverridePause(t *testing.T) {
 	}
 }
 
+func TestRollout_HeadroomBoundsRemoveFirst(t *testing.T) {
+	// The mock group holds 5 instances: both new nodes of a group of 5 are
+	// refused. Two nodes at their soft age limit may then be removed first,
+	// but only as many at a time as the headroom holds: while the provider
+	// refuses, their new instances may not come.
+	for _, tc := range []struct {
+		headroom int
+		removed  int
+	}{
+		{1, 1},
+		{2, 2},
+	} {
+		t.Run(fmt.Sprintf("headroom_nodes %d", tc.headroom), func(t *testing.T) {
+			e := rollEnv(t, 5, map[string]any{"headroom_nodes": tc.headroom,
+				"rolling": map[string]any{"max_node_age": "10d", "jitter": "0%", "max_unavailable": 2, "max_surge": 2}})
+			for _, id := range e.nodeIDs()[:2] {
+				e.setMeta(id, map[string]string{MetaCreatedAt: e.now.Add(-11 * 24 * time.Hour).Format(time.RFC3339)})
+			}
+			e.reconcile() // both surges are refused: backed off
+			if ro := e.rollout(); ro.Backoff.Reason != "SurgeRefused" || len(ro.Replacing) != 0 {
+				t.Fatalf("rollout %+v backoff %+v", ro.Replacing, ro.Backoff)
+			}
+			for range 2 { // the second look starts no more than the first
+				e.reconcile()
+				ro := e.rollout()
+				if len(ro.Replacing) != tc.removed {
+					t.Fatalf("%d removed first, want %d: %+v", len(ro.Replacing), tc.removed, ro.Replacing)
+				}
+				for _, m := range ro.Replacing {
+					if m.Surge { // emptying, or deleted at once: the node has no work
+						t.Fatalf("not removed first: %+v", m)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestRollout_SurgeLimitAllTheWay(t *testing.T) {
 	// Three nodes, two at a time: replicas + max_surge instances at most, all
 	// the way to the end.
