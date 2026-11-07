@@ -492,10 +492,10 @@ func (r *Reconciler) giveBack(ctx context.Context, nodeID string, held, draining
 	}
 }
 
-// heldNote tells, in an event, that a node given back stays ineligible.
+// heldNote follows "stays" in an event: a node given back stays ineligible.
 func heldNote(held bool) string {
 	if held {
-		return " and stays ineligible, as it was out of service by hand when it was taken"
+		return " ineligible, as it was out of service by hand when it was taken"
 	}
 	return ""
 }
