@@ -5,35 +5,47 @@ SPDX-License-Identifier: MPL-2.0
 
 # norca-platform
 
-The platform operators of Norca and the providers they call, in one
-repository. An operator is an application outside the core that turns
-objects of the operator framework into things of a platform; a provider is
-the application that knows one platform (a cloud, the VMs of a lab) and
-keeps its credentials.
+The platform operators of Norca and the provider application they call, in
+one repository. An operator is an application outside the core that turns
+objects of the operator framework into things of a platform; the provider
+application, `norca-provider`, knows the platforms (a cloud, the VMs of a
+lab) and keeps their credentials. **One platform is one directory under
+`providers/` and one type of `norca-provider`**, serving node scaling and
+load balancers with the same credentials.
 
 - **Node scaling** (`nodescaler/`): the core decides how many nodes a
   `NodeGroup` should have (`spec.replicas`); the operator `norca-nodescaler`
   creates and deletes the machines through a **node provider**.
-- **Load balancers** will move here from `norca-loadbalancer`. Nothing here
-  assumes it is the only operator of the repository.
+- **Load balancers** (`loadbalancer/`): a service asks for a load balancer
+  with `expose { load_balancer { class = "..." } }`; the operator
+  `norca-loadbalancer` keeps a `norca.io/LoadBalancer` object for it and has
+  the load balancer made by its built-in `nomad` class or by the provider of
+  a **load balancer class**.
 
 ## Layout
 
 ```
-nodescaler/provider/        the contract between the node scaling operator and a node provider:
-                            the types, the HTTP server a provider uses, the client the operator uses
-nodescaler/provider/mock/   a node provider in memory, for trials and tests
-nodescaler/provider/docker/ a node provider whose machines are containers on its host, for the lab
-nodescaler/registrar/       the NodeProvider object of a provider and its heartbeat
-nodescaler/operator/        the operator: reconciles the NodeGroup objects with their providers
-nodescaler/bootstrap/       the bootstrap of a machine: the node's certificate and agent configuration, as cloud-init
-nodescaler/join/            the hardened node identity: the join endpoint of the operator and norca-join on the node
-cmd/nodeprovider/           a node provider program (types mock and docker)
-cmd/norca-nodescaler/       the operator program
-cmd/norca-join/             the program on a node that makes its key, joins with a one-time token and renews
+provider/                 the framework of norca-provider: the type registry, the configuration file,
+                          the build of the providers, one HTTP server for both contracts
+provider/params/          the typed parameters of a type (required, secret, dynamic, published)
+provider/wire/            what both contracts share: the error shape and the bearer token
+provider/node/            the node contract: types, handler, client of the operator; providertest checks a provider
+provider/lb/              the load balancer contract: types, handler, client of the operator; lbtest checks a provider
+provider/registrar/       the NodeProvider and LoadBalancerClass objects of the providers and their heartbeat
+providers/<platform>/     one directory per platform: aws, gcp, hcloud, digitalocean, vultr, scaleway,
+                          nginx, tcpproxy (load balancers), docker (nodes), mock (both); all links them
+nodescaler/operator/      the node scaling operator: reconciles the NodeGroup objects with their providers
+nodescaler/bootstrap/     the bootstrap of a machine: the node's certificate and agent configuration, as cloud-init
+nodescaler/join/          the hardened node identity: the join endpoint of the operator and norca-join on the node
+loadbalancer/operator/    the LoadBalancer operator, with its kinds (loadbalancer.kind.hcl,
+                          loadbalancerclass.kind.hcl), their schemas, its ACL policy and a job file
+cmd/norca-provider/       the provider application
+cmd/norca-nodescaler/     the node scaling operator
+cmd/norca-join/           the program on a node that makes its key, joins with a one-time token and renews
+cmd/norca-loadbalancer/   the LoadBalancer operator (and the proxy of its nomad class)
 ```
 
-## The operator
+## The node scaling operator
 
 `norca-nodescaler` reconciles every `norca.io/NodeGroup` with a `provider`:
 it asks the provider for the instances the scale (`spec.replicas`) is
@@ -188,9 +200,114 @@ comes next.
 norca-nodescaler -region eu -provider-ttl 3m -token-namespace default
 ```
 
+## The provider application
+
+`norca-provider` serves the providers its configuration file names, on one
+HTTP server, and registers them in Norca: a `norca.io/NodeProvider` object
+for a node provider, a `norca.io/LoadBalancerClass` object for each load
+balancer class, both with the same status (`heartbeat`, RFC 3339, and
+`version`), updated every `heartbeat_interval` (30 seconds), registered
+again when an object disappears and removed on exit
+(`-deregister-on-exit`). `-register=false` serves without touching Norca.
+
+**Types.** A type is a platform. It declares the parameters its two sides
+share (the credentials, the API of the platform) and implements a node
+provider, a load balancer provider or both:
+
+```
+$ norca-provider types
+docker - containers on the host of the provider, each running a Norca agent; for the lab and for trials [node]
+  node.params:
+    image                    string   (default debian:bookworm-slim)  the image of the containers ...
+  node.groups[].params:
+    cpu                      int      [required]  CPU of a machine of the group, in MHz
+...
+hcloud - Hetzner Cloud [loadbalancer]
+  params:
+    token                    string   [required, secret]  Hetzner Cloud API token (supports env:NAME or file:/path)
+  loadbalancer.classes[].params:
+    location                 string   (default fsn1)  Hetzner Cloud location name ...
+    type                     string   (default lb11) [dynamic]  Hetzner Cloud load balancer type ...
+```
+
+Every parameter has a name, a type (`string`, `int`, `bool`, `duration`,
+`list`), a description and optionally a default, `required`, an enum,
+`secret` (never published; a value may be `env:NAME` or `file:/path`) and
+`dynamic` (class parameters only: the operator sends the `parameters` of the
+`LoadBalancerClass` object with every call and they override the configured
+ones, so they change without a restart). The parameters that are not secret
+are published: those of a group in the groups of the `NodeProvider`, those of
+a class (and the shared ones) in `spec.parameters` of the
+`LoadBalancerClass`. Unknown parameters and wrong types are errors at start.
+
+**Configuration.** `providers.example.json` shows a full file:
+
+```json
+{
+  "listen": ":8443",
+  "tls": { "cert": "tls.crt", "key": "tls.key" },
+  "advertise_url": "https://norca-provider.service.norca:8443",
+  "heartbeat_interval": "30s",
+  "providers": [{
+    "name": "hetzner-eu", "type": "hcloud",
+    "params": { "token": "${HCLOUD_TOKEN}" },
+    "token_file": "/secrets/token", "token_variable": "providers/hetzner-eu",
+    "node": { "groups": [{ "name": "fsn1", "max": 10, "params": {} }] },
+    "loadbalancer": { "classes": [{ "class": "hcloud", "params": { "location": "fsn1" } }] }
+  }]
+}
+```
+
+- **What runs is what the file says**: only the sections a provider has
+  (`node`, `loadbalancer`) are started, registered and served. A section the
+  type does not implement is an error at start (`type nginx has no node
+  provider`). `-serve node|lb|all` (default `all`) narrows what a process
+  serves of its file; it never adds a section.
+- **Endpoints.** The node provider of `hetzner-eu` is served at
+  `advertise_url` + `/providers/hetzner-eu` (the endpoint of its
+  `NodeProvider`), a class at `advertise_url` + `/classes/<class>`. `endpoint`
+  in the node section or in a class replaces it, behind a port mapping or a
+  proxy: the registered URL is not the address the process listens on.
+- **The token** of a provider (`token`, `env:NAME` and `file:/path`
+  resolved, or `token_file`) is required of every call to its node provider
+  and its classes, as `Authorization: Bearer`; `token_variable` is the
+  Variable in Norca (item `token`) the operators read to send it. Without a
+  token the provider needs `no_auth` (a trusted network only).
+- A class may limit itself: `internal: false` offers only public load
+  balancers, `internal: true` requires a type that can make internal ones,
+  `ports` (`"80,443,8000-8100"`) limits the frontend ports; the server checks
+  both before the provider is called.
+- **`${NAME}` and `${NAME:-default}`** in any string are replaced with the
+  environment (an unset variable without a default is an error), so a file
+  can be written for a job whose address and port are known when it is
+  placed: `"listen": "0.0.0.0:${NORCA_PORT_api}"`. Inside a Norca job file the
+  dollar sign is doubled in the `template` block.
+- The LoadBalancer operator accepts `https` endpoints, `http` only with
+  `-class-allow-http`, and trusts a private CA with `-class-ca-file`.
+
+The server also answers `GET /healthz`, `GET /v1/types` (the linked types,
+their capabilities and parameters), `GET /v1/providers` and `GET /v1/classes`
+(what it serves; tokens are never listed).
+
+**Running it.** The Norca API is read from the environment (`NORCA_ADDR`,
+`NORCA_TOKEN`). As a Norca job, `NORCA_ADDR=unix://${NORCA_SECRETS_DIR}/api.sock`
+with `identity { env = true }` uses the task API socket and the workload
+identity; as a container in bridge mode, `NORCA_ADDR` is a server and
+`NORCA_CACERT` the CA of the cluster. The ACL policy of the job needs
+`read`, `write` and `write-status` on the kinds it registers
+(`norca.io/NodeProvider`, `norca.io/LoadBalancerClass`) in the namespace
+`"*"`, and nothing else. The `norca-provider` pack of the registry is a
+complete job; the `Dockerfile` builds a `FROM scratch` image (the docker
+platform needs the docker CLI and runs on the host).
+
+```shell
+norca var put providers/hetzner-eu token="$PROVIDER_TOKEN"
+norca-provider -config providers.json
+```
+
 ## The node provider contract
 
-A provider registers itself with a `norca.io/NodeProvider` object (its
+A node provider is registered with a `norca.io/NodeProvider` object (its
 endpoint, the Variable with its token, the groups it offers) and keeps a
 heartbeat in the status. The operator calls it:
 
@@ -208,12 +325,9 @@ name. A request that cannot be served fails with a reason:
 from (its own, a NAT in front of it), best already in the answer of the
 create: the join endpoint binds the join and the renewals of the node to
 them; without addresses there is no binding. See the package documentation
-of `nodescaler/provider`.
+of `provider/node`.
 
-A provider implements `provider.Provider` (`Group`, `Create`, `Delete`),
-serves it with `provider.NewHandler` and registers it with
-`registrar.Registrar`; `cmd/nodeprovider` puts the three together.
-**`nodescaler/provider/providertest`** checks a provider against the
+**`provider/node/providertest`** checks a node provider against the
 contract over HTTP, as the operator calls it: the capacity of a group
 without instances, a create that is idempotent by its request ID, the names,
 labels and request IDs of the instances, invalid requests, the quota reason,
@@ -224,8 +338,8 @@ against a test account:
 ```go
 func TestContract(t *testing.T) {
 	providertest.Run(t, providertest.Config{
-		New:        func(t *testing.T) provider.Provider { return newProvider(t) },
-		Restart:    func(t *testing.T, _ provider.Provider) provider.Provider { return newProvider(t) },
+		New:        func(t *testing.T) node.Provider { return newProvider(t) },
+		Restart:    func(t *testing.T, _ node.Provider) node.Provider { return newProvider(t) },
 		Group:      "fsn1",
 		Params:     map[string]any{"size": "cx22"},
 		QuotaGroup: "fsn1-small", QuotaMax: 2,
@@ -234,42 +348,140 @@ func TestContract(t *testing.T) {
 }
 ```
 
-```shell
-nodeprovider -name mock -listen :8480 -endpoint http://10.0.0.5:8480 \
-  -group dc1:4000:8192:40000:10 -token-file /secrets/token
-```
-
-**The docker provider** (`-type docker`) runs each instance as a container on
-the host it runs on: it reads the files back from the cloud-init document of
-the instance, writes them under `-docker-state-dir` and mounts them read-only
-at their paths, mounts the norca binary of the host (`-docker-binary`), and
-runs `norca agent -config <the .hcl file>` in `-docker-image` (a privileged
-container with the host's cgroups, named after the instance). The containers
-carry the labels of the request, so a restart of the provider loses nothing.
-A node that joins with a key of its own runs `norca-join` of the host
-(`-docker-join-binary`) with the agent as its child. An instance reports the
-addresses of its container and those of the host (`-docker-host-address`,
-comma separated; default the host of `-endpoint` when it is an IP address
-that is not a loopback one): a container reaches its own host from its
-bridge address and other machines from the host's, after the masquerade of
-the bridge. Toward the other machines the containers of one host share its
+**The docker platform** runs each instance as a container on the host it
+runs on: it reads the files back from the cloud-init document of the
+instance, writes them under `state_dir` and mounts them read-only at their
+paths, mounts the norca binary of the host (`binary`), and runs
+`norca agent -config <the .hcl file>` in `image` (a privileged container
+with the host's cgroups, named after the instance). The containers carry the
+labels of the request, so a restart of the provider loses nothing. A node
+that joins with a key of its own runs `norca-join` of the host
+(`join_binary`) with the agent as its child. An instance reports the
+addresses of its container and those of the host (`host_addresses`; default
+the host of the endpoint of the provider when it is an IP address that is
+not a loopback one): a container reaches its own host from its bridge
+address and other machines from the host's, after the masquerade of the
+bridge. Toward the other machines the containers of one host share its
 address, so the address binding of the join tells hosts apart, not
 containers. It is for the lab and for trials, not for production.
 
+```json
+{"name": "lab", "type": "docker", "token_file": "/secrets/token", "token_variable": "nodescaler/providers/lab",
+ "node": {"params": {"state_dir": "/var/lib/norca-provider"},
+          "groups": [{"name": "dc2", "max": 3, "params": {"cpu": 2000, "memory": 1024, "disk": 10000}}]}}
+```
+
+## The load balancer contract
+
+A class is registered with a `norca.io/LoadBalancerClass` object (its
+endpoint, the Variable with its token, its capabilities `internal` and
+`ports`, its published parameters) and keeps a heartbeat in the status. The
+operator calls it:
+
+```
+PUT    {endpoint}/v1/loadbalancers/{namespace}/{name}   create or update (idempotent), returns the state
+DELETE {endpoint}/v1/loadbalancers/{namespace}/{name}   remove
+```
+
+with a bearer token. `PUT` carries the whole desired state (service, port,
+internal, the healthy targets, the parameters of the object) and returns
+`ready`, `addresses`, `resource` and `message`. A failure has the shape of
+the node contract (`{"reason": "invalid", "error": "..."}`): 422 for a
+request the provider cannot satisfy (the operator does not retry it with the
+same input), 502 for a failure of the platform. See the package
+documentation of `provider/lb`; **`provider/lb/lbtest`** checks a provider
+the way `providertest` does for nodes.
+
+The load balancer platforms:
+
+- **mock**: keeps the load balancers in memory. `ready` and `latency` are
+  dynamic, so editing the `LoadBalancerClass` object makes the mock report an
+  outage or a slow cloud.
+- **tcpproxy**: a TCP listener per load balancer inside the provider; each
+  connection goes to the next target (round robin) and to the next one when a
+  target does not answer. After a restart the load balancers are back when
+  the operator calls again. The firewall must allow their ports.
+- **nginx**: writes one file per load balancer into `config_dir`, to be
+  included in the `stream` context, and runs `reload_command` when something
+  changed. A configuration that nginx rejects is rolled back.
+- **hcloud**, **scaleway**, **aws**, **gcp**, **digitalocean**, **vultr**: the
+  load balancers of the cloud through its REST API (no SDK), public and
+  private ones where the cloud has them, with dynamic parameters for the type
+  or size and the algorithm.
+
+## Adding a platform
+
+1. Create `providers/<id>/`, implement `node.Provider` (`Group`, `Create`,
+   `Delete`) and/or `lb.Provider` (`Capabilities`, `Ensure`, `Delete`).
+2. Declare the parameters and register the type in `init()`:
+
+   ```go
+   var shared = []params.Param{
+       {Name: "token", Type: params.ParamString, Required: true, Secret: true},
+   }
+   var classParams = []params.Param{
+       {Name: "location", Type: params.ParamString, Default: "fsn1"},
+       {Name: "type", Type: params.ParamString, Default: "lb11", Dynamic: true},
+   }
+
+   func init() {
+       provider.Register(provider.Type{
+           ID: "hcloud", Description: "Hetzner Cloud", Params: shared,
+           Node: &provider.NodeSpec{GroupParams: groupParams, New: newNode}, // nil without node provider
+           LB:   &provider.LBSpec{Params: classParams, New: NewLB},          // nil without load balancers
+       })
+   }
+   ```
+
+3. Add a blank import to `providers/all/all.go`.
+
+A constructor gets the resolved shared parameters together with those of its
+section (`provider.NodeConfig`: the node parameters and the groups with
+their parameters and max; `lb.Config`: the class parameters). `Ensure`
+receives the whole desired state each time and must be idempotent; `Delete`
+must accept what does not exist. An error wrapping `lb.ErrInvalid`
+(`lb.Invalid(...)`) means the request cannot be satisfied. The server
+serializes the calls for one load balancer. A platform with no state of its
+own should find its resources by a name derived from the request (the
+instance name, the namespace and name of the load balancer) or by a tag, so
+it survives a restart. Run `providertest` and `lbtest` in its tests.
+
+## The LoadBalancer operator
+
+`norca-loadbalancer` (`loadbalancer/operator`) reconciles every
+`norca.io/LoadBalancer` object: it follows the healthy instances of the
+service and has the load balancer made by the class of the object, the
+built-in `nomad` class (a proxy job of the same binary, `norca-loadbalancer
+proxy`) or a registered `LoadBalancerClass`. A class without a registration
+is reported as `UnknownClass`, one whose heartbeat is older than
+`-class-ttl` (three minutes) as `ProviderUnavailable`. It is installed as
+the `loadbalancer-operator` pack of the registry; `loadbalancer.norca.hcl`
+and `loadbalancer-policy.hcl` run it by hand, after
+`norca object-kind apply loadbalancer.kind.hcl` and
+`loadbalancerclass.kind.hcl`.
+
 ```shell
-nodeprovider -name lab -type docker -listen :8480 -endpoint http://10.0.0.5:8480   -group dc2:2000:1024:10000:3 -docker-state-dir /var/lib/norca-nodeprovider
+norca-loadbalancer -objects native -class-ca-file /secrets/ca.pem
 ```
 
 ## Development
 
-The Norca API client comes from the checkout next to this repository
-(`replace` in `go.mod`), as in `norca-loadbalancer`: keep `norca` and
-`norca-platform` side by side.
+The Norca API client and the controller SDK come from the checkout next to
+this repository (`replace` in `go.mod`): keep `norca` and `norca-platform`
+side by side.
 
 ```shell
 make test      # the tests
 make lint      # golangci-lint v2 with .golangci.yml
-make build     # bin/nodeprovider, bin/norca-nodescaler, bin/norca-join
+make build     # bin/norca-provider, bin/norca-nodescaler, bin/norca-join, bin/norca-loadbalancer
 ```
+
+The tests need no cloud, no nginx and no Norca. The end-to-end test of the
+LoadBalancer operator (`loadbalancer/operator/e2e_test.go`) installs the
+`loadbalancer-operator` pack on a dev agent: it needs a `norca` binary
+(`NORCA_BINARY` or on the `PATH`) and a `norca-registry` checkout
+(`NORCA_REGISTRY_DIR`, or next to this repository), and is skipped without
+them. The whole chain on real machines is in the lab (`norca-lab`, cases
+`nodescaler`, `loadbalancer`, `loadbalancer-docker`).
 
 Commits are signed off (`git commit -s`).

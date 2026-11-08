@@ -1,0 +1,62 @@
+{
+  "listen": ":8443",
+  "tls": { "cert": "/etc/norca-provider/tls.crt", "key": "/etc/norca-provider/tls.key" },
+  "advertise_url": "https://norca-provider.service.norca:8443",
+  "heartbeat_interval": "30s",
+
+  "providers": [
+    {
+      "name": "hetzner-eu",
+      "type": "hcloud",
+      "params": { "token": "env:HCLOUD_TOKEN" },
+      "token": "env:PROVIDER_HETZNER_TOKEN",
+      "token_variable": "providers/hetzner-eu",
+      "loadbalancer": {
+        "classes": [
+          { "class": "hcloud-fsn1", "params": { "location": "fsn1", "type": "lb11" } },
+          { "class": "hcloud-private", "params": { "location": "fsn1", "network_id": 4711 }, "internal": true }
+        ]
+      }
+    },
+    {
+      "name": "edge",
+      "type": "nginx",
+      "token_file": "/secrets/edge-token",
+      "token_variable": "providers/edge",
+      "loadbalancer": {
+        "classes": [
+          {
+            "class": "nginx-edge",
+            "ports": "1024-65535",
+            "params": { "config_dir": "/etc/nginx/norca-lb", "advertise_address": "203.0.113.5" }
+          }
+        ]
+      }
+    },
+    {
+      "name": "scaleway-par",
+      "type": "scaleway",
+      "params": { "secret_key": "env:SCW_SECRET_KEY", "project_id": "00000000-0000-0000-0000-000000000000" },
+      "token": "env:PROVIDER_SCW_TOKEN",
+      "token_variable": "providers/scaleway-par",
+      "loadbalancer": { "classes": [ { "class": "scaleway-par", "params": { "zone": "fr-par-1", "type": "LB-S" } } ] }
+    },
+    {
+      "name": "lab",
+      "type": "docker",
+      "token_file": "/secrets/lab-token",
+      "token_variable": "nodescaler/providers/lab",
+      "node": {
+        "params": { "state_dir": "/var/lib/norca-provider", "host_addresses": ["10.77.1.12"] },
+        "groups": [ { "name": "dc2", "max": 3, "params": { "cpu": 2000, "memory": 1024, "disk": 10000 } } ]
+      }
+    },
+    {
+      "name": "mock",
+      "type": "mock",
+      "no_auth": true,
+      "node": { "groups": [ { "name": "dc1", "max": 10, "params": { "cpu": 4000, "memory": 8192, "disk": 40000 } } ] },
+      "loadbalancer": { "classes": [ { "class": "mock", "params": { "address": "192.0.2.10" } } ] }
+    }
+  ]
+}

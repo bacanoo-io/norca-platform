@@ -89,12 +89,11 @@ func HostAddresses(configured []string, endpoint string) ([]string, error) {
 	if len(out) > 0 {
 		return out, nil
 	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, nil
-	}
-	if ip, err := netip.ParseAddr(u.Hostname()); err == nil && !ip.IsLoopback() && !ip.IsUnspecified() {
-		return []string{ip.Unmap().String()}, nil
+	// An endpoint that is not a URL with an IP address gives no address.
+	if u, err := url.Parse(endpoint); err == nil {
+		if ip, err := netip.ParseAddr(u.Hostname()); err == nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+			return []string{ip.Unmap().String()}, nil
+		}
 	}
 	return nil, nil
 }

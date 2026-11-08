@@ -136,7 +136,7 @@ func (p *Provider) scan() error {
 		return err
 	}
 	for _, f := range files {
-		raw, err := os.ReadFile(f) //nolint:gosec // G304: scanning config_dir files managed by this provider
+		raw, err := os.ReadFile(f)
 		if err != nil {
 			return err
 		}
@@ -231,7 +231,7 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 
 	path := p.fileFor(req.Ref)
 	content := render(req.Ref, listener, req)
-	old, readErr := os.ReadFile(path) //nolint:gosec // G304: path is built from validated namespace and name in config_dir
+	old, readErr := os.ReadFile(path)
 	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 		return lb.State{}, readErr
 	}
@@ -271,7 +271,7 @@ func (p *Provider) Delete(ctx context.Context, ref lb.Ref) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	path := p.fileFor(ref)
-	old, err := os.ReadFile(path) //nolint:gosec // G304: path is built from validated namespace and name in config_dir
+	old, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		delete(p.listeners, p.files[ref])
 		delete(p.files, ref)

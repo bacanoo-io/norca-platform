@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"strings"
 
@@ -223,12 +224,8 @@ func buildNode(t Type, p ProviderConfig, token, base string, log *slog.Logger) (
 		Name: p.Name, Type: t.ID, Endpoint: endpoint, Token: token, TokenVariable: p.TokenVariable,
 		Parameters: map[string]any{"type": t.ID},
 	}
-	for k, v := range params.Published(t.Params, shared) {
-		n.Parameters[k] = v
-	}
-	for k, v := range params.Published(t.Node.Params, section) {
-		n.Parameters[k] = v
-	}
+	maps.Copy(n.Parameters, params.Published(t.Params, shared))
+	maps.Copy(n.Parameters, params.Published(t.Node.Params, section))
 	cfg := NodeConfig{Name: p.Name, Values: params.Merge(shared, section), Endpoint: endpoint, Logger: log.With("provider", p.Name)}
 	for _, g := range p.Node.Groups {
 		gv, err := params.Resolve(t.Node.GroupParams, g.Params)

@@ -111,3 +111,19 @@ func TestRun_RegistersBothAndDeregisters(t *testing.T) {
 		t.Fatalf("deregistrations before run returned: %v", deleted)
 	}
 }
+
+// The example configuration of the repository is valid for the linked
+// types.
+func TestExampleConfig(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "providers.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := provider.Parse(raw, os.LookupEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Check(provider.Default); err != nil {
+		t.Fatal(err)
+	}
+}

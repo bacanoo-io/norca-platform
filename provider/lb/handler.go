@@ -126,7 +126,7 @@ func (h *handler) request(ref Ref, body EnsureRequest) (Request, error) {
 		if t.Address == "" || t.Port < 1 || t.Port > 65535 {
 			return Request{}, fmt.Errorf("invalid target %d: %q port %d", i, t.Address, t.Port)
 		}
-		targets[i] = Target{Address: t.Address, Port: t.Port, AllocID: t.AllocID}
+		targets[i] = Target(t)
 	}
 	values, err := h.c.Effective(body.Parameters)
 	if err != nil {

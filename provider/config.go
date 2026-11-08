@@ -213,7 +213,7 @@ func expandString(s string, lookup func(string) (string, bool)) (string, error) 
 
 // Load reads and checks a configuration file.
 func Load(path string) (*File, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the configuration file the operator names
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}

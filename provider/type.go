@@ -30,6 +30,7 @@ package provider
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"regexp"
 	"sort"
 	"strings"
@@ -359,9 +360,7 @@ func newClass(providerName string, t Type, class string, shared, classParams map
 		return nil, fmt.Errorf("class %q (type %s): %w", class, t.ID, err)
 	}
 	published := params.Published(t.Params, sv)
-	for k, v := range params.Published(t.LB.Params, cv) {
-		published[k] = v
-	}
+	maps.Copy(published, params.Published(t.LB.Params, cv))
 	return &lb.Class{
 		Name: class, Type: t.ID, Provider: p, Params: t.LB.Params, Values: values,
 		Published: published, Caps: p.Capabilities(),

@@ -100,9 +100,7 @@ func (c *Client) do(ctx context.Context, method string, ref Ref, body any) ([]by
 		}
 		rd = bytes.NewReader(b)
 	}
-	// The endpoint is the one a registered LoadBalancerClass names: calling
-	// it is the purpose of the client.
-	req, err := http.NewRequestWithContext(ctx, method, c.url(ref), rd) //nolint:gosec // G704: see above
+	req, err := http.NewRequestWithContext(ctx, method, c.url(ref), rd)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +115,7 @@ func (c *Client) do(ctx context.Context, method string, ref Ref, body any) ([]by
 	if hc == nil {
 		hc = defaultHTTP
 	}
-	resp, err := hc.Do(req) //nolint:gosec // G704: the endpoint of the registered class
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}

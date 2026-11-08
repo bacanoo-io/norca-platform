@@ -11,6 +11,7 @@ package params
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"slices"
@@ -366,9 +367,7 @@ func ResolveSecret(s string) (string, error) { return resolveSecret(s) }
 func Merge(all ...Values) Values {
 	out := Values{}
 	for _, v := range all {
-		for k, val := range v.Clone() {
-			out[k] = val
-		}
+		maps.Copy(out, v.Clone())
 	}
 	return out
 }
