@@ -284,6 +284,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	for _, m := range readRollout(prevStatus).Replacing {
 		removing[m.Name] = true
 	}
+	// Nor is the node of an instance deleted for a join failure.
+	for name := range readJoinState(prevStatus).deletedNames() {
+		removing[name] = true
+	}
 	strays := matchNodes(obj.Name, o, nodes, removing)
 
 	// Nodes without an instance: reported, the foreign ones made ineligible.
@@ -296,6 +300,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// The join of the nodes: failed and late instances are deleted, slow ones
 	// marked.
 	js := r.trackJoins(ctx, obj, client, group, spec, o, prevStatus, now)
+	r.purgeDeleted(ctx, obj, &js, now)
 	failing := js.Failures >= spec.maxFailures()
 	if failing && readJoinState(prevStatus).Failures < spec.maxFailures() {
 		r.event(ctx, obj, api.ObjectEventTypeWarning, CondJoinFailing, joinCondition(js, spec.maxFailures()).Message)

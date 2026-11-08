@@ -5,6 +5,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -33,6 +34,16 @@ type joinState struct {
 	Revision    string
 	Resumed     int64
 	LastFailure string
+	// Deleted are the instances deleted here (failed or late) whose node
+	// registered: the node is purged once it is down (status.join.deleted).
+	Deleted []deletedInstance
+}
+
+// deletedInstance is an instance deleted for a join failure, with its node.
+type deletedInstance struct {
+	Instance string
+	Node     string
+	At       time.Time
 }
 
 func readJoinState(status map[string]any) joinState {
@@ -46,6 +57,18 @@ func readJoinState(status map[string]any) joinState {
 		j.Resumed = int64(v)
 	}
 	j.LastFailure, _ = m["lastFailure"].(string)
+	list, _ := m["deleted"].([]any)
+	for _, item := range list {
+		d, _ := item.(map[string]any)
+		inst, _ := d["instance"].(string)
+		node, _ := d["node"].(string)
+		at, _ := d["at"].(string)
+		t, err := time.Parse(time.RFC3339, at)
+		if inst == "" || node == "" || err != nil {
+			continue
+		}
+		j.Deleted = append(j.Deleted, deletedInstance{Instance: inst, Node: node, At: t})
+	}
 	return j
 }
 
@@ -54,7 +77,54 @@ func (j joinState) doc() map[string]any {
 	if j.LastFailure != "" {
 		doc["lastFailure"] = j.LastFailure
 	}
+	if len(j.Deleted) > 0 {
+		list := make([]any, 0, len(j.Deleted))
+		for _, d := range j.Deleted {
+			list = append(list, map[string]any{"instance": d.Instance, "node": d.Node, "at": d.At.UTC().Format(time.RFC3339)})
+		}
+		doc["deleted"] = list
+	}
 	return doc
+}
+
+// deletedNames are the instances of j.Deleted, for matchNodes: their nodes
+// are not strays.
+func (j joinState) deletedNames() map[string]bool {
+	out := make(map[string]bool, len(j.Deleted))
+	for _, d := range j.Deleted {
+		out[d.Instance] = true
+	}
+	return out
+}
+
+// purgeDeleted purges the nodes of the instances deleted for a join failure
+// once they are down, as a scale down does, and forgets the ones that are
+// gone, purged, or still up after downWait (they are strays from then on).
+func (r *Reconciler) purgeDeleted(ctx context.Context, obj *api.CustomObject, j *joinState, now time.Time) {
+	kept := j.Deleted[:0]
+	for _, d := range j.Deleted {
+		detail, err := r.Nodes.Detail(ctx, d.Node)
+		switch {
+		case errors.Is(err, ErrNodeNotFound):
+			// purged already
+		case err != nil:
+			r.log.Warn("reading the node of a deleted instance failed", "group", obj.Name, "node", d.Node, "error", err)
+			kept = append(kept, d)
+		case !detail.Ready:
+			if err := r.Nodes.Purge(ctx, d.Node); err != nil {
+				r.log.Warn("purging the node of a deleted instance failed", "group", obj.Name, "node", d.Node, "error", err)
+				kept = append(kept, d)
+				continue
+			}
+			r.event(ctx, obj, api.ObjectEventTypeNormal, "NodePurged",
+				fmt.Sprintf("node %s of the deleted instance %s is down and purged", d.Node, d.Instance))
+		case now.Sub(d.At) > downWait:
+			r.log.Warn("the node of a deleted instance is still up, it is left as it is", "group", obj.Name, "node", d.Node)
+		default:
+			kept = append(kept, d)
+		}
+	}
+	j.Deleted = kept
 }
 
 // prevRecord is what the last status said about an instance.
@@ -87,7 +157,9 @@ func (r *Reconciler) trackJoins(ctx context.Context, obj *api.CustomObject, clie
 
 	j := readJoinState(status)
 	if rev := spec.templateRevision(); j.Revision != rev || spec.Join.ResumeGeneration > j.Resumed {
-		j = joinState{Revision: rev, Resumed: spec.Join.ResumeGeneration}
+		// A new template ends the row of failures; the nodes of the deleted
+		// instances are still to be purged.
+		j = joinState{Revision: rev, Resumed: spec.Join.ResumeGeneration, Deleted: j.Deleted}
 	}
 	prev := previousRecords(status)
 	deadline, slowAfter := spec.joinDeadline(), spec.slowAfter()
@@ -114,6 +186,12 @@ func (r *Reconciler) trackJoins(ctx context.Context, obj *api.CustomObject, clie
 			}
 			j.Failures++
 			j.LastFailure = failure
+			// The node of an instance deleted here was not purged before: Once the instance was gone, the
+			// node was a stray: ForeignNode (and made ineligible) while it
+			// still looked ready, then NodeWithoutInstance, down for good.
+			if hasNode && node.ID != "" {
+				j.Deleted = append(j.Deleted, deletedInstance{Instance: instanceKey(inst), Node: node.ID, At: now})
+			}
 			reason := "JoinTimeout"
 			if inst.State == provider.StateFailed {
 				reason = "InstanceFailed"
