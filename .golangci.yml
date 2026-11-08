@@ -44,6 +44,12 @@ linters:
       # The QF checks are quick-fix suggestions (fmt.Fprintf instead of
       # WriteString(Sprintf), De Morgan), not bugs.
       checks: ["all", "-QF*", "-ST1000", "-ST1003", "-ST1005", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
+    modernize:
+      # Embedded types named in struct literals (lb.Request{Ref: ...}) and
+      # omitempty on structs are kept on purpose.
+      disable:
+        - omitzero
+        - embedlit
     nolintlint:
       require-explanation: true
       require-specific: true
@@ -57,6 +63,20 @@ linters:
           - errcheck
           - forcetypeassert
           - noctx
+      # The LoadBalancer operator moved from the norca repository, which lints
+      # it with its own configuration; it is changed here only as far as the
+      # provider contract requires. Its findings of these linters (deliberate
+      # nil errors of ignored events, the proxy's plain dial and listen, the
+      # newer idioms) are left for a change of their own.
+      - path: loadbalancer/operator/
+        linters:
+          - nilerr
+          - noctx
+          - modernize
+          - gosec
+          - errcheck
+          - forcetypeassert
+          - nolintlint
 
 formatters:
   enable:

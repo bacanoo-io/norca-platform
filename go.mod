@@ -13,9 +13,11 @@ require (
 	github.com/bacanoo-io/norca-pki v0.3.0
 	github.com/bacanoo-io/norca/norca/api v0.0.0-20230103221135-ce00d683f9be
 	github.com/bacanoo-io/norca/norca/controller v0.0.0-00010101000000-000000000000
+	github.com/shoenig/test v0.6.6
 )
 
 require (
+	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/hashicorp/cronexpr v1.1.2 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
