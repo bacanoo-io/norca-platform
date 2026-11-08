@@ -76,6 +76,9 @@ func (f *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
 		f.runs = append(f.runs, args)
 		c := &container{Name: "/" + argAfter(args, "--name")}
 		c.State.Status = "running"
+		// An address on the network of the run, as docker gives one.
+		c.NetworkSettings.Networks = map[string]struct{ IPAddress, GlobalIPv6Address string }{
+			argAfter(args, "--network"): {IPAddress: fmt.Sprintf("172.17.0.%d", len(f.runs)+1)}}
 		c.Config.Labels = map[string]string{}
 		for i, a := range args {
 			if a == "--label" {
@@ -110,7 +113,7 @@ func newTestProvider(t *testing.T) (*Provider, *fakeDocker, string) {
 	fd := &fakeDocker{containers: map[string]*container{}}
 	p, err := New(Config{
 		Groups:   map[string]GroupConfig{"dc1": {Capacity: provider.Capacity{CPU: 2000, Memory: 2048, Disk: 10000}, Max: 3}},
-		StateDir: dir, Docker: fd,
+		StateDir: dir, Docker: fd, HostAddresses: []string{"10.77.1.12"},
 		Now: func() time.Time { return time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
@@ -212,6 +215,11 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	if len(insts) != 2 || insts[0].Name != "workers-dc1-1-1" || insts[0].ID != "workers-dc1-1-1" {
 		t.Fatalf("instances: %+v", insts)
 	}
+	// The addresses are in the answer of the create: the container's on its
+	// network, then the host's.
+	if got := strings.Join(insts[1].Addresses, ","); got != "172.17.0.3,10.77.1.12" {
+		t.Fatalf("the addresses of a new instance: %q", got)
+	}
 	args := strings.Join(fd.runs[0], " ")
 	for _, want := range []string{
 		"--name workers-dc1-1-1", "--hostname workers-dc1-1-1", "--label norca.request=eu/workers-dc1/1",
@@ -240,6 +248,9 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	if len(g.Instances) != 2 || g.Instances[0].State != provider.StateRunning || g.Instances[0].RequestID != "eu/workers-dc1/1" ||
 		g.Instances[0].Labels["norca.node_group"] != "workers-dc1" || !g.Instances[0].CreatedAt.Equal(time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)) {
 		t.Fatalf("group: %+v", g.Instances)
+	}
+	if got := strings.Join(g.Instances[0].Addresses, ","); got != "172.17.0.2,10.77.1.12" {
+		t.Fatalf("the addresses of a listed instance: %q", got)
 	}
 	if g.Capacity.Memory != 2048 {
 		t.Fatalf("capacity: %+v", g.Capacity)
@@ -286,9 +297,11 @@ func TestDocker_LimitsAndFailures(t *testing.T) {
 	}
 	fd.containers["c-1"].State.Status = "exited"
 	fd.containers["c-1"].State.ExitCode = 1
+	// A stopped container has no address; neither then has the host.
+	fd.containers["c-1"].NetworkSettings.Networks = nil
 	fd.logs = map[string]string{"c-1": "==> Loaded configuration\nError starting agent: client setup failed\n"}
 	g, _ := p.Group(ctx, "dc1", nil)
-	if g.Instances[0].State != provider.StateFailed || !strings.Contains(g.Instances[0].Message, "exit code 1") ||
+	if g.Instances[0].State != provider.StateFailed || len(g.Instances[0].Addresses) != 0 || !strings.Contains(g.Instances[0].Message, "exit code 1") ||
 		!strings.Contains(g.Instances[0].Message, "last output: ==> Loaded configuration | Error starting agent: client setup failed") {
 		t.Fatalf("instance: %+v", g.Instances[0])
 	}

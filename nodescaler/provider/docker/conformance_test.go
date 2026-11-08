@@ -33,6 +33,7 @@ func TestContract_Docker(t *testing.T) {
 		Capacity:   &provider.Capacity{CPU: 2000, Memory: 2048, Disk: 10000},
 		QuotaGroup: "dc1",
 		QuotaMax:   3,
+		Addresses:  true,
 		// The docker provider writes the files of the bootstrap: it needs a
 		// real one.
 		Bootstrap: func(t *testing.T, name string) *provider.Bootstrap {

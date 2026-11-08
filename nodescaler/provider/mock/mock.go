@@ -3,7 +3,9 @@
 
 // Package mock is a node provider in memory, for trials and tests: it keeps
 // the instances it is asked for and creates no machine. An instance is
-// running as soon as it is created.
+// running as soon as it is created, with the addresses of the n-th instance
+// the mock made: 192.0.2.n and 2001:db8::n (n in hex), from the ranges for
+// documentation.
 package mock
 
 import (
@@ -108,6 +110,7 @@ func (p *Provider) Create(_ context.Context, group string, req provider.CreateRe
 			State:     provider.StateRunning,
 			RequestID: req.RequestID,
 			Labels:    maps.Clone(req.Labels),
+			Addresses: Addresses(p.next),
 			CreatedAt: p.now(),
 		}
 		p.inst[group][inst.ID] = inst
@@ -118,6 +121,11 @@ func (p *Provider) Create(_ context.Context, group string, req provider.CreateRe
 		out = append(out, inst)
 	}
 	return out, nil
+}
+
+// Addresses are the addresses of the n-th instance the mock makes.
+func Addresses(n int) []string {
+	return []string{fmt.Sprintf("192.0.2.%d", n%254+1), fmt.Sprintf("2001:db8::%x", n)}
 }
 
 // UserData returns the bootstrap an instance was created with, as a platform

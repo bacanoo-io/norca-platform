@@ -12,6 +12,13 @@
 //
 // The containers carry the labels of the request, so the provider knows its
 // instances after a restart and answers a repeated request with them.
+//
+// The addresses of an instance are those of its container on its docker
+// networks and the addresses of the host (Config.HostAddresses): traffic
+// from a container to its own host keeps the container's address, traffic
+// to other machines is masqueraded to the host's. For the address binding
+// of the join endpoint the containers of one host are therefore one
+// machine toward the rest of the cluster.
 package docker
 
 import (
@@ -123,6 +130,11 @@ type Config struct {
 	// Network is the docker network of the containers (default bridge).
 	Network string
 
+	// HostAddresses are the addresses the traffic of the containers to
+	// other machines comes from (the host's, after the masquerade of the
+	// docker bridge); they are reported with the container's own addresses.
+	HostAddresses []string
+
 	Docker Runner
 	Now    func() time.Time
 }
@@ -172,6 +184,12 @@ type container struct {
 	Config struct {
 		Labels map[string]string
 	}
+	NetworkSettings struct {
+		Networks map[string]struct {
+			IPAddress         string
+			GlobalIPv6Address string
+		}
+	}
 }
 
 // instances lists the containers of a group.
@@ -195,7 +213,7 @@ func (p *Provider) instances(ctx context.Context, group string) ([]provider.Inst
 	}
 	insts := make([]provider.Instance, 0, len(cs))
 	for _, c := range cs {
-		inst := instanceOf(c)
+		inst := p.instanceOf(c)
 		if inst.State == provider.StateFailed {
 			// The operator deletes a failed instance, and the output of the
 			// container with it: the reason goes into the message.
@@ -225,8 +243,32 @@ func lastOutput(logs string) string {
 	return out
 }
 
+// addresses are the addresses of a container on its networks, then those of
+// the host; none while the container has no address of its own (not
+// started): a partial list would bind the join to the host alone.
+func (p *Provider) addresses(c container) []string {
+	var out []string
+	for _, name := range slices.Sorted(maps.Keys(c.NetworkSettings.Networks)) {
+		n := c.NetworkSettings.Networks[name]
+		for _, a := range []string{n.IPAddress, n.GlobalIPv6Address} {
+			if a != "" && !slices.Contains(out, a) {
+				out = append(out, a)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	for _, a := range p.cfg.HostAddresses {
+		if !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // instanceOf maps a container to an instance.
-func instanceOf(c container) provider.Instance {
+func (p *Provider) instanceOf(c container) provider.Instance {
 	labels := map[string]string{}
 	for k, v := range c.Config.Labels {
 		if strings.HasPrefix(k, "norca.") && k != LabelManaged && k != LabelGroup && k != LabelName && k != LabelCreated {
@@ -238,6 +280,7 @@ func instanceOf(c container) provider.Instance {
 		Name:      c.Config.Labels[LabelName],
 		RequestID: c.Config.Labels["norca.request"],
 		Labels:    labels,
+		Addresses: p.addresses(c),
 	}
 	inst.CreatedAt, _ = time.Parse(time.RFC3339, c.Config.Labels[LabelCreated])
 	switch c.State.Status {
@@ -372,10 +415,20 @@ func (p *Provider) start(ctx context.Context, group string, req provider.CreateR
 		_ = os.RemoveAll(dir)
 		return provider.Instance{}, err
 	}
-	return provider.Instance{
+	inst := provider.Instance{
 		ID: ir.Name, Name: ir.Name, State: provider.StateCreating, RequestID: req.RequestID,
 		Labels: maps.Clone(req.Labels), CreatedAt: p.cfg.Now().UTC().Truncate(time.Second),
-	}, nil
+	}
+	// The addresses at once: the node joins as soon as it starts, and the
+	// operator records them from this answer. Without them (inspect failed)
+	// the operator records them from a later list.
+	if out, err := p.cfg.Docker.Run(ctx, "inspect", ir.Name); err == nil {
+		var cs []container
+		if json.Unmarshal([]byte(out), &cs) == nil && len(cs) == 1 {
+			inst.Addresses = p.addresses(cs[0])
+		}
+	}
+	return inst, nil
 }
 
 // Delete implements provider.Provider: the container and its files go.

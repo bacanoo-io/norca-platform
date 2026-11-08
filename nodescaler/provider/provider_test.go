@@ -28,5 +28,6 @@ func TestContract_Mock(t *testing.T) {
 		Capacity:   &provider.Capacity{CPU: 2000, Memory: 4096, Disk: 20000},
 		QuotaGroup: "fsn1",
 		QuotaMax:   3,
+		Addresses:  true,
 	})
 }

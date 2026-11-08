@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -68,6 +70,35 @@ func parseGroup(s string) (string, mock.GroupConfig, error) {
 	}, nil
 }
 
+// hostAddresses reads -docker-host-address: IP addresses, comma separated.
+// Empty, it is the host of the endpoint if that is an IP address and not a
+// loopback or unspecified one (the provider then serves on the address of
+// the host the containers' traffic leaves from), else none.
+func hostAddresses(flagValue, endpoint string) ([]string, error) {
+	var out []string
+	for a := range strings.SplitSeq(flagValue, ",") {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		ip, err := netip.ParseAddr(a)
+		if err != nil {
+			return nil, fmt.Errorf("-docker-host-address: %q is not an IP address", a)
+		}
+		out = append(out, ip.Unmap().String())
+	}
+	if len(out) > 0 || flagValue != "" {
+		return out, nil
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, nil
+	}
+	if ip, err := netip.ParseAddr(u.Hostname()); err == nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+		return []string{ip.Unmap().String()}, nil
+	}
+	return nil, nil
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "nodeprovider:", err)
@@ -86,6 +117,7 @@ func run(args []string) error {
 		dockerJoin    = fs.String("docker-join-binary", "/usr/local/bin/norca-join", "docker: norca-join of the host, mounted into the containers of nodes that join with a key of their own")
 		dockerState   = fs.String("docker-state-dir", "/var/lib/norca-nodeprovider", "docker: where the files of the nodes are written")
 		dockerNetwork = fs.String("docker-network", "bridge", "docker: the network of the containers")
+		dockerHost    = fs.String("docker-host-address", "", "docker: the addresses (comma separated) the traffic of the containers to other machines comes from, after the masquerade of the docker network, reported as addresses of every instance (the join endpoint binds the nodes to them); default: the host of -endpoint if it is an IP address that is not a loopback one")
 		listen        = fs.String("listen", ":8480", "address to serve the provider contract on")
 		endpoint      = fs.String("endpoint", "", "the URL the operator calls (default http://<listen>)")
 		tokenFile     = fs.String("token-file", "", "file with the bearer token the operator must send")
@@ -150,8 +182,16 @@ func run(args []string) error {
 		for name, cfg := range configs {
 			groups[name] = docker.GroupConfig{Capacity: cfg.Capacity, Max: cfg.Max}
 		}
+		hostAddrs, err := hostAddresses(*dockerHost, *endpoint)
+		if err != nil {
+			return err
+		}
+		if len(hostAddrs) == 0 {
+			log.Warn("no address of the host is known (-docker-host-address): the instances report only the addresses of their containers, " +
+				"and a node's traffic to another machine comes from an address the join endpoint does not know")
+		}
 		d, err := docker.New(docker.Config{Groups: groups, Image: *dockerImage, Binary: *dockerBinary,
-			JoinBinary: *dockerJoin, StateDir: *dockerState, Network: *dockerNetwork})
+			JoinBinary: *dockerJoin, StateDir: *dockerState, Network: *dockerNetwork, HostAddresses: hostAddrs})
 		if err != nil {
 			return err
 		}

@@ -16,8 +16,12 @@ func TestParseFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if f.region != "eu" || f.providerTTL != 3*time.Minute || !f.leaderElection || f.workers != 2 ||
-		!f.bootstrap || f.bootstrapVar != "nodescaler/bootstrap/eu" || f.networkVar != "nodescaler/network/eu" {
+		!f.bootstrap || f.bootstrapVar != "nodescaler/bootstrap/eu" || f.networkVar != "nodescaler/network/eu" ||
+		!f.joinCheckAddr {
 		t.Fatalf("defaults: %+v", f)
+	}
+	if f, err := parseFlags([]string{"-join-check-address=false"}); err != nil || f.joinCheckAddr {
+		t.Fatalf("-join-check-address=false: %+v %v", f, err)
 	}
 	for args, want := range map[string]string{
 		"-region=":   "-region must not be empty",

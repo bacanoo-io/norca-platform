@@ -4,10 +4,15 @@
 package join_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -169,6 +174,9 @@ func TestJoinAndRenew(t *testing.T) {
 	if second.SerialNumber.Cmp(first.SerialNumber) == 0 || string(keyBefore) == string(keyAfter) {
 		t.Fatal("the renewal kept the certificate or the key")
 	}
+	if pub, ok := second.PublicKey.(*ecdsa.PublicKey); !ok || pub.Equal(first.PublicKey) {
+		t.Fatal("the renewed certificate is for the key of the one before")
+	}
 	if !e.has("CertificateRenewed", "workers-1-1 renewed") {
 		t.Fatalf("no CertificateRenewed event: %v", e.events)
 	}
@@ -269,6 +277,169 @@ func TestRenewOnlyTheLatest(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("a renewal without a certificate: %d", res.StatusCode)
+	}
+}
+
+// A renewal rotates the key: a request for the key of the current
+// certificate is refused, and the refusal is in the log of the group.
+func TestRenewWithTheSameKeyIsRefused(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	c, path := e.node("workers-1-1")
+	if err := c.Join(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	pair, leaf, err := c.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "workers-1-1"}}, pair.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(join.RenewRequest{CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
+	hc := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true, Certificates: []tls.Certificate{*pair}}}} // #nosec G402 -- a test client of the endpoint
+	res, err := hc.Post(e.srv.URL+"/v1/renew", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got join.ErrorResponse
+	_ = json.NewDecoder(res.Body).Decode(&got)
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusForbidden || !strings.Contains(got.Error, "a renewal needs a new key") {
+		t.Fatalf("a renewal with the same key: %d %+v", res.StatusCode, got)
+	}
+	if !e.has("RenewalRefused", "for the key of its current certificate") {
+		t.Fatalf("no RenewalRefused event: %v", e.events)
+	}
+	// Nothing was recorded: the current certificate still renews, with a
+	// new key.
+	if err := c.Renew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, now, _ := c.Current(); now.SerialNumber.Cmp(leaf.SerialNumber) == 0 {
+		t.Fatal("no new certificate")
+	}
+}
+
+// With CheckAddress the join and the renewals come from an address the
+// provider reports for the instance; a first join waits until the operator
+// recorded what the provider reports.
+func TestAddressBinding(t *testing.T) {
+	e := newEnv(t)
+	e.server.CheckAddress = true
+	ctx := context.Background()
+	c, path := e.node("workers-1-1")
+	var refused *join.RefusedError
+
+	// Not recorded yet: the endpoint answers 503, the node tries again (not
+	// a refusal), and the token stays valid.
+	err := c.Join(ctx, path)
+	if err == nil || errors.As(err, &refused) || !strings.Contains(err.Error(), "has not recorded the addresses of workers-1-1 yet") {
+		t.Fatalf("a join before the addresses are known: %v", err)
+	}
+
+	// From an address that is not the instance's: refused, in the log of
+	// the group; the token is still not used.
+	if _, err := e.store.Seen(ctx, "workers", "workers-1-1", []string{"10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Join(ctx, path); !errors.As(err, &refused) || refused.Status != http.StatusForbidden ||
+		!strings.Contains(refused.Message, "from 127.0.0.1, which is not an address of the instance (10.0.0.9)") {
+		t.Fatalf("a join from another address: %v", err)
+	}
+	if !e.has("JoinAddressRefused", "a join of workers-1-1 from 127.0.0.1") {
+		t.Fatalf("no JoinAddressRefused event: %v", e.events)
+	}
+
+	// From an address of the instance (IPv4 mapped into IPv6 is the same).
+	if _, err := e.store.Seen(ctx, "workers", "workers-1-1", []string{"10.0.0.9", "::ffff:127.0.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Join(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	rec := e.backend.GetVariable("default", "nodescaler/join/eu/workers-1-1")
+	if rec.Items["addresses"] != "10.0.0.9,127.0.0.1" || rec.Items["seen"] == "" || rec.Items["serial"] == "" {
+		t.Fatalf("the record after the join: %v", rec.Items)
+	}
+
+	// A provider that stops reporting addresses does not clear them.
+	if wrote, err := e.store.Seen(ctx, "workers", "workers-1-1", nil); err != nil || wrote {
+		t.Fatalf("an empty list changed the record: %v %v", wrote, err)
+	}
+	if err := c.Renew(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The renewals are bound too: a new list replaces the old one.
+	if _, err := e.store.Seen(ctx, "workers", "workers-1-1", []string{"10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Renew(ctx); !errors.As(err, &refused) || refused.Status != http.StatusForbidden {
+		t.Fatalf("a renewal from another address: %v", err)
+	}
+	if !e.has("JoinAddressRefused", "a renewal of workers-1-1 from 127.0.0.1") {
+		t.Fatalf("no JoinAddressRefused event of the renewal: %v", e.events)
+	}
+
+	// A provider that reports no address for a running instance: the
+	// operator records that it saw it, and the join is not bound.
+	c2, path2 := e.node("workers-1-2")
+	if _, err := e.store.Seen(ctx, "workers", "workers-1-2", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Join(ctx, path2); err != nil {
+		t.Fatalf("a join of an instance without addresses: %v", err)
+	}
+
+	// Without the check nothing waits for the operator.
+	e.server.CheckAddress = false
+	c3, path3 := e.node("workers-1-3")
+	if err := c3.Join(ctx, path3); err != nil {
+		t.Fatalf("a join without the check: %v", err)
+	}
+}
+
+// A change of the record by the operator (its addresses) between the check
+// of a token or a certificate and the write of the new serial is not a use:
+// the join and the renewal still go through, a second use still fails.
+func TestOperatorWritesDoNotRefuse(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	c, _ := e.node("workers-1-1")
+	rec, _, err := e.store.Redeem(ctx, "workers-1-1", c.Config.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Seen(ctx, "workers", "workers-1-1", []string{"10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.Joined(ctx, rec, "aa"); err != nil {
+		t.Fatalf("a join after a write of the operator: %v", err)
+	}
+	if err := e.store.Joined(ctx, rec, "bb"); !errors.Is(err, join.ErrRefused) {
+		t.Fatalf("the token was used twice: %v", err)
+	}
+	rec, _, err = e.store.Renewing(ctx, "workers-1-1", "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Seen(ctx, "workers", "workers-1-1", []string{"10.0.0.8"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.Renewed(ctx, rec, "cc"); err != nil {
+		t.Fatalf("a renewal after a write of the operator: %v", err)
+	}
+	if err := e.store.Renewed(ctx, rec, "dd"); !errors.Is(err, join.ErrRefused) {
+		t.Fatalf("a certificate renewed twice: %v", err)
+	}
+	got := e.backend.GetVariable("default", "nodescaler/join/eu/workers-1-1").Items
+	if got["serial"] != "cc" || got["addresses"] != "10.0.0.8" || got["seen"] == "" || got["joined"] == "" ||
+		got["group"] != "workers" || got["token_sha256"] != "" {
+		t.Fatalf("the record: %v", got)
 	}
 }
 

@@ -68,6 +68,15 @@ type Instance struct {
 	// RequestID is the request that created the instance.
 	RequestID string `json:"request_id,omitempty"`
 
+	// Addresses are the IP addresses the traffic of the instance's node to
+	// the operator can come from: its own, and the address of a NAT in
+	// front of it. Optional: the join endpoint of the operator binds the
+	// join and the renewals of a node to them, and without addresses there
+	// is no binding. A provider that knows them when the instance is created
+	// returns them from Create; the first join of a node waits until the
+	// operator has the addresses, or until the instance runs without any.
+	// A list, once reported, replaces the one before; an empty list does not
+	// clear it.
 	Addresses []string          `json:"addresses,omitempty"`
 	Labels    map[string]string `json:"labels,omitempty"`
 	CreatedAt time.Time         `json:"created_at"`

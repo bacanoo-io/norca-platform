@@ -121,6 +121,23 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
   all records of a group when it is deleted with its instances (`drain`,
   `terminate`); orphaned instances keep theirs, so their nodes go on
   renewing.
+- A renewal rotates the key: the endpoint refuses a request for the key of
+  the current certificate (`RenewalRefused`), so a key that leaked does not
+  stay valid through the renewals.
+- **The join and the renewals are bound to the addresses of the instance.**
+  The operator writes the addresses the provider reports for an instance
+  into its record (`addresses`, and `seen` once it recorded what the
+  provider reports), from the answer of the create and from later lists,
+  only on a change; addresses once known are never cleared, a new non-empty
+  list replaces them. The endpoint accepts a join or a renewal only from one
+  of them (the peer address of the connection; no header is trusted); from
+  another it answers 403 and records `JoinAddressRefused`, a warning in the
+  log of the group: a stolen token or key. The token is issued before the
+  instance exists, so a first join waits (503, `norca-join` tries again)
+  until the operator has recorded the instance: its addresses, or that it
+  runs without any. A provider that reports no addresses has no binding.
+  Where a proxy, a load balancer or NAT in front of the endpoint changes the
+  source address, turn it off with `-join-check-address=false`.
 - The endpoints are `-join-url` (repeatable: a stable name or a load
   balancer) or, without it, the instances of the service `-join-service`
   (`nodescaler-join`) in the native catalog. Each answer gives the node the
@@ -186,7 +203,11 @@ DELETE {endpoint}/v1/groups/{group}/instances/{id}  delete one instance
 with a bearer token. A create request lists the instances, each with its
 name and its bootstrap (`user_data`); the provider gives the machine that
 name. A request that cannot be served fails with a reason:
-`quota`, `no_capacity`, `invalid` or `error`. See the package documentation
+`quota`, `no_capacity`, `invalid` or `error`. An instance may report its
+`addresses`, every IP address its node's traffic to the operator can come
+from (its own, a NAT in front of it), best already in the answer of the
+create: the join endpoint binds the join and the renewals of the node to
+them; without addresses there is no binding. See the package documentation
 of `nodescaler/provider`.
 
 A provider implements `provider.Provider` (`Group`, `Create`, `Delete`),
@@ -226,8 +247,14 @@ runs `norca agent -config <the .hcl file>` in `-docker-image` (a privileged
 container with the host's cgroups, named after the instance). The containers
 carry the labels of the request, so a restart of the provider loses nothing.
 A node that joins with a key of its own runs `norca-join` of the host
-(`-docker-join-binary`) with the agent as its child. It is for the lab and
-for trials, not for production.
+(`-docker-join-binary`) with the agent as its child. An instance reports the
+addresses of its container and those of the host (`-docker-host-address`,
+comma separated; default the host of `-endpoint` when it is an IP address
+that is not a loopback one): a container reaches its own host from its
+bridge address and other machines from the host's, after the masquerade of
+the bridge. Toward the other machines the containers of one host share its
+address, so the address binding of the join tells hosts apart, not
+containers. It is for the lab and for trials, not for production.
 
 ```shell
 nodeprovider -name lab -type docker -listen :8480 -endpoint http://10.0.0.5:8480   -group dc2:2000:1024:10000:3 -docker-state-dir /var/lib/norca-nodeprovider

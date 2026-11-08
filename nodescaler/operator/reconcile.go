@@ -268,6 +268,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		if err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(obj.Name), live); err != nil {
 			r.log.Warn("pruning the join records failed", "group", obj.Name, "error", err)
 		}
+		r.recordSeen(ctx, obj.Name, o.instances)
 	}
 	nodes, err := r.Nodes.Nodes(ctx, spec.Datacenter, spec.Pool, spec.NodeClass)
 	if err != nil {
@@ -348,6 +349,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 				o.retiring = roll.state.retiring()
 			} else {
 				requested = true
+				// The addresses of the new instances, before their nodes
+				// join: the endpoint waits for them.
+				r.recordSeen(ctx, obj.Name, created)
 				for _, inst := range created {
 					if slices.ContainsFunc(o.instances, func(i provider.Instance) bool { return i.ID == inst.ID }) {
 						continue // an instance of a repeated request

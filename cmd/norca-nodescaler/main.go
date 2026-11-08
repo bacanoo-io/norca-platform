@@ -74,6 +74,7 @@ type flags struct {
 	joinService    string
 	joinServiceNS  string
 	joinValidity   time.Duration
+	joinCheckAddr  bool
 }
 
 // stringList collects a repeatable flag.
@@ -108,6 +109,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.joinService, "join-service", "nodescaler-join", "service of the native catalog whose instances are the join endpoints, without -join-url")
 	fs.StringVar(&f.joinServiceNS, "join-service-namespace", envOr("NORCA_NAMESPACE", "default"), "namespace of -join-service")
 	fs.DurationVar(&f.joinValidity, "join-validity", 7*24*time.Hour, "validity of the certificate of a node that renews itself (renewed at two thirds)")
+	fs.BoolVar(&f.joinCheckAddr, "join-check-address", true, "the join endpoint accepts a join or a renewal only from an address the provider reports for the instance; turn it off where a proxy, a load balancer or NAT in front of the endpoint changes the source address")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -245,10 +247,10 @@ func startJoin(ctx context.Context, f *flags, client *api.Client, backend contro
 	}
 	srv := &join.Server{
 		Store: store, Authority: &operator.TemplateAuthority{Bootstrap: boot}, Region: f.region,
-		Validity: f.joinValidity, URLs: urls, Log: logger,
+		Validity: f.joinValidity, URLs: urls, Log: logger, CheckAddress: f.joinCheckAddr,
 		Event: func(ctx context.Context, group, reason, message string) {
 			typ := api.ObjectEventTypeNormal
-			if reason == "RenewalRefused" {
+			if reason == "RenewalRefused" || reason == "JoinAddressRefused" {
 				typ = api.ObjectEventTypeWarning
 			}
 			if err := backend.RecordObjectEvents(ctx, operator.NodeGroupKind, "", group,
@@ -272,6 +274,7 @@ func startJoin(ctx context.Context, f *flags, client *api.Client, backend contro
 		<-ctx.Done()
 		_ = hs.Close()
 	}()
-	logger.Info("serving the join endpoint", "address", ln.Addr().String(), "validity", f.joinValidity)
+	logger.Info("serving the join endpoint", "address", ln.Addr().String(), "validity", f.joinValidity,
+		"check_address", f.joinCheckAddr)
 	return &operator.StoreJoin{Store: store, URLs: urls}, nil
 }

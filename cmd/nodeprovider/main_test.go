@@ -28,6 +28,25 @@ func TestParseGroup(t *testing.T) {
 	}
 }
 
+func TestHostAddresses(t *testing.T) {
+	for _, tc := range []struct{ flag, endpoint, want string }{
+		{"", "http://10.77.1.12:8480", "10.77.1.12"},
+		{"", "http://127.0.0.1:8480", ""},
+		{"", "http://[::]:8480", ""},
+		{"", "http://provider.lab:8480", ""},
+		{"10.0.0.1, 2001:db8::1", "http://10.77.1.12:8480", "10.0.0.1,2001:db8::1"},
+		{"::ffff:10.0.0.1", "", "10.0.0.1"},
+	} {
+		got, err := hostAddresses(tc.flag, tc.endpoint)
+		if err != nil || strings.Join(got, ",") != tc.want {
+			t.Errorf("%q %q: got %v %v, want %q", tc.flag, tc.endpoint, got, err, tc.want)
+		}
+	}
+	if _, err := hostAddresses("host.lab", ""); err == nil {
+		t.Error("a name is accepted as an address")
+	}
+}
+
 func TestRun_Flags(t *testing.T) {
 	for args, want := range map[string]string{
 		"-group dc1:4000:8192:0": "-name is required",

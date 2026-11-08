@@ -5,6 +5,7 @@ package join
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,12 +16,17 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	pki "github.com/bacanoo-io/norca-pki"
+	"github.com/bacanoo-io/norca/norca/api"
 )
 
 // Authority is what the endpoint signs with: the cluster CA (the roots of
@@ -57,8 +63,15 @@ type Server struct {
 	URLs func(ctx context.Context) ([]string, error)
 	// Event records an event in the log of a node group; nil records none.
 	Event func(ctx context.Context, group, reason, message string)
-	Log   *slog.Logger
-	Now   func() time.Time
+	// CheckAddress binds a join and a renewal to the addresses the provider
+	// reports for the instance (its record, Store.Seen): a request from
+	// another source address is refused. A record without addresses is not
+	// checked, but a first join waits until the operator has recorded what
+	// the provider reports. Off where a proxy, a load balancer or NAT in
+	// front of the endpoint changes the source address.
+	CheckAddress bool
+	Log          *slog.Logger
+	Now          func() time.Time
 
 	mu       sync.Mutex
 	auth     *Authority
@@ -197,6 +210,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, statusOf(err), "join", req.Instance, err)
 		return
 	}
+	if status, err := s.checkAddress(ctx, r, rec, group, req.Instance, "join"); err != nil {
+		s.fail(w, status, "join", req.Instance, err)
+		return
+	}
 	pub, err := pki.ParseCSR([]byte(req.CSR))
 	if err != nil {
 		s.fail(w, http.StatusBadRequest, "join", req.Instance, err)
@@ -243,11 +260,6 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusBadRequest, "renew", instance, fmt.Errorf("the request: %w", err))
 		return
 	}
-	pub, err := pki.ParseCSR([]byte(req.CSR))
-	if err != nil {
-		s.fail(w, http.StatusBadRequest, "renew", instance, err)
-		return
-	}
 	rec, group, err := s.Store.Renewing(ctx, instance, leaf.SerialNumber.Text(16))
 	if err != nil {
 		if errors.Is(err, ErrRefused) {
@@ -258,6 +270,23 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.fail(w, statusOf(err), "renew", instance, err)
+		return
+	}
+	if status, err := s.checkAddress(ctx, r, rec, group, instance, "renewal"); err != nil {
+		s.fail(w, status, "renew", instance, err)
+		return
+	}
+	pub, err := pki.ParseCSR([]byte(req.CSR))
+	if err != nil {
+		s.fail(w, http.StatusBadRequest, "renew", instance, err)
+		return
+	}
+	// A renewal rotates the key: a request for the key of the current
+	// certificate would keep a key that may have leaked valid for ever.
+	if k, ok := leaf.PublicKey.(interface{ Equal(crypto.PublicKey) bool }); ok && k.Equal(pub) {
+		err := fmt.Errorf("%w: the request of %s is for the key of its current certificate; a renewal needs a new key", ErrRefused, instance)
+		s.event(ctx, group, "RenewalRefused", err.Error())
+		s.fail(w, http.StatusForbidden, "renew", instance, err)
 		return
 	}
 	resp, serial, err := s.issue(ctx, instance, pub)
@@ -333,6 +362,52 @@ func verifyNode(a *Authority, chain []*x509.Certificate, now time.Time) (*x509.C
 	return chain[0], nil
 }
 
+// errNotSeen is a first join before the operator recorded what the provider
+// reports for the instance: the node tries again (503).
+var errNotSeen = errors.New("not recorded yet")
+
+// checkAddress checks the source address of a request (the peer of the
+// connection; no header is trusted) against the addresses of the record of
+// the instance, while CheckAddress is on. A request from another address is
+// refused (403) and in the log of the group: it may be a stolen token or
+// key. A record without addresses is not checked; only a first join waits
+// (503) until the operator has recorded what the provider reports.
+func (s *Server) checkAddress(ctx context.Context, r *http.Request, rec *api.Variable, group, instance, what string) (int, error) {
+	if !s.CheckAddress {
+		return 0, nil
+	}
+	addrs, seen := Addresses(rec)
+	if len(addrs) == 0 {
+		if what == "join" && !seen {
+			return http.StatusServiceUnavailable, fmt.Errorf("%w: the operator has not recorded the addresses of %s yet; try again", errNotSeen, instance)
+		}
+		s.log().Debug("the provider reports no address of the instance: the source of the request is not checked",
+			"instance", instance, "request", what)
+		return 0, nil
+	}
+	src := sourceAddress(r)
+	if slices.Contains(addrs, src) {
+		return 0, nil
+	}
+	err := fmt.Errorf("%w: a %s of %s from %s, which is not an address of the instance (%s)",
+		ErrRefused, what, instance, src, strings.Join(addrs, ", "))
+	s.event(ctx, group, "JoinAddressRefused", err.Error()+"; a stolen token or key?")
+	return http.StatusForbidden, err
+}
+
+// sourceAddress is the IP address of the peer of a request, an IPv4 address
+// mapped into IPv6 as IPv4.
+func sourceAddress(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().WithZone("").String()
+	}
+	return host
+}
+
 func (s *Server) event(ctx context.Context, group, reason, message string) {
 	if s.Event != nil && group != "" {
 		s.Event(ctx, group, reason, message)
@@ -342,7 +417,7 @@ func (s *Server) event(ctx context.Context, group, reason, message string) {
 func (s *Server) fail(w http.ResponseWriter, status int, what, instance string, err error) {
 	s.log().Warn("a "+what+" was refused", "instance", instance, "status", status, "error", err)
 	msg := err.Error()
-	if status >= 500 {
+	if status >= 500 && !errors.Is(err, errNotSeen) {
 		msg = "internal error"
 	}
 	writeJSON(w, status, ErrorResponse{Error: msg})

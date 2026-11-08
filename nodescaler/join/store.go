@@ -12,6 +12,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
+	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,6 +30,11 @@ const (
 	itemSerial  = "serial"
 	itemJoined  = "joined"
 	itemRenewed = "renewed"
+	// The addresses the provider reports for the instance (comma separated)
+	// and when the operator first recorded what the provider reports: the
+	// join endpoint binds the join and the renewals to these addresses.
+	itemAddresses = "addresses"
+	itemSeen      = "seen"
 )
 
 // ErrRefused is a join or a renewal the record does not allow: an unknown
@@ -115,12 +123,17 @@ func (s *Store) Redeem(ctx context.Context, instance, token string) (*api.Variab
 }
 
 // Joined records the first certificate of a redeemed instance; the token is
-// void from now. It fails if the record changed since Redeem (the token was
-// used meanwhile).
+// void from now. It fails if the token was used meanwhile; a change of the
+// record by the operator (its addresses) is not a use.
 func (s *Store) Joined(ctx context.Context, v *api.Variable, serial string) error {
-	return s.update(ctx, v, api.VariableItems{
-		itemGroup: v.Items[itemGroup], itemSerial: serial, itemJoined: s.now().UTC().Format(time.RFC3339),
-	})
+	token := v.Items[itemToken]
+	return s.updateRetry(ctx, v, func(cur *api.Variable) bool { return cur.Items[itemToken] == token },
+		func(items api.VariableItems) {
+			delete(items, itemToken)
+			delete(items, itemExpires)
+			items[itemSerial] = serial
+			items[itemJoined] = s.now().UTC().Format(time.RFC3339)
+		})
 }
 
 // Renewing checks that a certificate of an instance is its latest: it
@@ -139,13 +152,77 @@ func (s *Store) Renewing(ctx context.Context, instance, serial string) (*api.Var
 	return v, v.Items[itemGroup], nil
 }
 
-// Renewed records the new certificate of an instance. It fails if the record
-// changed since Renewing (another renewal with the same certificate won).
+// Renewed records the new certificate of an instance. It fails if another
+// renewal with the same certificate won; a change of the record by the
+// operator (its addresses) is not one.
 func (s *Store) Renewed(ctx context.Context, v *api.Variable, serial string) error {
-	return s.update(ctx, v, api.VariableItems{
-		itemGroup: v.Items[itemGroup], itemSerial: serial, itemJoined: v.Items[itemJoined],
-		itemRenewed: s.now().UTC().Format(time.RFC3339),
-	})
+	old := v.Items[itemSerial]
+	return s.updateRetry(ctx, v, func(cur *api.Variable) bool { return cur.Items[itemSerial] == old },
+		func(items api.VariableItems) {
+			items[itemSerial] = serial
+			items[itemRenewed] = s.now().UTC().Format(time.RFC3339)
+		})
+}
+
+// Addresses returns the addresses recorded for an instance and whether the
+// operator recorded what the provider reports for it (seen).
+func Addresses(v *api.Variable) (addresses []string, seen bool) {
+	if a := v.Items[itemAddresses]; a != "" {
+		addresses = strings.Split(a, ",")
+	}
+	return addresses, v.Items[itemSeen] != ""
+}
+
+// NormalizeAddresses returns the IP addresses of a list, sorted and once
+// each, IPv4 mapped into IPv6 as IPv4; what is not an IP address is left out.
+func NormalizeAddresses(list []string) []string {
+	var out []string
+	for _, a := range list {
+		ip, err := netip.ParseAddr(strings.TrimSpace(a))
+		if err != nil {
+			continue
+		}
+		out = append(out, ip.Unmap().WithZone("").String())
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// Seen records what the provider reports for an instance of the group: its
+// addresses, and that the operator saw it (the join endpoint waits for it
+// before a first join while it checks the addresses). It writes only on a
+// change. Addresses that were known are never cleared: a provider that stops
+// reporting them does not open the check; a new non-empty list replaces
+// them. An instance without a record, or with the record of another group,
+// is left alone. It reports whether it wrote.
+func (s *Store) Seen(ctx context.Context, group, instance string, addresses []string) (bool, error) {
+	if !ValidInstance(instance) {
+		return false, nil
+	}
+	v, err := s.Vars.ReadVariable(ctx, s.Namespace, s.path(instance))
+	if errors.Is(err, controller.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reading the join record of %s: %w", instance, err)
+	}
+	if v.Items[itemGroup] != group {
+		return false, nil
+	}
+	items := maps.Clone(v.Items)
+	if list := NormalizeAddresses(addresses); len(list) > 0 {
+		items[itemAddresses] = strings.Join(list, ",")
+	}
+	if items[itemSeen] == "" {
+		items[itemSeen] = s.now().UTC().Format(time.RFC3339)
+	}
+	if maps.Equal(items, v.Items) {
+		return false, nil
+	}
+	if err := s.update(ctx, v, items); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Prune deletes the records of a group that are no longer needed: a token
@@ -227,6 +304,26 @@ func (s *Store) read(ctx context.Context, instance string) (*api.Variable, error
 		return nil, fmt.Errorf("reading the join record of %s: %w", instance, err)
 	}
 	return v, nil
+}
+
+// updateRetry changes the items of a record (change works on a copy). When
+// the record changed since it was read, it is read again and, if still
+// holds for it, changed again, once: a change by the operator (Seen) does
+// not refuse a join or a renewal.
+func (s *Store) updateRetry(ctx context.Context, v *api.Variable, still func(*api.Variable) bool, change func(api.VariableItems)) error {
+	for attempt := 0; ; attempt++ {
+		items := maps.Clone(v.Items)
+		change(items)
+		err := s.update(ctx, v, items)
+		if err == nil || attempt > 0 || !errors.Is(err, ErrRefused) {
+			return err
+		}
+		cur, rerr := s.Vars.ReadVariable(ctx, s.Namespace, v.Path)
+		if rerr != nil || !still(cur) {
+			return err
+		}
+		v = cur
+	}
 }
 
 func (s *Store) update(ctx context.Context, v *api.Variable, items api.VariableItems) error {

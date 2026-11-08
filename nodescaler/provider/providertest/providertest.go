@@ -16,7 +16,9 @@
 //   - a restarted provider lists the instances of before and still knows
 //     their request IDs (a provider keeps its state on the platform, not in
 //     memory);
-//   - the token is required, the health check is not.
+//   - the token is required, the health check is not;
+//   - the addresses of an instance are IP addresses, and with
+//     Config.Addresses a running instance reports at least one.
 //
 // A provider for a real platform runs it against a test account, with a
 // group of its own; the mock and the docker provider of this repository run
@@ -29,6 +31,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -69,6 +72,12 @@ type Config struct {
 	// Settle is how long a list may take to show a change, on a platform
 	// whose lists lag behind its writes (default: no wait).
 	Settle time.Duration
+
+	// Addresses says that the provider reports the addresses of its
+	// instances (optional in the contract): a running instance must then
+	// list at least one. Without it only the form of reported addresses is
+	// checked.
+	Addresses bool
 }
 
 const token = "providertest-token"
@@ -92,6 +101,7 @@ func Run(t *testing.T, cfg Config) {
 	t.Run("Delete", c.delete)
 	t.Run("RestartKeepsTheInstances", c.restart)
 	t.Run("Token", c.token)
+	t.Run("Addresses", c.addresses)
 }
 
 type checks struct{ cfg Config }
@@ -318,6 +328,44 @@ func (c checks) restart(t *testing.T) {
 	if len(again) != 2 || !slices.ContainsFunc(again, func(i provider.Instance) bool { return i.ID == first[0].ID }) {
 		t.Fatalf("after a restart the request of before created more: %+v, before %+v", again, first)
 	}
+}
+
+func (c checks) addresses(t *testing.T) {
+	ctx := context.Background()
+	cl := serve(t, c.cfg.New(t))
+	req := c.request(t, "providertest/addresses/1", names("pt-addr", 1)...)
+	created, err := cl.Create(ctx, c.cfg.Group, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := func(list []provider.Instance) string {
+		for _, inst := range list {
+			for _, a := range inst.Addresses {
+				if _, err := netip.ParseAddr(a); err != nil {
+					return fmt.Sprintf("instance %s reports %q, not an IP address", inst.ID, a)
+				}
+			}
+		}
+		return ""
+	}
+	if bad := valid(created); bad != "" {
+		t.Fatal(bad)
+	}
+	c.eventually(t, "the addresses of a running instance", func() (bool, string) {
+		g, err := cl.Group(ctx, c.cfg.Group, c.cfg.Params)
+		if err != nil {
+			return false, err.Error()
+		}
+		got := ofRequest(g, req.RequestID)
+		if bad := valid(got); bad != "" {
+			return false, bad
+		}
+		if !c.cfg.Addresses {
+			return true, ""
+		}
+		return len(got) == 1 && got[0].State == provider.StateRunning && len(got[0].Addresses) > 0,
+			fmt.Sprintf("listed %+v: a running instance reports at least one address", got)
+	})
 }
 
 func (c checks) token(t *testing.T) {

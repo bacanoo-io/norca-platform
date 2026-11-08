@@ -13,6 +13,7 @@ import (
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
 	"github.com/bacanoo-io/norca-platform/nodescaler/join"
+	"github.com/bacanoo-io/norca-platform/nodescaler/provider/mock"
 )
 
 // fileOf decodes a file of a cloud-init document.
@@ -84,6 +85,16 @@ func TestJoin_InstancesGetATokenNotAKey(t *testing.T) {
 	rec := e.backend.GetVariable("default", "nodescaler/join/eu/workers-dc1-1-1")
 	if rec == nil || rec.Items["group"] != "workers-dc1" {
 		t.Fatalf("join record: %+v", rec)
+	}
+	// The addresses the provider answered the create with are recorded, so
+	// the endpoint can bind the join to them; a reconcile that finds them
+	// unchanged writes nothing.
+	if want := strings.Join(mock.Addresses(1), ","); rec.Items["addresses"] != want || rec.Items["seen"] == "" {
+		t.Fatalf("join record: %v, want the addresses %s", rec.Items, want)
+	}
+	e.reconcile()
+	if again := e.backend.GetVariable("default", "nodescaler/join/eu/workers-dc1-1-1"); again.ModifyIndex != rec.ModifyIndex {
+		t.Fatalf("the record was written again: %v", again.Items)
 	}
 	// The token of the bootstrap is the recorded one.
 	if _, group, err := store.Redeem(context.Background(), "workers-dc1-1-1", conf.Token); err != nil || group != "workers-dc1" {
