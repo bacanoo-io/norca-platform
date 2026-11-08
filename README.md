@@ -159,9 +159,23 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
 - Without an endpoint no instance is asked for (`Provisioned` False,
   `NoBootstrap`). Every join and renewal is an event of the group
   (`CertificateIssued`, `CertificateRenewed`).
+- **The key can live in the TPM.** `-join-key-store` (or `spec.join.key_store`
+  of a group, which wins) goes into `key_store` of the configuration of
+  `norca-join`: `file` (the default, a PEM key file), `tpm` (the key is made
+  in the TPM 2.0 of the machine and never leaves it; without `/dev/tpmrm0`
+  the join fails) or `auto` (the TPM where the machine has one, else a
+  file). With the TPM the key is ECDSA P-256 under the storage key of the
+  owner hierarchy, the certificate request and the client certificate of a
+  renewal are signed by the TPM, and the key file is a TSS2 PEM key file
+  (`-----BEGIN TSS2 PRIVATE KEY-----`, as the tpm2 providers of OpenSSL
+  write it): useless on another machine. The agent loads it (Linux). Each
+  renewal makes a new key in the TPM and replaces the file; keys are loaded
+  transiently, no NV slot is used. Linux only: `tpm` fails elsewhere, `auto`
+  is a file. The node reports the key store in its requests, and the events
+  of a key in the TPM say so (not verified: there is no attestation).
 
 ```shell
-norca-nodescaler -region eu -join-listen :8490 -join-validity 168h
+norca-nodescaler -region eu -join-listen :8490 -join-validity 168h -join-key-store auto
 norca-join run -config /etc/norca/norca-join.json                       # the unit of the bootstrap
 norca-join run -config /etc/norca/norca-join.json -- norca agent -config /etc/norca/norca.hcl   # in a container
 ```

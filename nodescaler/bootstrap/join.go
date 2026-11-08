@@ -16,10 +16,13 @@ import (
 )
 
 // JoinTicket is what a node that joins with a key of its own receives
-// instead of a certificate: a one-time token and the join endpoints.
+// instead of a certificate: a one-time token and the join endpoints, and
+// where it keeps its key (join.KeyStoreFile, KeyStoreTPM or KeyStoreAuto;
+// empty is a file).
 type JoinTicket struct {
-	Token string
-	URLs  []string
+	Token    string
+	URLs     []string
+	KeyStore string
 }
 
 // JoinUnit is the systemd unit of norca-join that RenderJoin writes.
@@ -62,7 +65,7 @@ func (t *Template) RenderJoin(n Node, ticket JoinTicket) (*Rendered, error) {
 		Instance: n.Name, Region: t.Region,
 		URLs: ticket.URLs, Endpoint: join.EndpointURI(t.TrustDomain, t.Region).String(), Token: ticket.Token,
 		CAFile: n.CAFile, CertFile: n.CertFile, KeyFile: n.KeyFile,
-		StateFile: t.TLSDir + "/norca-join.state", Service: t.Service,
+		StateFile: t.TLSDir + "/norca-join.state", Service: t.Service, KeyStore: ticket.KeyStore,
 	}
 	if err := conf.Check(); err != nil {
 		return nil, fmt.Errorf("the join of node %s: %w", n.Name, err)

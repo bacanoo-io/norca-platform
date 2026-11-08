@@ -118,6 +118,34 @@ type Config struct {
 	// Service is the systemd unit of the agent: started after the join,
 	// sent SIGHUP after a renewal. Unused when norca-join runs the agent.
 	Service string `json:"service,omitempty"`
+
+	// KeyStore is where the key of the node is made and kept, at the join
+	// and at each renewal: KeyStoreFile (the default), KeyStoreTPM or
+	// KeyStoreAuto.
+	KeyStore string `json:"key_store,omitempty"`
+}
+
+// The key stores of a node.
+const (
+	// KeyStoreFile: the key is a PEM file (EC PRIVATE KEY).
+	KeyStoreFile = "file"
+	// KeyStoreTPM: the key is made in the TPM 2.0 of the machine and never
+	// leaves it; the key file is a TSS2 PEM key file that only this TPM
+	// can load. Without a TPM (/dev/tpmrm0) the join fails. Linux only.
+	KeyStoreTPM = "tpm"
+	// KeyStoreAuto: the TPM when the machine has one (/dev/tpmrm0 on
+	// Linux), else a file.
+	KeyStoreAuto = "auto"
+)
+
+// ValidKeyStore reports whether s is a key store; empty is the default,
+// KeyStoreFile.
+func ValidKeyStore(s string) bool {
+	switch s {
+	case "", KeyStoreFile, KeyStoreTPM, KeyStoreAuto:
+		return true
+	}
+	return false
 }
 
 // LoadConfig reads and checks a configuration.
@@ -149,6 +177,8 @@ func (c *Config) Check() error {
 		return errors.New("no endpoint name (endpoint)")
 	case c.CAFile == "" || c.CertFile == "" || c.KeyFile == "" || c.StateFile == "":
 		return errors.New("ca_file, cert_file, key_file and state_file are required")
+	case !ValidKeyStore(c.KeyStore):
+		return fmt.Errorf("the key_store %q is not file, tpm or auto", c.KeyStore)
 	}
 	for _, u := range c.URLs {
 		p, err := url.Parse(u)
@@ -165,12 +195,16 @@ type JoinRequest struct {
 	Token    string `json:"token"`
 	// CSR is the PEM certificate request; only its key is used.
 	CSR string `json:"csr"`
+	// KeyStore is where the node keeps the key (file or tpm), as the node
+	// reports it: for the log, not verified.
+	KeyStore string `json:"key_store,omitempty"`
 }
 
 // RenewRequest is the body of POST /v1/renew, sent with the current
 // certificate of the node as the client certificate.
 type RenewRequest struct {
-	CSR string `json:"csr"`
+	CSR      string `json:"csr"`
+	KeyStore string `json:"key_store,omitempty"`
 }
 
 // Response is the answer to a join or a renewal.

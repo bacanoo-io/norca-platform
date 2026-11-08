@@ -180,3 +180,44 @@ func TestInstancePrefix(t *testing.T) {
 		}
 	}
 }
+
+// The key store of the operator reaches the join configuration of the
+// instances; a group that names one overrides it.
+func TestJoin_KeyStore(t *testing.T) {
+	e := newEnv(t, "")
+	items, _ := bootstraptest.Items(t)
+	e.withBootstrap(items)
+	e.withJoin("https://10.0.0.7:8490")
+	e.r.cfg.Join.(*StoreJoin).KeyStore = join.KeyStoreAuto
+	keyStore := func(id string) string {
+		t.Helper()
+		raw, ok := fileOf(t, e.mock.UserData(id), "/etc/norca/norca-join.json")
+		if !ok {
+			t.Fatal("no join configuration")
+		}
+		var conf join.Config
+		if err := json.Unmarshal([]byte(raw), &conf); err != nil {
+			t.Fatal(err)
+		}
+		return conf.KeyStore
+	}
+
+	e.putGroup(1, nil)
+	e.reconcile()
+	insts := e.instances()
+	if len(insts) != 1 || keyStore(insts[0].ID) != join.KeyStoreAuto {
+		t.Fatalf("the key store of the operator: %+v", insts)
+	}
+
+	e.putGroup(2, map[string]any{"join": map[string]any{"key_store": "tpm"}})
+	e.reconcile()
+	tpm := 0
+	for _, inst := range e.instances() {
+		if keyStore(inst.ID) == join.KeyStoreTPM {
+			tpm++
+		}
+	}
+	if tpm != 1 {
+		t.Fatalf("the key store of the group reached %d new instances, want 1", tpm)
+	}
+}

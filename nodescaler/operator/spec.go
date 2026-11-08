@@ -84,6 +84,9 @@ type groupSpec struct {
 		SlowAfter        string `json:"slow_after"`
 		MaxFailures      int    `json:"max_failures"`
 		ResumeGeneration int64  `json:"resume_generation"`
+		// KeyStore is where the nodes of the group keep their keys, over
+		// the key store of the operator: file, tpm or auto.
+		KeyStore string `json:"key_store"`
 	} `json:"join"`
 	Policy struct {
 		ScaleDown struct {

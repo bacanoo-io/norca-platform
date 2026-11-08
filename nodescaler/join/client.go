@@ -6,6 +6,7 @@ package join
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -22,6 +23,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/bacanoo-io/norca-platform/nodescaler/tpmkey"
 )
 
 // State is what norca-join keeps between its runs: the endpoints the
@@ -39,6 +42,46 @@ type Client struct {
 	Now    func() time.Time
 	// Timeout of one request (default 30s).
 	Timeout time.Duration
+
+	// OpenTPM opens the TPM of the key store tpm (default the device
+	// /dev/tpmrm0, on Linux only); TPMPresent tells the key store auto
+	// whether there is one (default: /dev/tpmrm0 is a device). Tests
+	// replace them.
+	OpenTPM    tpmkey.Opener
+	TPMPresent func() bool
+}
+
+func (c *Client) openTPM() tpmkey.Opener {
+	if c.OpenTPM != nil {
+		return c.OpenTPM
+	}
+	return tpmkey.DeviceOpener("")
+}
+
+// keyStore is where the next key is made, KeyStoreFile or KeyStoreTPM: the
+// key store of the configuration on this machine.
+func (c *Client) keyStore() (string, error) {
+	supported := tpmkey.Supported || c.OpenTPM != nil
+	switch c.Config.KeyStore {
+	case "", KeyStoreFile:
+		return KeyStoreFile, nil
+	case KeyStoreTPM:
+		if !supported {
+			return "", fmt.Errorf("key_store tpm: %w", tpmkey.ErrUnsupported)
+		}
+		return KeyStoreTPM, nil
+	case KeyStoreAuto:
+		present := c.TPMPresent
+		if present == nil {
+			present = func() bool { return tpmkey.Present("") }
+		}
+		if supported && present() {
+			return KeyStoreTPM, nil
+		}
+		return KeyStoreFile, nil
+	default:
+		return "", fmt.Errorf("unknown key_store %q", c.Config.KeyStore)
+	}
 }
 
 func (c *Client) now() time.Time {
@@ -60,9 +103,23 @@ func (c *Client) log() *slog.Logger {
 var ErrNoToken = errors.New("no certificate and no join token")
 
 // Current returns the certificate of the node if it is there and still
-// valid.
+// valid. A key of the TPM (a TSS2 key file) opens the TPM at its first
+// signature.
 func (c *Client) Current() (*tls.Certificate, *x509.Certificate, error) {
-	pair, err := tls.LoadX509KeyPair(c.Config.CertFile, c.Config.KeyFile)
+	certPEM, err := os.ReadFile(c.Config.CertFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyPEM, err := os.ReadFile(c.Config.KeyFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	var pair tls.Certificate
+	if tpmkey.IsPEM(keyPEM) {
+		pair, err = tpmkey.X509KeyPair(certPEM, keyPEM, c.openTPM())
+	} else {
+		pair, err = tls.X509KeyPair(certPEM, keyPEM)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -94,11 +151,12 @@ func (c *Client) Join(ctx context.Context, configPath string) error {
 	if c.Config.Token == "" {
 		return ErrNoToken
 	}
-	key, csr, err := newKeyAndCSR(c.Config.Instance)
+	key, csr, err := c.newKeyAndCSR()
 	if err != nil {
 		return err
 	}
-	body, _ := json.Marshal(JoinRequest{Instance: c.Config.Instance, Token: c.Config.Token, CSR: string(csr)})
+	defer key.close()
+	body, _ := json.Marshal(JoinRequest{Instance: c.Config.Instance, Token: c.Config.Token, CSR: string(csr), KeyStore: key.store})
 	resp, err := c.post(ctx, "/v1/join", body, nil)
 	if err != nil {
 		return err
@@ -107,7 +165,7 @@ func (c *Client) Join(ctx context.Context, configPath string) error {
 		return err
 	}
 	c.forgetToken(configPath)
-	c.log().Info("joined with a key of the node", "instance", c.Config.Instance, "not_after", resp.NotAfter)
+	c.log().Info("joined with a key of the node", "instance", c.Config.Instance, "key_store", key.store, "not_after", resp.NotAfter)
 	return nil
 }
 
@@ -118,11 +176,15 @@ func (c *Client) Renew(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("the current certificate: %w", err)
 	}
-	key, csr, err := newKeyAndCSR(c.Config.Instance)
+	if closer, ok := current.PrivateKey.(io.Closer); ok {
+		defer closer.Close()
+	}
+	key, csr, err := c.newKeyAndCSR()
 	if err != nil {
 		return err
 	}
-	body, _ := json.Marshal(RenewRequest{CSR: string(csr)})
+	defer key.close()
+	body, _ := json.Marshal(RenewRequest{CSR: string(csr), KeyStore: key.store})
 	resp, err := c.post(ctx, "/v1/renew", body, current)
 	if err != nil {
 		return err
@@ -130,7 +192,7 @@ func (c *Client) Renew(ctx context.Context) error {
 	if err := c.install(key, resp); err != nil {
 		return err
 	}
-	c.log().Info("renewed the certificate", "instance", c.Config.Instance, "not_after", resp.NotAfter)
+	c.log().Info("renewed the certificate", "instance", c.Config.Instance, "key_store", key.store, "not_after", resp.NotAfter)
 	return nil
 }
 
@@ -263,7 +325,7 @@ func EndpointTLS(caPEM []byte, endpoint string, cert *tls.Certificate) (*tls.Con
 // install writes the key and the certificate (each by a rename, so the
 // agent never reads half a file), the cluster CA if it changed, and the
 // state.
-func (c *Client) install(key *ecdsa.PrivateKey, resp *Response) error {
+func (c *Client) install(key *nodeKey, resp *Response) error {
 	block, _ := pem.Decode([]byte(resp.Certificate))
 	if block == nil {
 		return errors.New("the answer has no certificate")
@@ -272,16 +334,12 @@ func (c *Client) install(key *ecdsa.PrivateKey, resp *Response) error {
 	if err != nil {
 		return err
 	}
-	if pub, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok || !pub.Equal(&key.PublicKey) {
+	if pub, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok || !pub.Equal(key.signer.Public()) {
 		return errors.New("the certificate is not for the key of the request")
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		return err
 	}
 	// The key first: until the certificate follows, the agent keeps the
 	// pair it loaded, and it loads again only on SIGHUP.
-	if err := writeAtomic(c.Config.KeyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+	if err := writeAtomic(c.Config.KeyFile, key.pem, 0o600); err != nil {
 		return err
 	}
 	if err := writeAtomic(c.Config.CertFile, []byte(resp.Certificate), 0o644); err != nil {
@@ -333,15 +391,61 @@ func (c *Client) forgetToken(path string) {
 	}
 }
 
-func newKeyAndCSR(instance string) (*ecdsa.PrivateKey, []byte, error) {
+// nodeKey is a new key of the node: its signer, its key file and where it
+// is kept.
+type nodeKey struct {
+	signer crypto.Signer
+	pem    []byte
+	store  string
+}
+
+// close closes the TPM of a key of the TPM.
+func (k *nodeKey) close() {
+	if closer, ok := k.signer.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+// newKey makes a new ECDSA P-256 key in the key store: in the TPM (a TSS2
+// key file) or in memory (an EC PRIVATE KEY file). A TPM that the key store
+// auto found but that can not make the key leaves it to a file.
+func (c *Client) newKey() (*nodeKey, error) {
+	store, err := c.keyStore()
+	if err != nil {
+		return nil, err
+	}
+	if store == KeyStoreTPM {
+		signer, keyPEM, err := tpmkey.Generate(c.openTPM())
+		if err == nil {
+			return &nodeKey{signer: signer, pem: keyPEM, store: KeyStoreTPM}, nil
+		}
+		if c.Config.KeyStore == KeyStoreTPM {
+			return nil, fmt.Errorf("the key in the TPM: %w", err)
+		}
+		c.log().Warn("the TPM can not make the key: it is kept in a file", "error", err)
+	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return &nodeKey{signer: key, pem: pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), store: KeyStoreFile}, nil
+}
+
+// newKeyAndCSR makes a new key and its certificate request, signed with it.
+func (c *Client) newKeyAndCSR() (*nodeKey, []byte, error) {
+	key, err := c.newKey()
 	if err != nil {
 		return nil, nil, err
 	}
 	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: instance},
-	}, key)
+		Subject: pkix.Name{CommonName: c.Config.Instance},
+	}, key.signer)
 	if err != nil {
+		key.close()
 		return nil, nil, err
 	}
 	return key, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}), nil

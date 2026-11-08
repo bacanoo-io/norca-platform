@@ -75,6 +75,7 @@ type flags struct {
 	joinServiceNS  string
 	joinValidity   time.Duration
 	joinCheckAddr  bool
+	joinKeyStore   string
 }
 
 // stringList collects a repeatable flag.
@@ -110,8 +111,12 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.joinServiceNS, "join-service-namespace", envOr("NORCA_NAMESPACE", "default"), "namespace of -join-service")
 	fs.DurationVar(&f.joinValidity, "join-validity", 7*24*time.Hour, "validity of the certificate of a node that renews itself (renewed at two thirds)")
 	fs.BoolVar(&f.joinCheckAddr, "join-check-address", true, "the join endpoint accepts a join or a renewal only from an address the provider reports for the instance; turn it off where a proxy, a load balancer or NAT in front of the endpoint changes the source address")
+	fs.StringVar(&f.joinKeyStore, "join-key-store", join.KeyStoreFile, "where the nodes that join keep their keys, unless their group names it (spec.join.key_store): file (a key file), tpm (made in the TPM 2.0 of the machine, which must have one; Linux) or auto (the TPM where the machine has one, else a file)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
+	}
+	if !join.ValidKeyStore(f.joinKeyStore) {
+		return nil, fmt.Errorf("-join-key-store %q is not file, tpm or auto", f.joinKeyStore)
 	}
 	if f.joinListen != "" && !f.bootstrap {
 		return nil, errors.New("-join-listen needs -bootstrap")
@@ -275,6 +280,6 @@ func startJoin(ctx context.Context, f *flags, client *api.Client, backend contro
 		_ = hs.Close()
 	}()
 	logger.Info("serving the join endpoint", "address", ln.Addr().String(), "validity", f.joinValidity,
-		"check_address", f.joinCheckAddr)
-	return &operator.StoreJoin{Store: store, URLs: urls}, nil
+		"check_address", f.joinCheckAddr, "key_store", f.joinKeyStore)
+	return &operator.StoreJoin{Store: store, URLs: urls, KeyStore: f.joinKeyStore}, nil
 }

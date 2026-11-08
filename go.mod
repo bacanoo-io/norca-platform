@@ -13,6 +13,8 @@ require (
 	github.com/bacanoo-io/norca-pki v0.3.0
 	github.com/bacanoo-io/norca/norca/api v0.0.0-20230103221135-ce00d683f9be
 	github.com/bacanoo-io/norca/norca/controller v0.0.0-00010101000000-000000000000
+	github.com/foxboron/go-tpm-keyfiles v0.0.0-20260902202739-8c9c2d1005f4
+	github.com/google/go-tpm v0.9.9-0.20260124013517-8f8f42cba0de
 	github.com/shoenig/test v0.6.6
 )
 
@@ -26,5 +28,7 @@ require (
 	github.com/hashicorp/go-rootcerts v1.0.2 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
+	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/exp v0.0.0-20230728194245-b0cb94b80691 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 )

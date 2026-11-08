@@ -475,6 +475,9 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 				if err != nil {
 					return nil, nil, fmt.Errorf("the join of %s: %w", name, err)
 				}
+				if spec.Join.KeyStore != "" {
+					ticket.KeyStore = spec.Join.KeyStore
+				}
 				rd, err := tmpl.RenderJoin(node, ticket)
 				if err != nil {
 					return nil, nil, err

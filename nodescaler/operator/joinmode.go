@@ -50,6 +50,10 @@ const joinSlack = 5 * time.Minute
 type StoreJoin struct {
 	Store *join.Store
 	URLs  func(ctx context.Context) ([]string, error)
+	// KeyStore is where the nodes keep their keys (join.KeyStoreFile,
+	// KeyStoreTPM or KeyStoreAuto) unless their group names one; empty is
+	// a file.
+	KeyStore string
 
 	mu sync.Mutex
 	// seen are the addresses last recorded per group and instance: a
@@ -75,7 +79,7 @@ func (s *StoreJoin) Ticket(ctx context.Context, group, instance string, ttl time
 	if err != nil {
 		return bootstrap.JoinTicket{}, err
 	}
-	return bootstrap.JoinTicket{Token: token, URLs: urls}, nil
+	return bootstrap.JoinTicket{Token: token, URLs: urls, KeyStore: s.KeyStore}, nil
 }
 
 // Prune implements JoinIssuer.

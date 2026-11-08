@@ -48,6 +48,10 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The tests of the TPM keys run against swtpm; without it they skip.
+      - name: Software TPM
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends swtpm
+
       - name: Test
         run: go test -race -shuffle=on -count=1 ./...
 

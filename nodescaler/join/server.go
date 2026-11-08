@@ -228,9 +228,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, statusOf(err), "join", req.Instance, err)
 		return
 	}
-	s.log().Info("a node joined with its own key", "instance", req.Instance, "group", group, "serial", serial)
-	s.event(ctx, group, "CertificateIssued", fmt.Sprintf("%s joined with its own key: certificate %s, valid until %s",
-		req.Instance, serial, resp.NotAfter.UTC().Format(time.RFC3339)))
+	s.log().Info("a node joined with its own key", "instance", req.Instance, "group", group, "serial", serial,
+		"key_store", reportedKeyStore(req.KeyStore))
+	s.event(ctx, group, "CertificateIssued", fmt.Sprintf("%s joined with its own key%s: certificate %s, valid until %s",
+		req.Instance, keyStoreNote(req.KeyStore), serial, resp.NotAfter.UTC().Format(time.RFC3339)))
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -298,10 +299,33 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, statusOf(err), "renew", instance, err)
 		return
 	}
-	s.log().Info("a node renewed its certificate", "instance", instance, "group", group, "serial", serial)
-	s.event(ctx, group, "CertificateRenewed", fmt.Sprintf("%s renewed its certificate: %s, valid until %s",
-		instance, serial, resp.NotAfter.UTC().Format(time.RFC3339)))
+	s.log().Info("a node renewed its certificate", "instance", instance, "group", group, "serial", serial,
+		"key_store", reportedKeyStore(req.KeyStore))
+	s.event(ctx, group, "CertificateRenewed", fmt.Sprintf("%s renewed its certificate%s: %s, valid until %s",
+		instance, keyStoreNote(req.KeyStore), serial, resp.NotAfter.UTC().Format(time.RFC3339)))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// reportedKeyStore is the key store a node reports, file or tpm; a node
+// that reports none (an older norca-join) keeps its key in a file.
+func reportedKeyStore(s string) string {
+	switch s {
+	case "", KeyStoreFile:
+		return KeyStoreFile
+	case KeyStoreTPM:
+		return KeyStoreTPM
+	default:
+		return "unknown"
+	}
+}
+
+// keyStoreNote is the note of an event on a key the node reports to keep
+// in its TPM.
+func keyStoreNote(s string) string {
+	if s == KeyStoreTPM {
+		return " (key in its TPM)"
+	}
+	return ""
 }
 
 // issue signs the key of an instance with the identity of a node: the names

@@ -26,7 +26,7 @@ func TestRenderJoin(t *testing.T) {
 	}
 	r, err := tmpl.RenderJoin(Node{Name: "workers-dc1-3-1", Datacenter: "dc1", Pool: "workers",
 		Meta: map[string]string{"norca.instance": "workers-dc1-3-1"}},
-		JoinTicket{Token: "secret-token", URLs: []string{"https://10.0.0.7:8490"}})
+		JoinTicket{Token: "secret-token", URLs: []string{"https://10.0.0.7:8490"}, KeyStore: join.KeyStoreAuto})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,8 @@ func TestRenderJoin(t *testing.T) {
 		t.Fatal(err)
 	}
 	if conf.Instance != "workers-dc1-3-1" || conf.Token != "secret-token" || conf.Service != "norca" ||
-		conf.Endpoint != "spiffe://lab.norca/region/eu/nodescaler/join" || conf.KeyFile != "/etc/norca/tls/client-key.pem" {
+		conf.Endpoint != "spiffe://lab.norca/region/eu/nodescaler/join" || conf.KeyFile != "/etc/norca/tls/client-key.pem" ||
+		conf.KeyStore != join.KeyStoreAuto {
 		t.Fatalf("join configuration: %+v", conf)
 	}
 	unit := string(f["/etc/systemd/system/norca-join.service"])
