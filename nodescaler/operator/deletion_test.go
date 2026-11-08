@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	provider "github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // deletionEnv is a group of two instances, the first with a ready node, the

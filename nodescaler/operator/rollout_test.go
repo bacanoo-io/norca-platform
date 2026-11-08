@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	provider "github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // rollEnv is a group of n instances whose nodes have joined, with the marks of

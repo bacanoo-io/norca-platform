@@ -16,13 +16,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // GroupConfig is a group of the mock provider.
 type GroupConfig struct {
 	// Capacity is the size of one machine.
-	Capacity provider.Capacity
+	Capacity node.Capacity
 
 	// Max is the most instances the group has at a time; 0 is no limit. A
 	// request beyond it fails with ReasonQuota.
@@ -33,9 +33,9 @@ type GroupConfig struct {
 type Provider struct {
 	mu       sync.Mutex
 	groups   map[string]GroupConfig
-	inst     map[string]map[string]provider.Instance // by group and ID
-	requests map[string][]string                     // instance IDs by request ID
-	userData map[string]string                       // the bootstrap of an instance, by ID
+	inst     map[string]map[string]node.Instance // by group and ID
+	requests map[string][]string                 // instance IDs by request ID
+	userData map[string]string                   // the bootstrap of an instance, by ID
 	next     int
 
 	// Now is replaced in tests.
@@ -46,12 +46,12 @@ type Provider struct {
 func New(groups map[string]GroupConfig) *Provider {
 	p := &Provider{
 		groups:   maps.Clone(groups),
-		inst:     map[string]map[string]provider.Instance{},
+		inst:     map[string]map[string]node.Instance{},
 		requests: map[string][]string{},
 		userData: map[string]string{},
 	}
 	for name := range groups {
-		p.inst[name] = map[string]provider.Instance{}
+		p.inst[name] = map[string]node.Instance{}
 	}
 	return p
 }
@@ -63,33 +63,33 @@ func (p *Provider) now() time.Time {
 	return time.Now().UTC()
 }
 
-// Group implements provider.Provider. The parameters are not used: every
+// Group implements node.Provider. The parameters are not used: every
 // machine of a group has the size of the group.
-func (p *Provider) Group(_ context.Context, group string, _ map[string]any) (*provider.Group, error) {
+func (p *Provider) Group(_ context.Context, group string, _ map[string]any) (*node.Group, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cfg, ok := p.groups[group]
 	if !ok {
-		return nil, provider.ErrUnknownGroup
+		return nil, node.ErrUnknownGroup
 	}
 	capacity := cfg.Capacity
-	g := &provider.Group{Name: group, Capacity: &capacity, Instances: []provider.Instance{}}
+	g := &node.Group{Name: group, Capacity: &capacity, Instances: []node.Instance{}}
 	for _, id := range slices.Sorted(maps.Keys(p.inst[group])) {
 		g.Instances = append(g.Instances, p.inst[group][id])
 	}
 	return g, nil
 }
 
-// Create implements provider.Provider.
-func (p *Provider) Create(_ context.Context, group string, req provider.CreateRequest) ([]provider.Instance, error) {
+// Create implements node.Provider.
+func (p *Provider) Create(_ context.Context, group string, req node.CreateRequest) ([]node.Instance, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cfg, ok := p.groups[group]
 	if !ok {
-		return nil, provider.ErrUnknownGroup
+		return nil, node.ErrUnknownGroup
 	}
 	if ids, ok := p.requests[req.RequestID]; ok {
-		out := make([]provider.Instance, 0, len(ids))
+		out := make([]node.Instance, 0, len(ids))
 		for _, id := range ids {
 			if inst, ok := p.inst[group][id]; ok {
 				out = append(out, inst)
@@ -98,16 +98,16 @@ func (p *Provider) Create(_ context.Context, group string, req provider.CreateRe
 		return out, nil
 	}
 	if cfg.Max > 0 && len(p.inst[group])+len(req.Instances) > cfg.Max {
-		return nil, provider.Fail(provider.ReasonQuota, "group %s has %d of %d instances, %d more asked for",
+		return nil, node.Fail(node.ReasonQuota, "group %s has %d of %d instances, %d more asked for",
 			group, len(p.inst[group]), cfg.Max, len(req.Instances))
 	}
-	out := make([]provider.Instance, 0, len(req.Instances))
+	out := make([]node.Instance, 0, len(req.Instances))
 	for _, ir := range req.Instances {
 		p.next++
-		inst := provider.Instance{
+		inst := node.Instance{
 			ID:        fmt.Sprintf("mock-%s-%d", group, p.next),
 			Name:      ir.Name,
-			State:     provider.StateRunning,
+			State:     node.StateRunning,
 			RequestID: req.RequestID,
 			Labels:    maps.Clone(req.Labels),
 			Addresses: Addresses(p.next),
@@ -136,12 +136,12 @@ func (p *Provider) UserData(id string) string {
 	return p.userData[id]
 }
 
-// Delete implements provider.Provider.
+// Delete implements node.Provider.
 func (p *Provider) Delete(_ context.Context, group, id string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.groups[group]; !ok {
-		return provider.ErrUnknownGroup
+		return node.ErrUnknownGroup
 	}
 	delete(p.inst[group], id)
 	return nil
@@ -156,7 +156,7 @@ func (p *Provider) Fail(group, id, reason, message string) bool {
 	if !ok {
 		return false
 	}
-	inst.State, inst.Reason, inst.Message = provider.StateFailed, reason, message
+	inst.State, inst.Reason, inst.Message = node.StateFailed, reason, message
 	p.inst[group][id] = inst
 	return true
 }

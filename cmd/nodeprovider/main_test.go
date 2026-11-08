@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 func TestParseGroup(t *testing.T) {
@@ -15,7 +15,7 @@ func TestParseGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "dc1" || cfg.Capacity != (provider.Capacity{CPU: 4000, Memory: 8192, Disk: 40000}) || cfg.Max != 10 {
+	if name != "dc1" || cfg.Capacity != (node.Capacity{CPU: 4000, Memory: 8192, Disk: 40000}) || cfg.Max != 10 {
 		t.Fatalf("got %s %+v", name, cfg)
 	}
 	if _, cfg, err := parseGroup("dc2:2000:4096:0"); err != nil || cfg.Max != 0 {

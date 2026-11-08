@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // Package providertest checks that a node provider keeps the contract of
-// package provider, the way the node scaling operator relies on it. Run
-// serves the provider with provider.NewHandler and calls it with
-// provider.Client, over HTTP, so the checks see what the operator sees:
+// package node, the way the node scaling operator relies on it. Run
+// serves the provider with node.NewHandler and calls it with
+// node.Client, over HTTP, so the checks see what the operator sees:
 //
 //   - a group reports the capacity of a machine also without instances, and
 //     an empty list of instances, not none;
@@ -37,18 +37,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // Config describes the provider under test.
 type Config struct {
 	// New returns the provider under test, with no instances in Group and
 	// QuotaGroup. Each check gets a new one.
-	New func(t *testing.T) provider.Provider
+	New func(t *testing.T) node.Provider
 
 	// Restart returns a new provider of the same platform as p, as after a
 	// restart of the application. nil leaves the restart check out.
-	Restart func(t *testing.T, p provider.Provider) provider.Provider
+	Restart func(t *testing.T, p node.Provider) node.Provider
 
 	// Group is a group with room for at least two instances, and Params the
 	// parameters of a machine kind of it.
@@ -57,17 +57,17 @@ type Config struct {
 
 	// Capacity is the capacity Group reports for Params; nil checks only
 	// that one is reported.
-	Capacity *provider.Capacity
+	Capacity *node.Capacity
 
 	// QuotaGroup is a group that holds QuotaMax instances; creating
-	// QuotaMax+1 must fail with provider.ReasonQuota. Empty leaves the check
+	// QuotaMax+1 must fail with node.ReasonQuota. Empty leaves the check
 	// out.
 	QuotaGroup string
 	QuotaMax   int
 
 	// Bootstrap returns the bootstrap of an instance, for a provider that
 	// reads it (default: a cloud-init with nothing in it).
-	Bootstrap func(t *testing.T, name string) *provider.Bootstrap
+	Bootstrap func(t *testing.T, name string) *node.Bootstrap
 
 	// Settle is how long a list may take to show a change, on a platform
 	// whose lists lag behind its writes (default: no wait).
@@ -89,8 +89,8 @@ func Run(t *testing.T, cfg Config) {
 		t.Fatal("providertest: Config.New and Config.Group are required")
 	}
 	if cfg.Bootstrap == nil {
-		cfg.Bootstrap = func(*testing.T, string) *provider.Bootstrap {
-			return &provider.Bootstrap{UserData: "#cloud-config\n"}
+		cfg.Bootstrap = func(*testing.T, string) *node.Bootstrap {
+			return &node.Bootstrap{UserData: "#cloud-config\n"}
 		}
 	}
 	c := checks{cfg: cfg}
@@ -107,20 +107,20 @@ func Run(t *testing.T, cfg Config) {
 type checks struct{ cfg Config }
 
 // serve serves p over the HTTP contract and returns a client of it.
-func serve(t *testing.T, p provider.Provider) *provider.Client {
+func serve(t *testing.T, p node.Provider) *node.Client {
 	t.Helper()
-	srv := httptest.NewServer(provider.NewHandler(p, token, nil))
+	srv := httptest.NewServer(node.NewHandler(p, token, nil))
 	t.Cleanup(srv.Close)
-	return &provider.Client{Endpoint: srv.URL, Token: token}
+	return &node.Client{Endpoint: srv.URL, Token: token}
 }
 
 // request asks for the named instances, with a label and the bootstrap of
 // each.
-func (c checks) request(t *testing.T, id string, names ...string) provider.CreateRequest {
-	req := provider.CreateRequest{RequestID: id, Parameters: c.cfg.Params,
+func (c checks) request(t *testing.T, id string, names ...string) node.CreateRequest {
+	req := node.CreateRequest{RequestID: id, Parameters: c.cfg.Params,
 		Labels: map[string]string{"norca.node_group": "providertest", "norca.request": id}}
 	for _, n := range names {
-		req.Instances = append(req.Instances, provider.InstanceRequest{Name: n, Bootstrap: c.cfg.Bootstrap(t, n)})
+		req.Instances = append(req.Instances, node.InstanceRequest{Name: n, Bootstrap: c.cfg.Bootstrap(t, n)})
 	}
 	return req
 }
@@ -151,10 +151,10 @@ func (c checks) eventually(t *testing.T, what string, cond func() (bool, string)
 }
 
 // ofRequest returns the instances of a group made by a request.
-func ofRequest(g *provider.Group, requestID string) []provider.Instance {
-	var out []provider.Instance
+func ofRequest(g *node.Group, requestID string) []node.Instance {
+	var out []node.Instance
 	for _, inst := range g.Instances {
-		if inst.RequestID == requestID && inst.State != provider.StateDeleting {
+		if inst.RequestID == requestID && inst.State != node.StateDeleting {
 			out = append(out, inst)
 		}
 	}
@@ -200,7 +200,7 @@ func (c checks) idempotent(t *testing.T) {
 			t.Fatalf("instance %d has the request %q, want %q", i, inst.RequestID, req.RequestID)
 		case inst.Labels["norca.node_group"] != "providertest":
 			t.Fatalf("instance %d lost the labels of the request: %v", i, inst.Labels)
-		case inst.State != provider.StateCreating && inst.State != provider.StateRunning:
+		case inst.State != node.StateCreating && inst.State != node.StateRunning:
 			t.Fatalf("instance %d is %q, want creating or running", i, inst.State)
 		}
 	}
@@ -208,7 +208,7 @@ func (c checks) idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the same request again: %v", err)
 	}
-	ids := func(list []provider.Instance) []string {
+	ids := func(list []node.Instance) []string {
 		var out []string
 		for _, inst := range list {
 			out = append(out, inst.ID)
@@ -233,21 +233,21 @@ func (c checks) invalid(t *testing.T) {
 	ctx := context.Background()
 	cl := serve(t, c.cfg.New(t))
 	b := c.cfg.Bootstrap(t, "pt-invalid")
-	for what, req := range map[string]provider.CreateRequest{
-		"no request id": {Instances: []provider.InstanceRequest{{Name: "pt-invalid", Bootstrap: b}}},
+	for what, req := range map[string]node.CreateRequest{
+		"no request id": {Instances: []node.InstanceRequest{{Name: "pt-invalid", Bootstrap: b}}},
 		"no instance":   {RequestID: "providertest/invalid/1"},
 		"an instance without a name": {RequestID: "providertest/invalid/2",
-			Instances: []provider.InstanceRequest{{Bootstrap: b}}},
+			Instances: []node.InstanceRequest{{Bootstrap: b}}},
 		"the same name twice": {RequestID: "providertest/invalid/3",
-			Instances: []provider.InstanceRequest{{Name: "pt-invalid", Bootstrap: b}, {Name: "pt-invalid", Bootstrap: b}}},
+			Instances: []node.InstanceRequest{{Name: "pt-invalid", Bootstrap: b}, {Name: "pt-invalid", Bootstrap: b}}},
 	} {
 		req.Parameters = c.cfg.Params
-		if _, err := cl.Create(ctx, c.cfg.Group, req); provider.ReasonOf(err) != provider.ReasonInvalid {
-			t.Errorf("%s: want the reason %q, got %v", what, provider.ReasonInvalid, err)
+		if _, err := cl.Create(ctx, c.cfg.Group, req); node.ReasonOf(err) != node.ReasonInvalid {
+			t.Errorf("%s: want the reason %q, got %v", what, node.ReasonInvalid, err)
 		}
 	}
-	if _, err := cl.Group(ctx, "providertest-no-such-group", nil); !errors.Is(err, provider.ErrUnknownGroup) {
-		t.Errorf("an unknown group: want provider.ErrUnknownGroup, got %v", err)
+	if _, err := cl.Group(ctx, "providertest-no-such-group", nil); !errors.Is(err, node.ErrUnknownGroup) {
+		t.Errorf("an unknown group: want node.ErrUnknownGroup, got %v", err)
 	}
 }
 
@@ -258,9 +258,9 @@ func (c checks) quota(t *testing.T) {
 	ctx := context.Background()
 	cl := serve(t, c.cfg.New(t))
 	req := c.request(t, "providertest/quota/1", names("pt-quota", c.cfg.QuotaMax+1)...)
-	if _, err := cl.Create(ctx, c.cfg.QuotaGroup, req); provider.ReasonOf(err) != provider.ReasonQuota {
+	if _, err := cl.Create(ctx, c.cfg.QuotaGroup, req); node.ReasonOf(err) != node.ReasonQuota {
 		t.Fatalf("%d instances in a group of %d: want the reason %q, got %v", c.cfg.QuotaMax+1, c.cfg.QuotaMax,
-			provider.ReasonQuota, err)
+			node.ReasonQuota, err)
 	}
 	g, err := cl.Group(ctx, c.cfg.QuotaGroup, c.cfg.Params)
 	if err != nil {
@@ -325,7 +325,7 @@ func (c checks) restart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the request of before, after the restart: %v", err)
 	}
-	if len(again) != 2 || !slices.ContainsFunc(again, func(i provider.Instance) bool { return i.ID == first[0].ID }) {
+	if len(again) != 2 || !slices.ContainsFunc(again, func(i node.Instance) bool { return i.ID == first[0].ID }) {
 		t.Fatalf("after a restart the request of before created more: %+v, before %+v", again, first)
 	}
 }
@@ -338,7 +338,7 @@ func (c checks) addresses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	valid := func(list []provider.Instance) string {
+	valid := func(list []node.Instance) string {
 		for _, inst := range list {
 			for _, a := range inst.Addresses {
 				if _, err := netip.ParseAddr(a); err != nil {
@@ -363,7 +363,7 @@ func (c checks) addresses(t *testing.T) {
 		if !c.cfg.Addresses {
 			return true, ""
 		}
-		return len(got) == 1 && got[0].State == provider.StateRunning && len(got[0].Addresses) > 0,
+		return len(got) == 1 && got[0].State == node.StateRunning && len(got[0].Addresses) > 0,
 			fmt.Sprintf("listed %+v: a running instance reports at least one address", got)
 	})
 }

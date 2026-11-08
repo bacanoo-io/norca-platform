@@ -13,7 +13,7 @@ import (
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
 	"github.com/bacanoo-io/norca-platform/nodescaler/join"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider/mock"
+	"github.com/bacanoo-io/norca-platform/providers/mock"
 )
 
 // fileOf decodes a file of a cloud-init document.

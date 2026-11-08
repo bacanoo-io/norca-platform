@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	provider "github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // createRaw creates an instance in the mock provider with the labels, named

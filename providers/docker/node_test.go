@@ -19,7 +19,7 @@ import (
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap"
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // fakeDocker keeps containers in memory and answers ps, inspect, run and rm
@@ -112,7 +112,7 @@ func newTestProvider(t *testing.T) (*Provider, *fakeDocker, string) {
 	dir := t.TempDir()
 	fd := &fakeDocker{containers: map[string]*container{}}
 	p, err := New(Config{
-		Groups:   map[string]GroupConfig{"dc1": {Capacity: provider.Capacity{CPU: 2000, Memory: 2048, Disk: 10000}, Max: 3}},
+		Groups:   map[string]GroupConfig{"dc1": {Capacity: node.Capacity{CPU: 2000, Memory: 2048, Disk: 10000}, Max: 3}},
 		StateDir: dir, Docker: fd, HostAddresses: []string{"10.77.1.12"},
 		Now: func() time.Time { return time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC) },
 	})
@@ -123,20 +123,20 @@ func newTestProvider(t *testing.T) (*Provider, *fakeDocker, string) {
 }
 
 // request renders the bootstrap of the named instances, as the operator does.
-func request(t *testing.T, id string, names ...string) provider.CreateRequest {
+func request(t *testing.T, id string, names ...string) node.CreateRequest {
 	t.Helper()
 	items, _ := bootstraptest.Items(t)
 	tmpl, err := bootstrap.Parse("eu", items)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := provider.CreateRequest{RequestID: id, Labels: map[string]string{"norca.node_group": "workers-dc1", "norca.region": "eu"}}
+	req := node.CreateRequest{RequestID: id, Labels: map[string]string{"norca.node_group": "workers-dc1", "norca.region": "eu"}}
 	for _, n := range names {
 		r, err := tmpl.Render(bootstrap.Node{Name: n, Datacenter: "dc1", Pool: "workers"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Instances = append(req.Instances, provider.InstanceRequest{Name: n, Bootstrap: &provider.Bootstrap{UserData: r.UserData}})
+		req.Instances = append(req.Instances, node.InstanceRequest{Name: n, Bootstrap: &node.Bootstrap{UserData: r.UserData}})
 	}
 	return req
 }
@@ -155,8 +155,8 @@ func TestDocker_CreateRunsNorcaJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := provider.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []provider.InstanceRequest{
-		{Name: "workers-dc1-1-1", Bootstrap: &provider.Bootstrap{UserData: r.UserData}}}}
+	req := node.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []node.InstanceRequest{
+		{Name: "workers-dc1-1-1", Bootstrap: &node.Bootstrap{UserData: r.UserData}}}}
 	if _, err := p.Create(context.Background(), "dc1", req); err != nil {
 		t.Fatal(err)
 	}
@@ -191,8 +191,8 @@ func TestDocker_IgnoresTheInstallScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := provider.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []provider.InstanceRequest{
-		{Name: "workers-dc1-1-1", Bootstrap: &provider.Bootstrap{UserData: r.UserData}}}}
+	req := node.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []node.InstanceRequest{
+		{Name: "workers-dc1-1-1", Bootstrap: &node.Bootstrap{UserData: r.UserData}}}}
 	if _, err := p.Create(context.Background(), "dc1", req); err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(g.Instances) != 2 || g.Instances[0].State != provider.StateRunning || g.Instances[0].RequestID != "eu/workers-dc1/1" ||
+	if len(g.Instances) != 2 || g.Instances[0].State != node.StateRunning || g.Instances[0].RequestID != "eu/workers-dc1/1" ||
 		g.Instances[0].Labels["norca.node_group"] != "workers-dc1" || !g.Instances[0].CreatedAt.Equal(time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)) {
 		t.Fatalf("group: %+v", g.Instances)
 	}
@@ -266,24 +266,24 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 func TestDocker_LimitsAndFailures(t *testing.T) {
 	p, fd, dir := newTestProvider(t)
 	ctx := context.Background()
-	if _, err := p.Create(ctx, "dc1", request(t, "r1", "a-1", "a-2", "a-3", "a-4")); provider.ReasonOf(err) != provider.ReasonQuota {
+	if _, err := p.Create(ctx, "dc1", request(t, "r1", "a-1", "a-2", "a-3", "a-4")); node.ReasonOf(err) != node.ReasonQuota {
 		t.Fatalf("want quota, got %v", err)
 	}
 	req := request(t, "r2", "a-1")
 	req.Instances[0].Bootstrap = nil
-	if _, err := p.Create(ctx, "dc1", req); provider.ReasonOf(err) != provider.ReasonInvalid {
+	if _, err := p.Create(ctx, "dc1", req); node.ReasonOf(err) != node.ReasonInvalid {
 		t.Fatalf("want invalid without a bootstrap, got %v", err)
 	}
-	if _, err := p.Create(ctx, "dc1", request(t, "r3", "Bad_Name")); provider.ReasonOf(err) != provider.ReasonInvalid {
+	if _, err := p.Create(ctx, "dc1", request(t, "r3", "Bad_Name")); node.ReasonOf(err) != node.ReasonInvalid {
 		t.Fatalf("want invalid for a bad name, got %v", err)
 	}
-	if _, err := p.Group(ctx, "dc9", nil); !errors.Is(err, provider.ErrUnknownGroup) {
+	if _, err := p.Group(ctx, "dc9", nil); !errors.Is(err, node.ErrUnknownGroup) {
 		t.Fatalf("unknown group: %v", err)
 	}
 
 	// docker run fails: an error, and no files are left.
 	fd.failRun = errors.New("no such image")
-	if _, err := p.Create(ctx, "dc1", request(t, "r4", "b-1")); provider.ReasonOf(err) != provider.ReasonError {
+	if _, err := p.Create(ctx, "dc1", request(t, "r4", "b-1")); node.ReasonOf(err) != node.ReasonError {
 		t.Fatalf("want an error, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "b-1")); !os.IsNotExist(err) {
@@ -301,7 +301,7 @@ func TestDocker_LimitsAndFailures(t *testing.T) {
 	fd.containers["c-1"].NetworkSettings.Networks = nil
 	fd.logs = map[string]string{"c-1": "==> Loaded configuration\nError starting agent: client setup failed\n"}
 	g, _ := p.Group(ctx, "dc1", nil)
-	if g.Instances[0].State != provider.StateFailed || len(g.Instances[0].Addresses) != 0 || !strings.Contains(g.Instances[0].Message, "exit code 1") ||
+	if g.Instances[0].State != node.StateFailed || len(g.Instances[0].Addresses) != 0 || !strings.Contains(g.Instances[0].Message, "exit code 1") ||
 		!strings.Contains(g.Instances[0].Message, "last output: ==> Loaded configuration | Error starting agent: client setup failed") {
 		t.Fatalf("instance: %+v", g.Instances[0])
 	}
@@ -316,7 +316,7 @@ func TestDocker_LimitsAndFailures(t *testing.T) {
 	if err := p.Delete(ctx, "dc1", "c-1"); err != nil {
 		t.Fatalf("a second delete: %v", err)
 	}
-	if err := p.Delete(ctx, "dc1", "../etc"); provider.ReasonOf(err) != provider.ReasonInvalid {
+	if err := p.Delete(ctx, "dc1", "../etc"); node.ReasonOf(err) != node.ReasonInvalid {
 		t.Fatalf("a bad id: %v", err)
 	}
 }

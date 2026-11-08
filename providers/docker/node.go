@@ -38,7 +38,7 @@ import (
 	"time"
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	"github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // The labels of the containers of the provider.
@@ -99,7 +99,7 @@ const (
 // GroupConfig is a group of the provider.
 type GroupConfig struct {
 	// Capacity is reported as the size of a machine.
-	Capacity provider.Capacity
+	Capacity node.Capacity
 	// Max is the most containers of the group; 0 is no limit.
 	Max int
 }
@@ -193,7 +193,7 @@ type container struct {
 }
 
 // instances lists the containers of a group.
-func (p *Provider) instances(ctx context.Context, group string) ([]provider.Instance, error) {
+func (p *Provider) instances(ctx context.Context, group string) ([]node.Instance, error) {
 	ids, err := p.cfg.Docker.Run(ctx, "ps", "-a", "-q", "--no-trunc",
 		"--filter", "label="+LabelManaged+"=1", "--filter", "label="+LabelGroup+"="+group)
 	if err != nil {
@@ -201,7 +201,7 @@ func (p *Provider) instances(ctx context.Context, group string) ([]provider.Inst
 	}
 	list := strings.Fields(ids)
 	if len(list) == 0 {
-		return []provider.Instance{}, nil
+		return []node.Instance{}, nil
 	}
 	out, err := p.cfg.Docker.Run(ctx, append([]string{"inspect"}, list...)...)
 	if err != nil {
@@ -211,10 +211,10 @@ func (p *Provider) instances(ctx context.Context, group string) ([]provider.Inst
 	if err := json.Unmarshal([]byte(out), &cs); err != nil {
 		return nil, fmt.Errorf("reading docker inspect: %w", err)
 	}
-	insts := make([]provider.Instance, 0, len(cs))
+	insts := make([]node.Instance, 0, len(cs))
 	for _, c := range cs {
 		inst := p.instanceOf(c)
-		if inst.State == provider.StateFailed {
+		if inst.State == node.StateFailed {
 			// The operator deletes a failed instance, and the output of the
 			// container with it: the reason goes into the message.
 			if logs, err := p.cfg.Docker.Logs(ctx, inst.ID, failureLogLines); err == nil && strings.TrimSpace(logs) != "" {
@@ -223,7 +223,7 @@ func (p *Provider) instances(ctx context.Context, group string) ([]provider.Inst
 		}
 		insts = append(insts, inst)
 	}
-	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(insts, func(a, b node.Instance) int { return strings.Compare(a.ID, b.ID) })
 	return insts, nil
 }
 
@@ -268,14 +268,14 @@ func (p *Provider) addresses(c container) []string {
 }
 
 // instanceOf maps a container to an instance.
-func (p *Provider) instanceOf(c container) provider.Instance {
+func (p *Provider) instanceOf(c container) node.Instance {
 	labels := map[string]string{}
 	for k, v := range c.Config.Labels {
 		if strings.HasPrefix(k, "norca.") && k != LabelManaged && k != LabelGroup && k != LabelName && k != LabelCreated {
 			labels[k] = v
 		}
 	}
-	inst := provider.Instance{
+	inst := node.Instance{
 		ID:        strings.TrimPrefix(c.Name, "/"),
 		Name:      c.Config.Labels[LabelName],
 		RequestID: c.Config.Labels["norca.request"],
@@ -285,48 +285,48 @@ func (p *Provider) instanceOf(c container) provider.Instance {
 	inst.CreatedAt, _ = time.Parse(time.RFC3339, c.Config.Labels[LabelCreated])
 	switch c.State.Status {
 	case "running":
-		inst.State = provider.StateRunning
+		inst.State = node.StateRunning
 	case "created", "restarting":
-		inst.State = provider.StateCreating
+		inst.State = node.StateCreating
 	case "removing":
-		inst.State = provider.StateDeleting
+		inst.State = node.StateDeleting
 	default: // exited, dead, paused
-		inst.State = provider.StateFailed
-		inst.Reason = provider.ReasonError
+		inst.State = node.StateFailed
+		inst.Reason = node.ReasonError
 		inst.Message = fmt.Sprintf("the container is %s (exit code %d) %s", c.State.Status, c.State.ExitCode, c.State.Error)
 	}
 	return inst
 }
 
-// Group implements provider.Provider.
-func (p *Provider) Group(ctx context.Context, group string, _ map[string]any) (*provider.Group, error) {
+// Group implements node.Provider.
+func (p *Provider) Group(ctx context.Context, group string, _ map[string]any) (*node.Group, error) {
 	cfg, ok := p.cfg.Groups[group]
 	if !ok {
-		return nil, provider.ErrUnknownGroup
+		return nil, node.ErrUnknownGroup
 	}
 	insts, err := p.instances(ctx, group)
 	if err != nil {
 		return nil, err
 	}
 	capacity := cfg.Capacity
-	return &provider.Group{Name: group, Capacity: &capacity, Instances: insts}, nil
+	return &node.Group{Name: group, Capacity: &capacity, Instances: insts}, nil
 }
 
 var validName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
-// Create implements provider.Provider.
-func (p *Provider) Create(ctx context.Context, group string, req provider.CreateRequest) ([]provider.Instance, error) {
+// Create implements node.Provider.
+func (p *Provider) Create(ctx context.Context, group string, req node.CreateRequest) ([]node.Instance, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cfg, ok := p.cfg.Groups[group]
 	if !ok {
-		return nil, provider.ErrUnknownGroup
+		return nil, node.ErrUnknownGroup
 	}
 	existing, err := p.instances(ctx, group)
 	if err != nil {
 		return nil, err
 	}
-	var same []provider.Instance
+	var same []node.Instance
 	for _, inst := range existing {
 		if inst.RequestID == req.RequestID {
 			same = append(same, inst)
@@ -336,23 +336,23 @@ func (p *Provider) Create(ctx context.Context, group string, req provider.Create
 		return same, nil
 	}
 	if cfg.Max > 0 && len(existing)+len(req.Instances) > cfg.Max {
-		return nil, provider.Fail(provider.ReasonQuota, "group %s has %d of %d containers, %d more asked for",
+		return nil, node.Fail(node.ReasonQuota, "group %s has %d of %d containers, %d more asked for",
 			group, len(existing), cfg.Max, len(req.Instances))
 	}
 	for _, ir := range req.Instances {
 		if !validName.MatchString(ir.Name) {
-			return nil, provider.Fail(provider.ReasonInvalid, "%q is not a container name", ir.Name)
+			return nil, node.Fail(node.ReasonInvalid, "%q is not a container name", ir.Name)
 		}
 		if ir.Bootstrap == nil {
-			return nil, provider.Fail(provider.ReasonInvalid, "instance %s has no bootstrap: a container runs the agent of its bootstrap", ir.Name)
+			return nil, node.Fail(node.ReasonInvalid, "instance %s has no bootstrap: a container runs the agent of its bootstrap", ir.Name)
 		}
 	}
 
-	out := make([]provider.Instance, 0, len(req.Instances))
+	out := make([]node.Instance, 0, len(req.Instances))
 	for _, ir := range req.Instances {
 		inst, err := p.start(ctx, group, req, ir)
 		if err != nil {
-			return out, provider.Fail(provider.ReasonError, "starting %s: %v", ir.Name, err)
+			return out, node.Fail(node.ReasonError, "starting %s: %v", ir.Name, err)
 		}
 		out = append(out, inst)
 	}
@@ -360,18 +360,18 @@ func (p *Provider) Create(ctx context.Context, group string, req provider.Create
 }
 
 // start writes the files of an instance and starts its container.
-func (p *Provider) start(ctx context.Context, group string, req provider.CreateRequest, ir provider.InstanceRequest) (provider.Instance, error) {
+func (p *Provider) start(ctx context.Context, group string, req node.CreateRequest, ir node.InstanceRequest) (node.Instance, error) {
 	doc, err := bootstrap.Decode(ir.Bootstrap.UserData)
 	if err != nil {
-		return provider.Instance{}, err
+		return node.Instance{}, err
 	}
 	config, err := doc.ConfigFile()
 	if err != nil {
-		return provider.Instance{}, err
+		return node.Instance{}, err
 	}
 	dir := filepath.Join(p.cfg.StateDir, ir.Name)
 	if err := os.RemoveAll(dir); err != nil {
-		return provider.Instance{}, err
+		return node.Instance{}, err
 	}
 	args := []string{"run", "-d", "--name", ir.Name, "--hostname", ir.Name,
 		"--privileged", "--cgroupns=host", "--network", p.cfg.Network,
@@ -395,10 +395,10 @@ func (p *Provider) start(ctx context.Context, group string, req provider.CreateR
 		}
 		host := filepath.Join(dir, filepath.FromSlash(strings.TrimPrefix(f.Path, "/")))
 		if err := os.MkdirAll(filepath.Dir(host), 0o700); err != nil {
-			return provider.Instance{}, err
+			return node.Instance{}, err
 		}
 		if err := os.WriteFile(host, f.Content, os.FileMode(f.Mode)); err != nil {
-			return provider.Instance{}, err
+			return node.Instance{}, err
 		}
 		args = append(args, "-v", host+":"+f.Path+":ro")
 	}
@@ -413,10 +413,10 @@ func (p *Provider) start(ctx context.Context, group string, req provider.CreateR
 	}
 	if _, err := p.cfg.Docker.Run(ctx, args...); err != nil {
 		_ = os.RemoveAll(dir)
-		return provider.Instance{}, err
+		return node.Instance{}, err
 	}
-	inst := provider.Instance{
-		ID: ir.Name, Name: ir.Name, State: provider.StateCreating, RequestID: req.RequestID,
+	inst := node.Instance{
+		ID: ir.Name, Name: ir.Name, State: node.StateCreating, RequestID: req.RequestID,
 		Labels: maps.Clone(req.Labels), CreatedAt: p.cfg.Now().UTC().Truncate(time.Second),
 	}
 	// The addresses at once: the node joins as soon as it starts, and the
@@ -431,13 +431,13 @@ func (p *Provider) start(ctx context.Context, group string, req provider.CreateR
 	return inst, nil
 }
 
-// Delete implements provider.Provider: the container and its files go.
+// Delete implements node.Provider: the container and its files go.
 func (p *Provider) Delete(ctx context.Context, group, id string) error {
 	if _, ok := p.cfg.Groups[group]; !ok {
-		return provider.ErrUnknownGroup
+		return node.ErrUnknownGroup
 	}
 	if !validName.MatchString(id) {
-		return provider.Fail(provider.ReasonInvalid, "%q is not a container of the provider", id)
+		return node.Fail(node.ReasonInvalid, "%q is not a container of the provider", id)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()

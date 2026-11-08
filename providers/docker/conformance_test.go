@@ -8,8 +8,8 @@ import (
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap"
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider/providertest"
+	"github.com/bacanoo-io/norca-platform/provider/node"
+	"github.com/bacanoo-io/norca-platform/provider/node/providertest"
 )
 
 // The docker provider keeps the contract. Its platform is the fake docker
@@ -17,11 +17,11 @@ import (
 // and the same state directory, as after a restart of the application.
 func TestContract_Docker(t *testing.T) {
 	providertest.Run(t, providertest.Config{
-		New: func(t *testing.T) provider.Provider {
+		New: func(t *testing.T) node.Provider {
 			p, _, _ := newTestProvider(t)
 			return p
 		},
-		Restart: func(t *testing.T, p provider.Provider) provider.Provider {
+		Restart: func(t *testing.T, p node.Provider) node.Provider {
 			old := p.(*Provider)
 			again, err := New(old.cfg)
 			if err != nil {
@@ -30,13 +30,13 @@ func TestContract_Docker(t *testing.T) {
 			return again
 		},
 		Group:      "dc1",
-		Capacity:   &provider.Capacity{CPU: 2000, Memory: 2048, Disk: 10000},
+		Capacity:   &node.Capacity{CPU: 2000, Memory: 2048, Disk: 10000},
 		QuotaGroup: "dc1",
 		QuotaMax:   3,
 		Addresses:  true,
 		// The docker provider writes the files of the bootstrap: it needs a
 		// real one.
-		Bootstrap: func(t *testing.T, name string) *provider.Bootstrap {
+		Bootstrap: func(t *testing.T, name string) *node.Bootstrap {
 			items, _ := bootstraptest.Items(t)
 			tmpl, err := bootstrap.Parse("eu", items)
 			if err != nil {
@@ -46,7 +46,7 @@ func TestContract_Docker(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			return &provider.Bootstrap{UserData: r.UserData}
+			return &node.Bootstrap{UserData: r.UserData}
 		},
 	})
 }

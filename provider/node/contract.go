@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Norca contributors
 // SPDX-License-Identifier: MPL-2.0
 
-// Package provider is the contract between the node scaling operator
+// Package node is the contract between the node scaling operator
 // (norca-nodescaler) and a node provider: an application outside the core
 // that creates and deletes the machines of one platform. The operator calls
 // the provider over HTTP:
@@ -13,7 +13,7 @@
 // A provider implements Provider and serves it with NewHandler; the operator
 // calls it with Client. Credentials of the platform stay with the provider;
 // the operator sends a bearer token.
-package provider
+package node
 
 import (
 	"context"

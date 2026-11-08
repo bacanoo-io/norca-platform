@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider/mock"
+	provider "github.com/bacanoo-io/norca-platform/provider/node"
+	"github.com/bacanoo-io/norca-platform/providers/mock"
 	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
 	"github.com/bacanoo-io/norca/norca/controller/fake"

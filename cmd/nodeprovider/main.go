@@ -32,10 +32,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider/docker"
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider/mock"
-	"github.com/bacanoo-io/norca-platform/nodescaler/registrar"
+	"github.com/bacanoo-io/norca-platform/provider/node"
+	"github.com/bacanoo-io/norca-platform/provider/registrar"
+	"github.com/bacanoo-io/norca-platform/providers/docker"
+	"github.com/bacanoo-io/norca-platform/providers/mock"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -65,7 +65,7 @@ func parseGroup(s string) (string, mock.GroupConfig, error) {
 		return "", mock.GroupConfig{}, fmt.Errorf("group %q: a name, cpu and memory are required", s)
 	}
 	return parts[0], mock.GroupConfig{
-		Capacity: provider.Capacity{CPU: nums[0], Memory: nums[1], Disk: nums[2]},
+		Capacity: node.Capacity{CPU: nums[0], Memory: nums[1], Disk: nums[2]},
 		Max:      int(nums[3]),
 	}, nil
 }
@@ -176,7 +176,7 @@ func run(args []string) error {
 		*endpoint = "http://" + host
 	}
 
-	var impl provider.Provider = mock.New(configs)
+	var impl node.Provider = mock.New(configs)
 	if *typ == "docker" {
 		groups := map[string]docker.GroupConfig{}
 		for name, cfg := range configs {
@@ -203,7 +203,7 @@ func run(args []string) error {
 
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           provider.NewHandler(impl, token, log),
+		Handler:           node.NewHandler(impl, token, log),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)

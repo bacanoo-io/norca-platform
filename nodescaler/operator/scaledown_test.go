@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	provider "github.com/bacanoo-io/norca-platform/provider/node"
 )
 
 // grown is an env with a group of n instances whose nodes joined, in the

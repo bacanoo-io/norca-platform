@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bacanoo-io/norca-platform/nodescaler/provider"
+	provider "github.com/bacanoo-io/norca-platform/provider/node"
 	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
 )
