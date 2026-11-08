@@ -50,7 +50,7 @@ func NewHandler(rt *Runtime, types []Type, log *slog.Logger) http.Handler {
 	}
 	for _, c := range rt.Classes {
 		prefix := "/classes/" + c.Name
-		mux.Handle(prefix+"/", http.StripPrefix(prefix, lb.NewHandler(c.Class, c.Token, log.With("class", c.Name))))
+		mux.Handle(prefix+"/", http.StripPrefix(prefix, lb.NewHandler(c.Class, c.Token, log)))
 	}
 	// What no route takes: an unknown provider or class, in the shape of
 	// the contracts.

@@ -355,7 +355,7 @@ func newClass(providerName string, t Type, class string, shared, classParams map
 		return nil, fmt.Errorf("class %q (type %s): %w", class, t.ID, err)
 	}
 	values := params.Merge(sv, cv)
-	p, err := t.LB.New(lb.Config{Provider: providerName, Class: class, Values: values, Logger: log.With("class", class)})
+	p, err := t.LB.New(lb.Config{Provider: providerName, Class: class, Values: values, Logger: log})
 	if err != nil {
 		return nil, fmt.Errorf("class %q (type %s): %w", class, t.ID, err)
 	}

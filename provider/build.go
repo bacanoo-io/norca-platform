@@ -159,7 +159,7 @@ func (f *File) Build(reg *Registry, serve Serve, log *slog.Logger) (*Runtime, er
 		}
 		if p.LoadBalancer != nil && serve.lb() {
 			for _, cc := range p.LoadBalancer.Classes {
-				c, err := newClass(p.Name, t, cc.Class, p.Params, cc.Params, log.With("provider", p.Name))
+				c, err := newClass(p.Name, t, cc.Class, p.Params, cc.Params, log)
 				if err != nil {
 					return fail(fmt.Errorf("provider %q: %w", p.Name, err))
 				}
