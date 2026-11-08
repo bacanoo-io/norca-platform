@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Norca contributors
 // SPDX-License-Identifier: MPL-2.0
 
-// Package mock is a node provider in memory, for trials and tests: it keeps
-// the instances it is asked for and creates no machine. An instance is
-// running as soon as it is created, with the addresses of the n-th instance
-// the mock made: 192.0.2.n and 2001:db8::n (n in hex), from the ranges for
-// documentation.
 package mock
 
 import (

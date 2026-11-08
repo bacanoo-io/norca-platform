@@ -12,14 +12,17 @@
 //
 // A provider implements Provider and serves it with NewHandler; the operator
 // calls it with Client. Credentials of the platform stay with the provider;
-// the operator sends a bearer token.
+// the operator sends a bearer token. norca-provider serves the contract of a
+// provider at {advertise_url}/providers/{name}, the endpoint of its
+// NodeProvider object.
 package node
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
+
+	"github.com/bacanoo-io/norca-platform/provider/wire"
 )
 
 // The states of an instance.
@@ -38,9 +41,9 @@ const (
 	// ReasonNoCapacity: the platform has no machine of the kind now.
 	ReasonNoCapacity = "no_capacity"
 	// ReasonInvalid: the request or its parameters are wrong.
-	ReasonInvalid = "invalid"
+	ReasonInvalid = wire.ReasonInvalid
 	// ReasonError: any other failure.
-	ReasonError = "error"
+	ReasonError = wire.ReasonError
 )
 
 // Capacity is the size of one machine of a kind: CPU in MHz, memory and disk
@@ -144,24 +147,13 @@ type Provider interface {
 var ErrUnknownGroup = errors.New("unknown group")
 
 // Error is a failure with a reason (ReasonQuota, ReasonNoCapacity,
-// ReasonInvalid, ReasonError).
-type Error struct {
-	Reason  string `json:"reason"`
-	Message string `json:"error"`
-}
-
-func (e *Error) Error() string { return e.Reason + ": " + e.Message }
+// ReasonInvalid, ReasonError); its shape is the one of both provider
+// contracts (package wire).
+type Error = wire.Error
 
 // Fail returns an Error with the reason.
-func Fail(reason, format string, args ...any) error {
-	return &Error{Reason: reason, Message: fmt.Sprintf(format, args...)}
-}
+func Fail(reason, format string, args ...any) error { return wire.Fail(reason, format, args...) }
 
 // ReasonOf returns the reason of an error: the reason of an Error, else
 // ReasonError.
-func ReasonOf(err error) string {
-	if e, ok := errors.AsType[*Error](err); ok {
-		return e.Reason
-	}
-	return ReasonError
-}
+func ReasonOf(err error) string { return wire.ReasonOf(err) }

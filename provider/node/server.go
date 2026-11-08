@@ -4,13 +4,13 @@
 package node
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
+
+	"github.com/bacanoo-io/norca-platform/provider/wire"
 )
 
 // maxRequestBody bounds the body of a create request; the bootstrap of a
@@ -24,7 +24,7 @@ func NewHandler(p Provider, token string, log *slog.Logger) http.Handler {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	h := &handler{p: p, token: token, log: log}
+	h := &handler{p: p, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -32,27 +32,12 @@ func NewHandler(p Provider, token string, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /v1/groups/{group}", h.group)
 	mux.HandleFunc("POST /v1/groups/{group}/instances", h.create)
 	mux.HandleFunc("DELETE /v1/groups/{group}/instances/{id}", h.delete)
-	return h.auth(mux)
+	return wire.Bearer(token, mux, "/v1/health")
 }
 
 type handler struct {
-	p     Provider
-	token string
-	log   *slog.Logger
-}
-
-func (h *handler) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.token != "" && r.URL.Path != "/v1/health" {
-			got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(h.token)) != 1 {
-				w.Header().Set("WWW-Authenticate", "Bearer")
-				writeError(w, http.StatusUnauthorized, &Error{Reason: ReasonInvalid, Message: "invalid or missing token"})
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
+	p   Provider
+	log *slog.Logger
 }
 
 // group serves GET: the parameters of the machine kind are the query.
@@ -132,11 +117,9 @@ func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 func writeError(w http.ResponseWriter, status int, e *Error) {
-	writeJSON(w, status, e)
+	wire.WriteJSON(w, status, e)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	wire.WriteJSON(w, status, v)
 }

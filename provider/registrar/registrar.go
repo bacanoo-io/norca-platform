@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Norca contributors
 // SPDX-License-Identifier: MPL-2.0
 
-// Package registrar writes the NodeProvider object of a node provider and
-// keeps its heartbeat, so the node scaling operator knows the provider
-// exists, where to call it, which groups it offers, and that it is alive.
+// Package registrar writes the objects a provider registers itself with and
+// keeps their heartbeat: a NodeProvider object for a node provider (for the
+// node scaling operator) and a LoadBalancerClass object for every load
+// balancer class (for the LoadBalancer operator). Both say where the
+// operator calls the provider and with which token, and carry the same
+// status: the heartbeat (RFC 3339) and the version of the provider.
 package registrar
 
 import (
@@ -20,13 +23,19 @@ import (
 	"github.com/bacanoo-io/norca/norca/api"
 )
 
-// The object kind of the registration, registered by the core.
+// The object kinds of the registrations.
 const (
 	Group = "norca.io"
-	Kind  = "NodeProvider"
+
+	// KindNodeProvider is registered by the core.
+	KindNodeProvider = "NodeProvider"
+
+	// KindLoadBalancerClass is registered with the LoadBalancer operator
+	// (loadbalancerclass.kind.hcl).
+	KindLoadBalancerClass = "LoadBalancerClass"
 
 	// ManagedBy marks the objects this program owns.
-	ManagedBy = "norca-nodeprovider"
+	ManagedBy = "norca-provider"
 )
 
 // ErrNotFound is returned by a Store when the object does not exist.
@@ -39,13 +48,34 @@ type Store interface {
 
 	// UpdateStatus replaces the status of the object; it returns ErrNotFound
 	// if the object does not exist.
-	UpdateStatus(ctx context.Context, name string, status map[string]any) error
+	UpdateStatus(ctx context.Context, kind, name string, status map[string]any) error
 
 	// Delete removes the object. Removing a missing object is not an error.
-	Delete(ctx context.Context, name string) error
+	Delete(ctx context.Context, kind, name string) error
 }
 
-// GroupSpec is a group (a zone) the provider offers.
+// Registration is one object: its kind (KindNodeProvider or
+// KindLoadBalancerClass), its name and its spec.
+type Registration struct {
+	Kind string
+	Name string
+	Spec map[string]any
+}
+
+// Object returns the object of the registration.
+func (r Registration) Object() *api.CustomObject {
+	return &api.CustomObject{
+		Group:     Group,
+		Kind:      r.Kind,
+		Name:      r.Name,
+		ManagedBy: ManagedBy,
+		Spec:      r.Spec,
+	}
+}
+
+func (r Registration) String() string { return r.Kind + "/" + r.Name }
+
+// GroupSpec is a group (a zone) a node provider offers.
 type GroupSpec struct {
 	Name string
 
@@ -57,33 +87,19 @@ type GroupSpec struct {
 	Parameters map[string]any
 }
 
-// Registration is the NodeProvider object of a provider.
-type Registration struct {
-	// Name is the name of the object, which node groups name in provider.
-	Name string
-
-	// Endpoint is the base URL the operator calls.
-	Endpoint string
-
-	// TokenVariable is the path of the Variable with the token the operator
-	// sends; empty if the provider takes no token.
-	TokenVariable string
-
-	Groups []GroupSpec
-
-	// Parameters are the published parameters of the provider.
-	Parameters map[string]any
-}
-
-// Object returns the NodeProvider object of the registration.
-func (r Registration) Object() *api.CustomObject {
-	spec := map[string]any{"endpoint": r.Endpoint}
-	if r.TokenVariable != "" {
-		spec["token_variable"] = r.TokenVariable
+// NodeProvider returns the registration of a node provider: name is the
+// name of the object, which node groups name in provider; endpoint the base
+// URL the operator calls; tokenVariable the path of the Variable with the
+// token the operator sends (empty: no token); parameters the published
+// parameters of the provider.
+func NodeProvider(name, endpoint, tokenVariable string, groups []GroupSpec, parameters map[string]any) Registration {
+	spec := map[string]any{"endpoint": endpoint}
+	if tokenVariable != "" {
+		spec["token_variable"] = tokenVariable
 	}
-	if len(r.Groups) > 0 {
-		groups := make([]any, 0, len(r.Groups))
-		for _, g := range r.Groups {
+	if len(groups) > 0 {
+		docs := make([]any, 0, len(groups))
+		for _, g := range groups {
 			doc := map[string]any{"name": g.Name}
 			if g.Max > 0 {
 				doc["max"] = g.Max
@@ -91,37 +107,56 @@ func (r Registration) Object() *api.CustomObject {
 			if len(g.Parameters) > 0 {
 				doc["parameters"] = g.Parameters
 			}
-			groups = append(groups, doc)
+			docs = append(docs, doc)
 		}
-		spec["groups"] = groups
+		spec["groups"] = docs
 	}
-	if len(r.Parameters) > 0 {
-		spec["parameters"] = r.Parameters
+	if len(parameters) > 0 {
+		spec["parameters"] = parameters
 	}
-	return &api.CustomObject{
-		Group:     Group,
-		Kind:      Kind,
-		Name:      r.Name,
-		ManagedBy: ManagedBy,
-		Spec:      spec,
-	}
+	return Registration{Kind: KindNodeProvider, Name: name, Spec: spec}
 }
 
-// Registrar registers a provider and reports that it is alive.
+// LoadBalancerClass returns the registration of a load balancer class: the
+// endpoint the operator calls for the class, the token Variable, what the
+// class supports (internal load balancers, the frontend ports; empty ports
+// is any) and the published parameters, which the operator sends back with
+// every call.
+func LoadBalancerClass(class, endpoint, tokenVariable string, internal bool, ports string, parameters map[string]any) Registration {
+	caps := map[string]any{"internal": internal}
+	if ports != "" {
+		caps["ports"] = ports
+	}
+	spec := map[string]any{
+		"endpoint":     endpoint,
+		"capabilities": caps,
+	}
+	if tokenVariable != "" {
+		spec["tokenVariable"] = tokenVariable
+	}
+	if len(parameters) > 0 {
+		spec["parameters"] = parameters
+	}
+	return Registration{Kind: KindLoadBalancerClass, Name: class, Spec: spec}
+}
+
+// Registrar registers the objects of a provider and reports that it is
+// alive.
 type Registrar struct {
-	Store        Store
-	Registration Registration
+	Store         Store
+	Registrations []Registration
 
 	// Interval is the period of the heartbeat. It should be well below the
-	// time after which the operator takes a provider for unavailable.
+	// time after which an operator takes a provider for unavailable (the
+	// -class-ttl of the LoadBalancer operator, three minutes by default).
 	Interval time.Duration
 
 	// Version is reported in the status.
 	Version string
 
-	// DeregisterOnExit removes the registration when Run returns, so the
-	// operator reports an unknown provider at once instead of waiting for
-	// the heartbeat to expire.
+	// DeregisterOnExit removes the registrations when Run returns, so an
+	// operator reports an unknown provider or class at once instead of
+	// waiting for the heartbeat to expire.
 	DeregisterOnExit bool
 
 	Logger *slog.Logger
@@ -145,8 +180,8 @@ func (r *Registrar) now() time.Time {
 	return time.Now()
 }
 
-// Run registers the provider (retrying until it succeeds or ctx ends) and
-// then reports the heartbeat until ctx ends.
+// Run registers the objects (retrying each until it succeeds or ctx ends)
+// and then reports the heartbeat until ctx ends.
 func (r *Registrar) Run(ctx context.Context) error {
 	interval := r.Interval
 	if interval <= 0 {
@@ -156,20 +191,21 @@ func (r *Registrar) Run(ctx context.Context) error {
 	if retry <= 0 {
 		retry = 5 * time.Second
 	}
-	reg := r.Registration
-	for {
-		err := r.register(ctx)
-		if err == nil {
-			break
+	for _, reg := range r.Registrations {
+		for {
+			err := r.register(ctx, reg)
+			if err == nil {
+				break
+			}
+			r.logger().Warn("registering failed, retrying", "object", reg.String(), "error", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(retry):
+			}
 		}
-		r.logger().Warn("registering the provider failed, retrying", "provider", reg.Name, "error", err)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(retry):
-		}
+		r.logger().Info("registered", "object", reg.String(), "endpoint", reg.Spec["endpoint"])
 	}
-	r.logger().Info("provider registered", "provider", reg.Name, "endpoint", reg.Endpoint)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -181,14 +217,16 @@ func (r *Registrar) Run(ctx context.Context) error {
 			}
 			return nil
 		case <-ticker.C:
-			if err := r.heartbeat(ctx); err != nil {
-				r.logger().Warn("heartbeat failed", "provider", reg.Name, "error", err)
+			for _, reg := range r.Registrations {
+				if err := r.heartbeat(ctx, reg); err != nil {
+					r.logger().Warn("heartbeat failed", "object", reg.String(), "error", err)
+				}
 			}
 		}
 	}
 }
 
-// status is the status of the object: the heartbeat (RFC 3339) and the
+// status is the status of every object: the heartbeat (RFC 3339) and the
 // version.
 func (r *Registrar) status() map[string]any {
 	status := map[string]any{"heartbeat": r.now().UTC().Format(time.RFC3339)}
@@ -198,20 +236,20 @@ func (r *Registrar) status() map[string]any {
 	return status
 }
 
-func (r *Registrar) register(ctx context.Context) error {
-	if err := r.Store.Apply(ctx, r.Registration.Object()); err != nil {
+func (r *Registrar) register(ctx context.Context, reg Registration) error {
+	if err := r.Store.Apply(ctx, reg.Object()); err != nil {
 		return err
 	}
-	return r.Store.UpdateStatus(ctx, r.Registration.Name, r.status())
+	return r.Store.UpdateStatus(ctx, reg.Kind, reg.Name, r.status())
 }
 
 // heartbeat updates the status; if the object was removed meanwhile, it is
 // registered again.
-func (r *Registrar) heartbeat(ctx context.Context) error {
-	err := r.Store.UpdateStatus(ctx, r.Registration.Name, r.status())
+func (r *Registrar) heartbeat(ctx context.Context, reg Registration) error {
+	err := r.Store.UpdateStatus(ctx, reg.Kind, reg.Name, r.status())
 	if errors.Is(err, ErrNotFound) {
-		r.logger().Warn("the registration disappeared, registering again", "provider", r.Registration.Name)
-		return r.register(ctx)
+		r.logger().Warn("the registration disappeared, registering again", "object", reg.String())
+		return r.register(ctx, reg)
 	}
 	return err
 }
@@ -220,8 +258,10 @@ func (r *Registrar) deregister() {
 	// ctx is done at this point; use a fresh one.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := r.Store.Delete(ctx, r.Registration.Name); err != nil {
-		r.logger().Warn("removing the registration failed", "provider", r.Registration.Name, "error", err)
+	for _, reg := range r.Registrations {
+		if err := r.Store.Delete(ctx, reg.Kind, reg.Name); err != nil {
+			r.logger().Warn("removing the registration failed", "object", reg.String(), "error", err)
+		}
 	}
 }
 
@@ -280,16 +320,16 @@ func (s *APIStore) Apply(ctx context.Context, obj *api.CustomObject) error {
 }
 
 // UpdateStatus implements Store.
-func (s *APIStore) UpdateStatus(ctx context.Context, name string, status map[string]any) error {
+func (s *APIStore) UpdateStatus(ctx context.Context, kind, name string, status map[string]any) error {
 	w := (&api.WriteOptions{}).WithContext(ctx)
-	_, _, err := s.Client.Objects().UpdateStatus(Group, Kind, name, status, nil, w)
+	_, _, err := s.Client.Objects().UpdateStatus(Group, kind, name, status, nil, w)
 	return wrap(err)
 }
 
 // Delete implements Store.
-func (s *APIStore) Delete(ctx context.Context, name string) error {
+func (s *APIStore) Delete(ctx context.Context, kind, name string) error {
 	w := (&api.WriteOptions{}).WithContext(ctx)
-	_, _, err := s.Client.Objects().Delete(Group, Kind, name, nil, w)
+	_, _, err := s.Client.Objects().Delete(Group, kind, name, nil, w)
 	if err = wrap(err); errors.Is(err, ErrNotFound) {
 		return nil
 	}
