@@ -75,6 +75,17 @@ func (p *Provider) Group(_ context.Context, group string, _ map[string]any) (*no
 	return g, nil
 }
 
+// SetMax changes the most instances a group has at a time (see
+// GroupConfig.Max): a test lowers it to make the provider refuse every new
+// instance from then on.
+func (p *Provider) SetMax(group string, max int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cfg := p.groups[group]
+	cfg.Max = max
+	p.groups[group] = cfg
+}
+
 // Create implements node.Provider.
 func (p *Provider) Create(_ context.Context, group string, req node.CreateRequest) ([]node.Instance, error) {
 	p.mu.Lock()

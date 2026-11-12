@@ -212,6 +212,41 @@ func TestRollout_RollBehindKeptWhileTheGroupGrows(t *testing.T) {
 	}
 }
 
+// While the provider refuses every new instance, the nodes removed first
+// one after another must not add up: a group never falls further below its
+// scale than its headroom, however long the refusal lasts and however many
+// nodes are at their soft age limit.
+func TestRollout_RemoveFirstDoesNotAddUp(t *testing.T) {
+	const size, headroom = 5, 1
+	e := rollEnv(t, size, map[string]any{"headroom_nodes": headroom,
+		"rolling": map[string]any{"max_node_age": "10d", "jitter": "0%", "max_unavailable": 2, "max_surge": 2}})
+	for _, id := range e.nodeIDs()[:3] {
+		e.setMeta(id, map[string]string{MetaCreatedAt: e.now.Add(-11 * 24 * time.Hour).Format(time.RFC3339)})
+	}
+	e.reconcile() // the surges are refused: backed off
+	if ro := e.rollout(); ro.Backoff.Reason != "SurgeRefused" {
+		t.Fatalf("backoff %+v", ro.Backoff)
+	}
+	e.mock.SetMax("dc1", 1) // from here on the provider refuses every instance
+
+	fewest := len(e.instances())
+	for range 12 {
+		e.settle(1)
+		fewest = min(fewest, len(e.instances()))
+	}
+	if fewest != size-headroom {
+		t.Fatalf("the group fell to %d instances, want no fewer than %d (the scale less the headroom)", fewest, size-headroom)
+	}
+	if n := len(e.instances()); n != size-headroom {
+		t.Fatalf("%d instances at the end, want %d", n, size-headroom)
+	}
+	// The group is a node short, so nothing more is started: the other two
+	// nodes at their soft limit wait for the provider.
+	if ro := e.rollout(); len(ro.Replacing) != 0 {
+		t.Fatalf("replacing %+v, want nothing while the group is a node short", ro.Replacing)
+	}
+}
+
 func TestRollout_RollBehindAfterABackoff(t *testing.T) {
 	// Two at a time the three nodes are done 20 hours after day 54, before
 	// day 55; backed off until day 55 they are late.
