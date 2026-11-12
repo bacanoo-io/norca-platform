@@ -202,6 +202,19 @@ func (f *fakeNodes) down(id string) {
 	f.detail(id).Ready = false
 }
 
+// downSince marks a node down since a time, as the servers report it.
+func (f *fakeNodes) downSince(id string, since time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.nodes {
+		if f.nodes[i].ID == id {
+			f.nodes[i].Ready = false
+			f.nodes[i].DownSince = since
+		}
+	}
+	f.detail(id).Ready = false
+}
+
 func (f *fakeNodes) madeIneligible() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

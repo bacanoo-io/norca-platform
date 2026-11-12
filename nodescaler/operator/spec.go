@@ -101,6 +101,10 @@ type groupSpec struct {
 	Edge struct {
 		MinShutdownDelay string `json:"min_shutdown_delay"`
 	} `json:"edge"`
+	Repair struct {
+		Enabled *bool  `json:"enabled"`
+		After   string `json:"after"`
+	} `json:"repair"`
 	Rolling struct {
 		Mode           string `json:"mode"`
 		Generation     int64  `json:"generation"`

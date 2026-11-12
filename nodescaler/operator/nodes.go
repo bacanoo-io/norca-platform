@@ -30,6 +30,10 @@ type Node struct {
 	Ready    bool
 	Eligible bool
 
+	// DownSince is since when the node has been down; zero for a node that
+	// is not down.
+	DownSince time.Time
+
 	// CreateIndex tells which of two nodes registered first.
 	CreateIndex uint64
 }
@@ -114,12 +118,22 @@ func (n *APINodes) Nodes(ctx context.Context, datacenter, pool, class string) ([
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, Node{
+		node := Node{
 			ID: s.ID, Name: s.Name, Instance: marks[0], Group: marks[1],
 			Ready:       s.Status == api.NodeStatusReady,
 			Eligible:    s.SchedulingEligibility == api.NodeSchedulingEligible,
 			CreateIndex: s.CreateIndex,
-		})
+		}
+		// The list does not say since when a node has its status; the few
+		// that are down are read for it.
+		if s.Status == api.NodeStatusDown {
+			info, _, err := n.Client.Nodes().Info(s.ID, q)
+			if err != nil {
+				return nil, err
+			}
+			node.DownSince = time.Unix(info.StatusUpdatedAt, 0)
+		}
+		out = append(out, node)
 	}
 	return out, nil
 }

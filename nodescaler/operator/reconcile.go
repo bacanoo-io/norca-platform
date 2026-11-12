@@ -300,6 +300,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// The join of the nodes: failed and late instances are deleted, slow ones
 	// marked.
 	js := r.trackJoins(ctx, obj, client, group, spec, o, prevStatus, now)
+
+	// The instances of nodes that have been down for long are replaced.
+	repairCond := r.repairDown(ctx, obj, client, group, spec, o, &js, now)
+	if repairCond.Status == "True" && conditionStatusOf(prevStatus, CondRepairHeld) != "True" {
+		r.event(ctx, obj, api.ObjectEventTypeWarning, CondRepairHeld, repairCond.Message)
+	}
 	r.purgeDeleted(ctx, obj, &js, now)
 	failing := js.Failures >= spec.maxFailures()
 	if failing && readJoinState(prevStatus).Failures < spec.maxFailures() {
@@ -415,6 +421,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		status["strayNodes"] = strayRecords
 		setCondition(status, foreignCond, now)
 		setCondition(status, netCond, now)
+		setCondition(status, repairCond, now)
 		setCondition(status, joinCondition(js, spec.maxFailures()), now)
 		status["observedGeneration"] = obj.Generation
 		setCondition(status, condition{Type: CondProviderAvailable, Status: "True", Reason: "Available"}, now)
