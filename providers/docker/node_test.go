@@ -114,7 +114,8 @@ func newTestProvider(t *testing.T) (*Provider, *fakeDocker, string) {
 	p, err := New(Config{
 		Groups:   map[string]GroupConfig{"dc1": {Capacity: node.Capacity{CPU: 2000, Memory: 2048, Disk: 10000}, Max: 3}},
 		StateDir: dir, Docker: fd, HostAddresses: []string{"10.77.1.12"},
-		Now: func() time.Time { return time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC) },
+		CgroupRoot: filepath.Join(dir, ".cgroup"),
+		Now:        func() time.Time { return time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +165,7 @@ func TestDocker_CreateRunsNorcaJoin(t *testing.T) {
 	for _, want := range []string{
 		"/usr/local/bin/norca-join:/usr/local/bin/norca-join:ro", ":/etc/norca/norca-join.json:ro",
 		"--entrypoint /usr/local/bin/norca-join debian:bookworm-slim run -config /etc/norca/norca-join.json -- " +
-			"/usr/local/bin/norca agent -config /etc/norca/norca.hcl",
+			"/usr/local/bin/norca agent -config /etc/norca/norca.hcl -config /etc/norca-provider/cgroup.hcl",
 	} {
 		if !strings.Contains(args, want) {
 			t.Errorf("docker run has no %q:\n%s", want, args)
@@ -225,7 +226,8 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 		"--name workers-dc1-1-1", "--hostname workers-dc1-1-1", "--label norca.request=eu/workers-dc1/1",
 		"--label norca.node_group=workers-dc1", "/usr/local/bin/norca:/usr/local/bin/norca:ro",
 		":/etc/norca/tls/client-key.pem:ro", ":/etc/norca/norca.hcl:ro",
-		"--entrypoint /usr/local/bin/norca debian:bookworm-slim agent -config /etc/norca/norca.hcl",
+		"--entrypoint /usr/local/bin/norca debian:bookworm-slim agent -config /etc/norca/norca.hcl -config /etc/norca-provider/cgroup.hcl",
+		":/etc/norca-provider/cgroup.hcl:ro",
 	} {
 		if !strings.Contains(args, want) {
 			t.Errorf("docker run has no %q:\n%s", want, args)
@@ -260,6 +262,59 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	again, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2"))
 	if err != nil || len(again) != 2 || len(fd.runs) != 2 {
 		t.Fatalf("again: %+v %v, %d runs", again, err, len(fd.runs))
+	}
+}
+
+// The agents of the containers see the cgroups of the host: each gets a
+// parent of its own for the cgroups of its tasks, and the parent goes with
+// the instance.
+func TestDocker_CgroupParentOfAnInstance(t *testing.T) {
+	p, fd, dir := newTestProvider(t)
+	ctx := context.Background()
+	if _, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2")); err != nil {
+		t.Fatal(err)
+	}
+	for i, name := range []string{"workers-dc1-1-1", "workers-dc1-1-2"} {
+		got, err := os.ReadFile(filepath.Join(dir, name, "etc", "norca-provider", "cgroup.hcl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "client {\n  cgroup_parent = \"norca-node-" + name + ".slice\"\n}\n"
+		if string(got) != want {
+			t.Errorf("the cgroup settings of %s:\n%s\nwant:\n%s", name, got, want)
+		}
+		// The host namespace stays: in one of its own the agent could not
+		// hand the controllers down to its tasks.
+		if args := strings.Join(fd.runs[i], " "); !strings.Contains(args, "--cgroupns=host") {
+			t.Errorf("docker run of %s has no --cgroupns=host:\n%s", name, args)
+		}
+	}
+
+	// What the agent of the first instance left on the host, and the parent
+	// of the second, which must stay.
+	root := filepath.Join(dir, ".cgroup")
+	own := filepath.Join(root, "norca-node-workers-dc1-1-1.slice")
+	other := filepath.Join(root, "norca-node-workers-dc1-1-2.slice")
+	for _, d := range []string{filepath.Join(own, "alloc-1.task.scope"), filepath.Join(own, "alloc-2.task.scope", "child"), other} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Delete(ctx, "dc1", "workers-dc1-1-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(own); !os.IsNotExist(err) {
+		t.Errorf("the cgroup parent of the deleted instance is left: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("the cgroup parent of the other instance: %v", err)
+	}
+	// An instance whose agent made no cgroup.
+	if err := p.Delete(ctx, "dc1", "workers-dc1-1-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Delete(ctx, "dc1", "workers-dc1-1-2"); err != nil {
+		t.Fatalf("a second delete: %v", err)
 	}
 }
 

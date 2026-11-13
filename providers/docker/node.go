@@ -10,6 +10,13 @@
 // runs "norca agent -config <the .hcl file>". The container has the name and
 // the host name of the instance.
 //
+// The containers are privileged and see the cgroups of the host, as the
+// agent needs to make cgroups for its tasks. Each agent gets a cgroup parent
+// of its own (norca-node-<instance>.slice, a second -config file of the
+// provider), so that the agents of one host, the host's own among them, do
+// not manage each other's task cgroups; the parent is removed with the
+// instance.
+//
 // The containers carry the labels of the request, so the provider knows its
 // instances after a restart and answers a repeated request with them.
 //
@@ -135,6 +142,12 @@ type Config struct {
 	// docker bridge); they are reported with the container's own addresses.
 	HostAddresses []string
 
+	// CgroupRoot is where the cgroups of the host are mounted (default
+	// /sys/fs/cgroup). The containers see the cgroups of the host, and the
+	// agent of each keeps its tasks under a parent of its own there
+	// (cgroupParent); the parent of a deleted instance is removed from here.
+	CgroupRoot string
+
 	Docker Runner
 	Now    func() time.Time
 }
@@ -161,6 +174,9 @@ func New(cfg Config) (*Provider, error) {
 	}
 	if cfg.Network == "" {
 		cfg.Network = "bridge"
+	}
+	if cfg.CgroupRoot == "" {
+		cfg.CgroupRoot = "/sys/fs/cgroup"
 	}
 	if cfg.Docker == nil {
 		cfg.Docker = CLI{}
@@ -359,6 +375,54 @@ func (p *Provider) Create(ctx context.Context, group string, req node.CreateRequ
 	return out, nil
 }
 
+// cgroupConfigPath is where the agent of a container finds the settings the
+// provider adds to those of the bootstrap.
+const cgroupConfigPath = "/etc/norca-provider/cgroup.hcl"
+
+// cgroupParent is the cgroup under which the agent of an instance keeps the
+// cgroups of its tasks. The containers run in the cgroup namespace of the
+// host (in one of their own the agent would sit in the root it sees, where
+// the kernel lets no controller be handed down while a process is in it), so
+// without a parent of its own every agent of the host, the host's own
+// included, would manage the same default parent: an agent removes the
+// cgroups there that it does not know and that hold no process, among them
+// the cgroup another agent has just made for a task that has not started.
+func cgroupParent(name string) string {
+	return "norca-node-" + name + ".slice"
+}
+
+// removeCgroups removes the cgroup parent of a deleted instance from the
+// host, children first. The processes of the container are gone by now, but
+// the kernel may take a moment to let their cgroups go, so it tries a few
+// times; what stays is empty and is used again by an instance of the name.
+func (p *Provider) removeCgroups(name string) {
+	root := filepath.Join(p.cfg.CgroupRoot, cgroupParent(name))
+	for range 5 {
+		dirs := []string{}
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				dirs = append(dirs, path)
+			}
+			return nil
+		})
+		if len(dirs) == 0 {
+			return
+		}
+		// A cgroup is removed with rmdir, and only once it has no child:
+		// the deepest first.
+		failed := false
+		for _, dir := range slices.Backward(dirs) {
+			if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+				failed = true
+			}
+		}
+		if !failed {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // start writes the files of an instance and starts its container.
 func (p *Provider) start(ctx context.Context, group string, req node.CreateRequest, ir node.InstanceRequest) (node.Instance, error) {
 	doc, err := bootstrap.Decode(ir.Bootstrap.UserData)
@@ -402,14 +466,26 @@ func (p *Provider) start(ctx context.Context, group string, req node.CreateReque
 		}
 		args = append(args, "-v", host+":"+f.Path+":ro")
 	}
+	// After the configuration of the bootstrap, so that it wins over a
+	// parent set there: the parent must be one no other agent of the host
+	// uses.
+	cgroupConfig := filepath.Join(dir, filepath.FromSlash(strings.TrimPrefix(cgroupConfigPath, "/")))
+	if err := os.MkdirAll(filepath.Dir(cgroupConfig), 0o700); err != nil {
+		return node.Instance{}, err
+	}
+	content := fmt.Sprintf("client {\n  cgroup_parent = %q\n}\n", cgroupParent(ir.Name))
+	if err := os.WriteFile(cgroupConfig, []byte(content), 0o600); err != nil {
+		return node.Instance{}, err
+	}
+	args = append(args, "-v", cgroupConfig+":"+cgroupConfigPath+":ro")
 	if joinConfig := doc.JoinConfig(); joinConfig != "" {
 		// The node makes its key and gets its certificate itself:
 		// norca-join runs the agent once it has one, and renews it.
 		args = append(args, "-v", p.cfg.JoinBinary+":/usr/local/bin/norca-join:ro",
 			"--entrypoint", "/usr/local/bin/norca-join", p.cfg.Image,
-			"run", "-config", joinConfig, "--", "/usr/local/bin/norca", "agent", "-config", config)
+			"run", "-config", joinConfig, "--", "/usr/local/bin/norca", "agent", "-config", config, "-config", cgroupConfigPath)
 	} else {
-		args = append(args, "--entrypoint", "/usr/local/bin/norca", p.cfg.Image, "agent", "-config", config)
+		args = append(args, "--entrypoint", "/usr/local/bin/norca", p.cfg.Image, "agent", "-config", config, "-config", cgroupConfigPath)
 	}
 	if _, err := p.cfg.Docker.Run(ctx, args...); err != nil {
 		_ = os.RemoveAll(dir)
@@ -431,7 +507,8 @@ func (p *Provider) start(ctx context.Context, group string, req node.CreateReque
 	return inst, nil
 }
 
-// Delete implements node.Provider: the container and its files go.
+// Delete implements node.Provider: the container, its cgroups and its files
+// go.
 func (p *Provider) Delete(ctx context.Context, group, id string) error {
 	if _, ok := p.cfg.Groups[group]; !ok {
 		return node.ErrUnknownGroup
@@ -444,5 +521,6 @@ func (p *Provider) Delete(ctx context.Context, group, id string) error {
 	if _, err := p.cfg.Docker.Run(ctx, "rm", "-f", id); err != nil && !strings.Contains(err.Error(), "No such container") {
 		return err
 	}
+	p.removeCgroups(id)
 	return os.RemoveAll(filepath.Join(p.cfg.StateDir, id))
 }

@@ -367,7 +367,12 @@ runs on: it reads the files back from the cloud-init document of the
 instance, writes them under `state_dir` and mounts them read-only at their
 paths, mounts the norca binary of the host (`binary`), and runs
 `norca agent -config <the .hcl file>` in `image` (a privileged container
-with the host's cgroups, named after the instance). The containers carry the
+with the host's cgroups, named after the instance). The agent of each
+container keeps the cgroups of its tasks under a parent of its own,
+`norca-node-<instance>.slice` (a `cgroup_parent` the provider adds after the
+configuration of the bootstrap), so the agents of one host do not remove
+each other's task cgroups; the parent is removed with the instance. The
+containers carry the
 labels of the request, so a restart of the provider loses nothing. A node
 that joins with a key of its own runs `norca-join` of the host
 (`join_binary`) with the agent as its child. An instance reports the
