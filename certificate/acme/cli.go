@@ -234,9 +234,15 @@ func httpClient(caFile, what string) (*http.Client, error) {
 	if !pool.AppendCertsFromPEM(raw) {
 		return nil, fmt.Errorf("%s CA file %s: no certificate found", what, caFile)
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
-	client.Transport = transport
+	client.Transport = &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 	return client, nil
 }
 

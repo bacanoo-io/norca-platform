@@ -200,7 +200,8 @@ func (a *acmeAuthority) RenewalInfo(ctx context.Context, leaf, _ *x509.Certifica
 	if err := getJSON(ctx, a.http, a.renewalInfo+"/"+id, &doc); err != nil {
 		return time.Time{}, false
 	}
-	return timeInWindow(doc.SuggestedWindow.Start, doc.SuggestedWindow.End, mrand.Float64())
+	// Where in the window is no secret: any spread will do.
+	return timeInWindow(doc.SuggestedWindow.Start, doc.SuggestedWindow.End, mrand.Float64()) //nolint:gosec // not a secret
 }
 
 // renewalInfoID is the identifier of a certificate for the renewalInfo
@@ -293,8 +294,7 @@ func parsePEM(text string) ([]*x509.Certificate, error) {
 // problemOf writes an error of the certificate authority for the status of
 // an order, and says whether the same request would fail again.
 func problemOf(err error) (text string, permanent bool) {
-	var acmeErr *xacme.Error
-	if errors.As(err, &acmeErr) {
+	if acmeErr, ok := errors.AsType[*xacme.Error](err); ok {
 		text = acmeErr.Detail
 		if text == "" {
 			text = acmeErr.ProblemType
@@ -310,12 +310,10 @@ func problemOf(err error) (text string, permanent bool) {
 		permanent = acmeErr.StatusCode >= 400 && acmeErr.StatusCode < 500 && !rateLimited && !badNonce
 		return text, permanent
 	}
-	var orderErr *xacme.OrderError
-	if errors.As(err, &orderErr) {
+	if orderErr, ok := errors.AsType[*xacme.OrderError](err); ok {
 		return fmt.Sprintf("the order of the certificate authority is %s", orderErr.Status), true
 	}
-	var authzErr *xacme.AuthorizationError
-	if errors.As(err, &authzErr) {
+	if authzErr, ok := errors.AsType[*xacme.AuthorizationError](err); ok {
 		return authzErr.Error(), true
 	}
 	return err.Error(), false

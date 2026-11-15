@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -506,9 +507,7 @@ func (e *env) advance(d time.Duration) {
 // default configuration.
 func (e *env) issuer(name string, config map[string]any) {
 	cfg := map[string]any{"directory": testDirectory, "roots": e.ca.rootPEM()}
-	for k, v := range config {
-		cfg[k] = v
-	}
+	maps.Copy(cfg, config)
 	e.cluster.put(IssuerKind, name, map[string]any{
 		"external": map[string]any{"controller": DefaultController, "config": cfg},
 	}, nil)
