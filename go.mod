@@ -1,6 +1,6 @@
 module github.com/bacanoo-io/norca-platform
 
-go 1.27.3
+go 1.27.4
 
 // The Norca API client and the controller SDK of the checkout next to this
 // repository, as in norca-loadbalancer.
