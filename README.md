@@ -21,6 +21,11 @@ balancers and DNS challenge records with the same credentials.
   `norca-loadbalancer` keeps a `norca.io/LoadBalancer` object for it and has
   the load balancer made by its built-in `nomad` class or by the provider of
   a **load balancer class**.
+- **Certificates from ACME** (`certificate/acme/`): the servers keep the
+  certificates of `norca.io/Certificate` objects; for an issuer that signs
+  through an ACME certificate authority the operator `norca-acme` fulfils
+  their orders, and proves the names over HTTP or through the provider of a
+  **DNS zone**.
 
 ## Layout
 
@@ -44,7 +49,10 @@ loadbalancer/operator/    the LoadBalancer operator, with its kinds (loadbalance
 cmd/norca-provider/       the provider application
 cmd/norca-nodescaler/     the node scaling operator
 cmd/norca-join/           the program on a node that makes its key, joins with a one-time token and renews
+certificate/acme/         the ACME operator: accounts, orders, the HTTP-01 answers, DNS-01 through the DNS
+                          contract; its ACL policy
 cmd/norca-loadbalancer/   the LoadBalancer operator (and the proxy of its nomad class)
+cmd/norca-acme/           the ACME operator
 ```
 
 ## The node scaling operator
@@ -535,6 +543,48 @@ and `loadbalancer-policy.hcl` run it by hand, after
 ```shell
 norca-loadbalancer -objects native -class-ca-file /secrets/ca.pem
 ```
+
+## The ACME operator
+
+`norca-acme` (`certificate/acme`) is the controller of the certificate
+issuers that sign through an ACME certificate authority (RFC 8555), such as
+Let's Encrypt:
+
+```hcl
+kind = "norca.io/CertificateIssuer"
+name = "letsencrypt"
+spec {
+  external {
+    controller = "norca-acme"
+    config {
+      directory = "https://acme-v02.api.letsencrypt.org/directory"
+      email     = "ops@example.com"
+      dns01 { zones = ["example.com"] }
+    }
+  }
+}
+```
+
+The servers make the key and the signing request of a certificate and write
+a `norca.io/CertificateOrder`; the operator places the order with the
+certificate authority, proves every name, has the request signed and writes
+the chain into the status of the order. **It never sees a private key of a
+certificate and reads no secret of a namespace.**
+
+| What | How |
+| --- | --- |
+| Account | One per issuer; the key is a secret of the operator (`norca-acme/accounts/<issuer>`). `eab_secret` names a secret with `kid` and `hmac_key` for an external account binding. Writing the issuer object accepts the terms of the certificate authority. |
+| Status of the issuer | `heartbeat` (every 30 seconds once the account of the issuer is open), `roots`, `account`, `directory`, `problem`. Without a heartbeat the servers order nothing. |
+| Roots | The chains are verified against `roots` of the configuration, or against the roots of the system the operator runs on; the root a chain ends in is declared in the status before the chain is handed on. |
+| DNS-01 | For a name in a `norca.io/DNSZone` of norca-provider (always for a wildcard). The record is added through the DNS contract; the certificate authority is told to look when every name server of the zone answers it (`-dns-propagation-check`, `-dns-resolver`). A zone whose provider has no heartbeat is waited for. |
+| HTTP-01 | For every other name. The operator answers `/.well-known/acme-challenge/<token>` on `-http01-listen`; the edge must route that path of every host to it, also on the port that redirects to https. |
+| Failures | A request the certificate authority refuses fails the order with its problem, which the certificate shows. Its own failures and rate limits are tried again after `-retry-base`, doubled up to `-retry-max`, `-max-attempts` times. |
+| Renewal | The suggestion of the certificate authority (ACME renewal information, RFC 9773) is passed on as `renew_after` of the order. |
+| Revocation | The operator keeps the certificates it issued until they expire (`norca-acme/issued/<issuer>/<serial>`) and revokes the one a revocation order names. |
+| Restart | The order of the certificate authority is in the status of the object; an open challenge is presented again. **Run one instance**: the HTTP-01 answers are in its memory. |
+
+The ACL policy is `certificate/acme/norca-acme-policy.hcl`. The TLS-ALPN-01
+challenge is not supported.
 
 ## Development
 
