@@ -586,6 +586,12 @@ certificate and reads no secret of a namespace.**
 The ACL policy is `certificate/acme/norca-acme-policy.hcl`. The TLS-ALPN-01
 challenge is not supported.
 
+The unit tests run the operator against a certificate authority of the
+test. `certificate/acme/testdata/pebble/run.sh` runs it against Pebble, the
+test certificate authority of the ACME protocol, and a BIND name server in
+containers: an HTTP-01 and a wildcard DNS-01 certificate, the renewal
+information, a revocation.
+
 ## Development
 
 The Norca API client and the controller SDK come from the checkout next to

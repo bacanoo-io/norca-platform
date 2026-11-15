@@ -1,0 +1,7 @@
+; SPDX-FileCopyrightText: 2026 Norca contributors
+; SPDX-License-Identifier: MPL-2.0
+$TTL 60
+@ IN SOA ns.http.lab. admin.http.lab. 1 60 60 3600 60
+@ IN NS ns.http.lab.
+ns IN A 10.30.50.3
+www IN A 10.30.50.5
