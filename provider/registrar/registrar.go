@@ -4,9 +4,9 @@
 // Package registrar writes the objects a provider registers itself with and
 // keeps their heartbeat: a NodeProvider object for a node provider (for the
 // node scaling operator) and a LoadBalancerClass object for every load
-// balancer class (for the LoadBalancer operator). Both say where the
-// operator calls the provider and with which token, and carry the same
-// status: the heartbeat (RFC 3339) and the version of the provider.
+// balancer class (for the LoadBalancer operator), and a DNSZone object for
+// every DNS zone (for norca-acme). All say where the operator calls the
+// provider and with which token, and carry the same status: the heartbeat (RFC 3339) and the version of the provider.
 package registrar
 
 import (
@@ -34,6 +34,9 @@ const (
 	// (loadbalancerclass.kind.hcl).
 	KindLoadBalancerClass = "LoadBalancerClass"
 
+	// KindDNSZone is registered with norca-acme (dnszone.kind.hcl).
+	KindDNSZone = "DNSZone"
+
 	// ManagedBy marks the objects this program owns.
 	ManagedBy = "norca-provider"
 )
@@ -54,8 +57,8 @@ type Store interface {
 	Delete(ctx context.Context, kind, name string) error
 }
 
-// Registration is one object: its kind (KindNodeProvider or
-// KindLoadBalancerClass), its name and its spec.
+// Registration is one object: its kind (KindNodeProvider,
+// KindLoadBalancerClass or KindDNSZone), its name and its spec.
 type Registration struct {
 	Kind string
 	Name string
@@ -138,6 +141,25 @@ func LoadBalancerClass(class, endpoint, tokenVariable string, internal bool, por
 		spec["parameters"] = parameters
 	}
 	return Registration{Kind: KindLoadBalancerClass, Name: class, Spec: spec}
+}
+
+// DNSZone returns the registration of a DNS zone: the name of the zone
+// (the name of the object), the provider of the configuration that serves
+// it, the endpoint the operator calls for the zone, the token Variable and
+// the published parameters.
+func DNSZone(zone, provider, endpoint, tokenVariable string, parameters map[string]any) Registration {
+	spec := map[string]any{
+		"zone":     zone,
+		"provider": provider,
+		"endpoint": endpoint,
+	}
+	if tokenVariable != "" {
+		spec["tokenVariable"] = tokenVariable
+	}
+	if len(parameters) > 0 {
+		spec["parameters"] = parameters
+	}
+	return Registration{Kind: KindDNSZone, Name: zone, Spec: spec}
 }
 
 // Registrar registers the objects of a provider and reports that it is

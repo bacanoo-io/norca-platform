@@ -5,8 +5,9 @@
 // connects Norca to the platforms it runs on. One platform is one type: it
 // creates the machines of node groups for the node scaling operator (the
 // node contract, package node), the load balancers of load balancer classes
-// for the LoadBalancer operator (the load balancer contract, package lb), or
-// both, with the same credentials.
+// for the LoadBalancer operator (the load balancer contract, package lb),
+// the TXT records of DNS zones for the DNS-01 challenges of norca-acme (the
+// DNS contract, package dns), or several of them, with the same credentials.
 //
 // A platform lives in its own package under providers/, declares a Type and
 // registers it in init(), like a database/sql driver:
@@ -21,10 +22,11 @@
 // The binary links the platforms it wants with blank imports (see
 // providers/all). A configuration file (File) then names any number of
 // providers, each an instance of a type with a node section, a load
-// balancer section or both; Build checks it against the types and creates
-// the instances; Server serves all of them on one HTTP server; and the
-// registrar (package registrar) writes their NodeProvider and
-// LoadBalancerClass objects and keeps the heartbeat.
+// balancer section, a dns section or several of them; Build checks it
+// against the types and creates the instances; Server serves all of them on
+// one HTTP server; and the registrar (package registrar) writes their
+// NodeProvider, LoadBalancerClass and DNSZone objects and keeps the
+// heartbeat.
 package provider
 
 import (
@@ -36,23 +38,24 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bacanoo-io/norca-platform/provider/dns"
 	"github.com/bacanoo-io/norca-platform/provider/lb"
 	"github.com/bacanoo-io/norca-platform/provider/node"
 	"github.com/bacanoo-io/norca-platform/provider/params"
 )
 
-// Type is a platform: its ID, the parameters its node and load balancer
-// providers share (the credentials and the API of the platform), and what
-// it implements. A section the type does not implement is nil.
+// Type is a platform: its ID, the parameters its node, load balancer and
+// DNS providers share (the credentials and the API of the platform), and
+// what it implements. A section the type does not implement is nil.
 type Type struct {
 	// ID is the identifier of the type, such as "hcloud" or "mock".
 	ID string
 
 	Description string
 
-	// Params are the parameters shared by the node and the load balancer
-	// provider of the type ("params" of a provider in the configuration).
-	// They cannot be dynamic.
+	// Params are the parameters shared by the providers of the type
+	// ("params" of a provider in the configuration). They cannot be
+	// dynamic.
 	Params []params.Param
 
 	// Node is the node provider of the type; nil if it has none.
@@ -60,6 +63,9 @@ type Type struct {
 
 	// LB is the load balancer provider of the type; nil if it has none.
 	LB *LBSpec
+
+	// DNS is the DNS provider of the type; nil if it has none.
+	DNS *DNSSpec
 }
 
 // NodeSpec is the node provider of a type.
@@ -142,7 +148,19 @@ type LBSpec struct {
 	New func(lb.Config) (lb.Provider, error)
 }
 
-// Capabilities returns what the type implements: "node", "loadbalancer".
+// DNSSpec is the DNS provider of a type.
+type DNSSpec struct {
+	// Params are the parameters of a zone ("dns.zones[].params"). The ones
+	// that are not secret are published in the DNSZone object.
+	Params []params.Param
+
+	// New creates the provider of a zone. dns.Config.Values hold the shared
+	// and the zone parameters.
+	New func(dns.Config) (dns.Provider, error)
+}
+
+// Capabilities returns what the type implements: "node", "loadbalancer",
+// "dns".
 func (t Type) Capabilities() []string {
 	var out []string
 	if t.Node != nil {
@@ -150,6 +168,9 @@ func (t Type) Capabilities() []string {
 	}
 	if t.LB != nil {
 		out = append(out, "loadbalancer")
+	}
+	if t.DNS != nil {
+		out = append(out, "dns")
 	}
 	return out
 }
@@ -198,8 +219,8 @@ func check(t Type) error {
 	if !validTypeID.MatchString(t.ID) {
 		return fmt.Errorf("invalid type ID")
 	}
-	if t.Node == nil && t.LB == nil {
-		return fmt.Errorf("implements neither a node nor a load balancer provider")
+	if t.Node == nil && t.LB == nil && t.DNS == nil {
+		return fmt.Errorf("implements no provider: neither node, load balancer nor dns")
 	}
 	if err := params.Validate(t.Params); err != nil {
 		return fmt.Errorf("params: %w", err)
@@ -252,6 +273,17 @@ func check(t Type) error {
 			return fmt.Errorf("the load balancer provider has no constructor")
 		}
 		if err := distinct("class", l.Params); err != nil {
+			return err
+		}
+	}
+	if d := t.DNS; d != nil {
+		if d.New == nil {
+			return fmt.Errorf("the dns provider has no constructor")
+		}
+		if err := distinct("zone", d.Params); err != nil {
+			return err
+		}
+		if err := fixed("zone", d.Params); err != nil {
 			return err
 		}
 	}
@@ -365,4 +397,41 @@ func newClass(providerName string, t Type, class string, shared, classParams map
 		Name: class, Type: t.ID, Provider: p, Params: t.LB.Params, Values: values,
 		Published: published, Caps: p.Capabilities(),
 	}, nil
+}
+
+// NewZone creates the DNS zone of a type, from the shared and the zone
+// parameters as configured. The configuration goes through Build; NewZone
+// is for tests and programs that serve a zone of their own.
+func (r *Registry) NewZone(zone, typeID string, shared, zoneParams map[string]any) (*dns.Zone, error) {
+	t, err := r.lookup(typeID)
+	if err != nil {
+		return nil, fmt.Errorf("zone %q: %w", zone, err)
+	}
+	return newZone("", t, zone, shared, zoneParams, slog.Default())
+}
+
+// newZone resolves the parameters and runs the constructor of the zone.
+func newZone(providerName string, t Type, zone string, shared, zoneParams map[string]any, log *slog.Logger) (*dns.Zone, error) {
+	if !dns.ValidZone(zone) {
+		return nil, fmt.Errorf("invalid zone name %q", zone)
+	}
+	if t.DNS == nil {
+		return nil, fmt.Errorf("zone %q: type %s has no dns provider", zone, t.ID)
+	}
+	sv, err := params.Resolve(t.Params, shared)
+	if err != nil {
+		return nil, fmt.Errorf("zone %q (type %s): %w", zone, t.ID, err)
+	}
+	zv, err := params.Resolve(t.DNS.Params, zoneParams)
+	if err != nil {
+		return nil, fmt.Errorf("zone %q (type %s): %w", zone, t.ID, err)
+	}
+	values := params.Merge(sv, zv)
+	p, err := t.DNS.New(dns.Config{Provider: providerName, Zone: zone, Values: values, Logger: log})
+	if err != nil {
+		return nil, fmt.Errorf("zone %q (type %s): %w", zone, t.ID, err)
+	}
+	published := params.Published(t.Params, sv)
+	maps.Copy(published, params.Published(t.DNS.Params, zv))
+	return &dns.Zone{Name: zone, Type: t.ID, Provider: p, Values: values, Published: published}, nil
 }

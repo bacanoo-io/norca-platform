@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bacanoo-io/norca-platform/provider/dns"
 	"github.com/bacanoo-io/norca-platform/provider/lb"
 )
 
@@ -28,7 +29,8 @@ import (
 //	    "params": {"token": "${HCLOUD_TOKEN}"},
 //	    "token_file": "/secrets/token", "token_variable": "providers/hetzner-eu",
 //	    "node": {"groups": [{"name": "fsn1", "max": 10, "params": {}}]},
-//	    "loadbalancer": {"classes": [{"class": "hcloud", "params": {"location": "fsn1"}}]}
+//	    "loadbalancer": {"classes": [{"class": "hcloud", "params": {"location": "fsn1"}}]},
+//	    "dns": {"zones": [{"zone": "example.com"}]}
 //	  }]
 //	}
 //
@@ -46,7 +48,8 @@ type File struct {
 	// AdvertiseURL is the base URL the operators reach this process on, for
 	// example "https://provider.service.norca:8443". The endpoint of a node
 	// provider is AdvertiseURL + "/providers/<name>", that of a class
-	// AdvertiseURL + "/classes/<class>".
+	// AdvertiseURL + "/classes/<class>", that of a DNS zone AdvertiseURL +
+	// "/zones/<zone>".
 	AdvertiseURL string `json:"advertise_url"`
 
 	// HeartbeatInterval is how often the status of the registrations is
@@ -78,7 +81,7 @@ type ProviderConfig struct {
 	Params map[string]any `json:"params,omitempty"`
 
 	// Token is the bearer token the operators must send, for the node
-	// contract and for every class of the provider; "env:NAME" and
+	// contract and for every class and zone of the provider; "env:NAME" and
 	// "file:/path" are resolved. TokenFile names a file with it instead.
 	// One of them is required unless NoAuth is set.
 	Token     string `json:"token,omitempty"`
@@ -97,6 +100,28 @@ type ProviderConfig struct {
 
 	// LoadBalancer is the load balancer section; nil serves no class.
 	LoadBalancer *LBSection `json:"loadbalancer,omitempty"`
+
+	// DNS is the DNS section; nil serves no zone.
+	DNS *DNSSection `json:"dns,omitempty"`
+}
+
+// DNSSection configures the DNS zones of a provider.
+type DNSSection struct {
+	Zones []ZoneConfig `json:"zones"`
+}
+
+// ZoneConfig is a DNS zone the provider writes TXT records in.
+type ZoneConfig struct {
+	// Zone is the name of the zone, such as "example.com". Unique in the
+	// file. It is the name of the DNSZone object.
+	Zone string `json:"zone"`
+
+	// Params are the zone parameters of the type.
+	Params map[string]any `json:"params,omitempty"`
+
+	// Endpoint is the full URL the operator calls for this zone. Without it
+	// the endpoint is advertise_url + "/zones/<zone>".
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 // NodeSection configures the node provider of a provider.
@@ -266,6 +291,7 @@ func (f *File) Validate() error {
 	}
 	names := map[string]bool{}
 	classes := map[string]string{}
+	zones := map[string]string{}
 	for i, p := range f.Providers {
 		if !ValidName(p.Name) {
 			return fmt.Errorf("providers[%d]: invalid name %q", i, p.Name)
@@ -283,8 +309,27 @@ func (f *File) Validate() error {
 		case p.Token == "" && p.TokenFile == "" && !p.NoAuth:
 			return fmt.Errorf("provider %q: token or token_file is required (or no_auth for a trusted network)", p.Name)
 		}
-		if p.Node == nil && p.LoadBalancer == nil {
-			return fmt.Errorf("provider %q: has neither a node nor a loadbalancer section", p.Name)
+		if p.Node == nil && p.LoadBalancer == nil && p.DNS == nil {
+			return fmt.Errorf("provider %q: has no node, loadbalancer or dns section", p.Name)
+		}
+		if d := p.DNS; d != nil {
+			if len(d.Zones) == 0 {
+				return fmt.Errorf("provider %q: dns: at least one zone is required", p.Name)
+			}
+			for j := range d.Zones {
+				z := &d.Zones[j]
+				z.Zone = dns.Normalize(z.Zone)
+				if !dns.ValidZone(z.Zone) {
+					return fmt.Errorf("provider %q: dns.zones[%d]: invalid zone name %q", p.Name, j, z.Zone)
+				}
+				if other, dup := zones[z.Zone]; dup {
+					return fmt.Errorf("zone %q is configured twice (providers %q and %q)", z.Zone, other, p.Name)
+				}
+				zones[z.Zone] = p.Name
+				if err := checkEndpoint(z.Endpoint, f.AdvertiseURL); err != nil {
+					return fmt.Errorf("zone %q: %w", z.Zone, err)
+				}
+			}
 		}
 		if n := p.Node; n != nil {
 			if err := checkEndpoint(n.Endpoint, f.AdvertiseURL); err != nil {

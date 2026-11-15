@@ -15,6 +15,7 @@ import (
 	_ "github.com/bacanoo-io/norca-platform/providers/hcloud"
 	_ "github.com/bacanoo-io/norca-platform/providers/mock"
 	_ "github.com/bacanoo-io/norca-platform/providers/nginx"
+	_ "github.com/bacanoo-io/norca-platform/providers/rfc2136"
 	_ "github.com/bacanoo-io/norca-platform/providers/scaleway"
 	_ "github.com/bacanoo-io/norca-platform/providers/tcpproxy"
 	_ "github.com/bacanoo-io/norca-platform/providers/vultr"

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/bacanoo-io/norca-platform/provider/dns"
 	"github.com/bacanoo-io/norca-platform/provider/lb"
 	"github.com/bacanoo-io/norca-platform/provider/node"
 	"github.com/bacanoo-io/norca-platform/provider/params"
@@ -27,6 +28,7 @@ const (
 	ServeAll  Serve = "all"
 	ServeNode Serve = "node"
 	ServeLB   Serve = "lb"
+	ServeDNS  Serve = "dns"
 )
 
 // ParseServe reads the -serve flag; empty is ServeAll.
@@ -34,20 +36,38 @@ func ParseServe(s string) (Serve, error) {
 	switch v := Serve(s); v {
 	case "":
 		return ServeAll, nil
-	case ServeAll, ServeNode, ServeLB:
+	case ServeAll, ServeNode, ServeLB, ServeDNS:
 		return v, nil
 	}
-	return "", fmt.Errorf("serve %q: want node, lb or all", s)
+	return "", fmt.Errorf("serve %q: want node, lb, dns or all", s)
 }
 
 func (s Serve) node() bool { return s == ServeAll || s == ServeNode || s == "" }
 func (s Serve) lb() bool   { return s == ServeAll || s == ServeLB || s == "" }
+func (s Serve) dns() bool  { return s == ServeAll || s == ServeDNS || s == "" }
 
-// Runtime is a built configuration: the node providers and the classes this
-// process serves.
+// Runtime is a built configuration: the node providers, the classes and the
+// DNS zones this process serves.
 type Runtime struct {
 	Nodes   []*NodeProvider
 	Classes []*ServedClass
+	Zones   []*ServedZone
+}
+
+// ServedZone is a served DNS zone.
+type ServedZone struct {
+	*dns.Zone
+
+	// ProviderName is the provider of the configuration the zone belongs
+	// to.
+	ProviderName string
+
+	// Endpoint is the URL the operator calls (in the DNSZone object).
+	Endpoint string
+
+	// Token is the bearer token of the calls; empty with no_auth.
+	Token         string
+	TokenVariable string
 }
 
 // NodeProvider is a served node provider.
@@ -95,6 +115,9 @@ func (rt *Runtime) Registrations() []registrar.Registration {
 	for _, c := range rt.Classes {
 		out = append(out, registrar.LoadBalancerClass(c.Name, c.Endpoint, c.TokenVariable, c.Caps.Internal, c.Caps.Ports, c.Published))
 	}
+	for _, z := range rt.Zones {
+		out = append(out, registrar.DNSZone(z.Name, z.ProviderName, z.Endpoint, z.TokenVariable, z.Published))
+	}
 	return out
 }
 
@@ -102,6 +125,9 @@ func (rt *Runtime) Registrations() []registrar.Registration {
 func (rt *Runtime) Close() {
 	for _, c := range rt.Classes {
 		_ = c.Close()
+	}
+	for _, z := range rt.Zones {
+		_ = z.Close()
 	}
 	for _, n := range rt.Nodes {
 		if cl, ok := n.Provider.(io.Closer); ok {
@@ -123,6 +149,9 @@ func (f *File) Check(reg *Registry) error {
 		}
 		if p.LoadBalancer != nil && t.LB == nil {
 			return fmt.Errorf("provider %q: type %s has no load balancer provider", p.Name, t.ID)
+		}
+		if p.DNS != nil && t.DNS == nil {
+			return fmt.Errorf("provider %q: type %s has no dns provider", p.Name, t.ID)
 		}
 	}
 	return nil
@@ -177,9 +206,22 @@ func (f *File) Build(reg *Registry, serve Serve, log *slog.Logger) (*Runtime, er
 				}
 			}
 		}
+		if p.DNS != nil && serve.dns() {
+			for _, zc := range p.DNS.Zones {
+				z, err := newZone(p.Name, t, zc.Zone, p.Params, zc.Params, log)
+				if err != nil {
+					return fail(fmt.Errorf("provider %q: %w", p.Name, err))
+				}
+				sz := &ServedZone{Zone: z, ProviderName: p.Name, Endpoint: zc.Endpoint, Token: token, TokenVariable: p.TokenVariable}
+				if sz.Endpoint == "" {
+					sz.Endpoint = base + "/zones/" + zc.Zone
+				}
+				rt.Zones = append(rt.Zones, sz)
+			}
+		}
 	}
-	if len(rt.Nodes) == 0 && len(rt.Classes) == 0 {
-		return nil, fmt.Errorf("nothing to serve: the configuration has no %s section", map[Serve]string{ServeNode: "node", ServeLB: "loadbalancer"}[serve])
+	if len(rt.Nodes) == 0 && len(rt.Classes) == 0 && len(rt.Zones) == 0 {
+		return nil, fmt.Errorf("nothing to serve: the configuration has no %s section", map[Serve]string{ServeNode: "node", ServeLB: "loadbalancer", ServeDNS: "dns"}[serve])
 	}
 	return rt, nil
 }

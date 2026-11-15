@@ -4,7 +4,7 @@
 // Package mock is the platform "mock": it keeps everything in memory and
 // creates nothing, for trying the operators and the provider contracts
 // without a platform, and as a model of how a platform is written. It has a
-// node provider and a load balancer provider.
+// node provider, a load balancer provider and a DNS provider.
 //
 // The node provider keeps the instances it is asked for. An instance is
 // running as soon as it is created, with the addresses of the n-th instance
@@ -14,6 +14,9 @@
 //
 // The load balancer provider keeps the load balancers it is asked for and
 // reports the address of its class as their frontend.
+//
+// The DNS provider keeps the TXT records it is asked for and serves them to
+// nobody.
 package mock
 
 import (
@@ -45,6 +48,10 @@ func init() {
 		LB: &provider.LBSpec{
 			Params: classParams,
 			New:    NewLB,
+		},
+		DNS: &provider.DNSSpec{
+			Params: zoneParams,
+			New:    NewDNS,
 		},
 	})
 }

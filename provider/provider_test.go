@@ -188,7 +188,7 @@ func TestParse_Errors(t *testing.T) {
 	cases := map[string]struct{ content, want string }{
 		"unknown field": {`{"advertise_url":"https://x","bogus":1,"providers":[]}`, "bogus"},
 		"no providers":  {`{"advertise_url":"https://x"}`, "at least one provider"},
-		"no section":    {`{"advertise_url":"https://x","providers":[{"name":"p","type":"mock","no_auth":true}]}`, "neither a node nor a loadbalancer section"},
+		"no section":    {`{"advertise_url":"https://x","providers":[{"name":"p","type":"mock","no_auth":true}]}`, "has no node, loadbalancer or dns section"},
 		"no advertise":  {`{"providers":[{"name":"p","type":"mock","no_auth":true,"loadbalancer":{"classes":[{"class":"a"}]}}]}`, "needs an endpoint, or advertise_url"},
 		"no token":      {`{"advertise_url":"https://x","providers":[{"name":"p","type":"mock","loadbalancer":{"classes":[{"class":"a"}]}}]}`, "token or token_file is required"},
 		"two tokens":    {`{"advertise_url":"https://x","providers":[{"name":"p","type":"mock","token":"a","token_file":"b","loadbalancer":{"classes":[{"class":"a"}]}}]}`, "exclude each other"},
@@ -374,7 +374,7 @@ func TestServer_BothContracts(t *testing.T) {
 		Capabilities []string `json:"capabilities"`
 	}
 	getJSON(t, srv.URL+"/v1/types", &types)
-	if len(types) != 3 || types[0].ID != "lbonly" || strings.Join(types[1].Capabilities, ",") != "node,loadbalancer" {
+	if len(types) != 3 || types[0].ID != "lbonly" || strings.Join(types[1].Capabilities, ",") != "node,loadbalancer,dns" {
 		t.Fatalf("types: %+v", types)
 	}
 	var classes []map[string]any

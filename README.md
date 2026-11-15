@@ -10,8 +10,8 @@ one repository. An operator is an application outside the core that turns
 objects of the operator framework into things of a platform; the provider
 application, `norca-provider`, knows the platforms (a cloud, the VMs of a
 lab) and keeps their credentials. **One platform is one directory under
-`providers/` and one type of `norca-provider`**, serving node scaling and
-load balancers with the same credentials.
+`providers/` and one type of `norca-provider`**, serving node scaling, load
+balancers and DNS challenge records with the same credentials.
 
 - **Node scaling** (`nodescaler/`): the core decides how many nodes a
   `NodeGroup` should have (`spec.replicas`); the operator `norca-nodescaler`
@@ -31,9 +31,11 @@ provider/params/          the typed parameters of a type (required, secret, dyna
 provider/wire/            what both contracts share: the error shape and the bearer token
 provider/node/            the node contract: types, handler, client of the operator; providertest checks a provider
 provider/lb/              the load balancer contract: types, handler, client of the operator; lbtest checks a provider
-provider/registrar/       the NodeProvider and LoadBalancerClass objects of the providers and their heartbeat
+provider/dns/             the DNS contract: types, handler, client of the operator, the DNSZone kind; dnstest checks a provider
+provider/registrar/       the NodeProvider, LoadBalancerClass and DNSZone objects of the providers and their heartbeat
 providers/<platform>/     one directory per platform: aws, gcp, hcloud, digitalocean, vultr, scaleway,
-                          nginx, tcpproxy (load balancers), docker (nodes), mock (both); all links them
+                          nginx, tcpproxy (load balancers), docker (nodes), rfc2136 (DNS), mock (all three);
+                          all links them
 nodescaler/operator/      the node scaling operator: reconciles the NodeGroup objects with their providers
 nodescaler/bootstrap/     the bootstrap of a machine: the node's certificate and agent configuration, as cloud-init
 nodescaler/join/          the hardened node identity: the join endpoint of the operator and norca-join on the node
@@ -219,14 +221,14 @@ norca-nodescaler -region eu -provider-ttl 3m -token-namespace default
 `norca-provider` serves the providers its configuration file names, on one
 HTTP server, and registers them in Norca: a `norca.io/NodeProvider` object
 for a node provider, a `norca.io/LoadBalancerClass` object for each load
-balancer class, both with the same status (`heartbeat`, RFC 3339, and
-`version`), updated every `heartbeat_interval` (30 seconds), registered
+balancer class, a `norca.io/DNSZone` object for each DNS zone, all with the
+same status (`heartbeat`, RFC 3339, and `version`), updated every `heartbeat_interval` (30 seconds), registered
 again when an object disappears and removed on exit
 (`-deregister-on-exit`). `-register=false` serves without touching Norca.
 
-**Types.** A type is a platform. It declares the parameters its two sides
+**Types.** A type is a platform. It declares the parameters its sides
 share (the credentials, the API of the platform) and implements a node
-provider, a load balancer provider or both:
+provider, a load balancer provider, a DNS provider or several of them:
 
 ```
 $ norca-provider types
@@ -428,10 +430,57 @@ The load balancer platforms:
   private ones where the cloud has them, with dynamic parameters for the type
   or size and the algorithm.
 
+## The DNS contract
+
+For the DNS-01 challenge of ACME an operator has to put a TXT record into a
+zone. A zone is registered with a `norca.io/DNSZone` object (the zone, the
+provider that serves it, its endpoint, the Variable with its token; the kind
+is `provider/dns/dnszone.kind.hcl`) and keeps a heartbeat in the status. The
+operator calls it:
+
+```
+PUT    {endpoint}/v1/txt/{name}   add a value to the TXT records of the name (idempotent)
+DELETE {endpoint}/v1/txt/{name}   remove that value
+```
+
+with a bearer token and the body `{"value": "...", "ttl": 60}`. **The
+contract writes challenge records and nothing else:** a name is
+`_acme-challenge.<a name of the zone>`, so the token of a zone cannot change
+what the zone serves. A name holds several values at once (a name and its
+wildcard are proven at the same challenge name), and a clean up removes one
+value and leaves the others. A failure has the shape of the other contracts:
+422 for a request the provider cannot satisfy, 502 for a failure of the
+platform. The provider answers when the platform has accepted the change;
+the operator waits for the name servers itself. See the package
+documentation of `provider/dns`; **`provider/dns/dnstest`** checks a
+provider the way `lbtest` does for load balancers.
+
+A zone is configured in the `dns` section of a provider:
+
+```json
+{
+  "name": "dns-eu", "type": "rfc2136",
+  "params": {"server": "ns1.example.com", "tsig_key": "norca-acme", "tsig_secret": "env:TSIG_SECRET"},
+  "token_file": "/secrets/dns-token", "token_variable": "providers/dns-eu",
+  "dns": {"zones": [{"zone": "example.com"}, {"zone": "example.org"}]}
+}
+```
+
+The DNS platforms:
+
+- **rfc2136**: dynamic updates (RFC 2136) signed with a TSIG key (RFC 8945),
+  for BIND, Knot DNS, PowerDNS and other servers that accept them. `server`
+  is the primary of the zones; the algorithm is `hmac-sha256` unless
+  `tsig_algorithm` says `hmac-sha384` or `hmac-sha512`. One update message
+  over TCP per call.
+- **mock**: keeps the records in memory and serves them to nobody; `fail`
+  and `latency` simulate an outage and a slow API.
+
 ## Adding a platform
 
 1. Create `providers/<id>/`, implement `node.Provider` (`Group`, `Create`,
-   `Delete`) and/or `lb.Provider` (`Capabilities`, `Ensure`, `Delete`).
+   `Delete`), `lb.Provider` (`Capabilities`, `Ensure`, `Delete`) and/or
+   `dns.Provider` (`Present`, `CleanUp`).
 2. Declare the parameters and register the type in `init()`:
 
    ```go
@@ -448,6 +497,7 @@ The load balancer platforms:
            ID: "hcloud", Description: "Hetzner Cloud", Params: shared,
            Node: &provider.NodeSpec{GroupParams: groupParams, New: newNode}, // nil without node provider
            LB:   &provider.LBSpec{Params: classParams, New: NewLB},          // nil without load balancers
+           DNS:  &provider.DNSSpec{Params: zoneParams, New: NewDNS},         // nil without DNS zones
        })
    }
    ```
@@ -456,14 +506,17 @@ The load balancer platforms:
 
 A constructor gets the resolved shared parameters together with those of its
 section (`provider.NodeConfig`: the node parameters and the groups with
-their parameters and max; `lb.Config`: the class parameters). `Ensure`
+their parameters and max; `lb.Config`: the class parameters; `dns.Config`:
+the zone and its parameters). `Ensure`
 receives the whole desired state each time and must be idempotent; `Delete`
 must accept what does not exist. An error wrapping `lb.ErrInvalid`
 (`lb.Invalid(...)`) means the request cannot be satisfied. The server
 serializes the calls for one load balancer. A platform with no state of its
 own should find its resources by a name derived from the request (the
 instance name, the namespace and name of the load balancer) or by a tag, so
-it survives a restart. Run `providertest` and `lbtest` in its tests.
+it survives a restart. `Present` and `CleanUp` of a DNS provider work on one
+value of the TXT records of a name and must leave the other values alone.
+Run `providertest`, `lbtest` and `dnstest` in its tests.
 
 ## The LoadBalancer operator
 

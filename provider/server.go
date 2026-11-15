@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/bacanoo-io/norca-platform/provider/dns"
 	"github.com/bacanoo-io/norca-platform/provider/lb"
 	"github.com/bacanoo-io/norca-platform/provider/node"
 	"github.com/bacanoo-io/norca-platform/provider/params"
@@ -20,13 +21,15 @@ import (
 //
 //	/providers/{name}/v1/groups/...           the node contract of a provider (package node)
 //	/classes/{class}/v1/loadbalancers/...     the load balancer contract of a class (package lb)
+//	/zones/{zone}/v1/txt/...                  the DNS contract of a zone (package dns)
 //	GET /healthz                              the health check
 //	GET /v1/types                             the linked types, their capabilities and parameters
 //	GET /v1/providers                         the served node providers and classes
 //	GET /v1/classes                           the served classes
+//	GET /v1/zones                             the served DNS zones
 //
-// Every provider checks its own token, for its node contract and its
-// classes alike; failures have the shape of package wire.
+// Every provider checks its own token, for its node contract, its classes
+// and its zones alike; failures have the shape of package wire.
 func NewHandler(rt *Runtime, types []Type, log *slog.Logger) http.Handler {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -52,6 +55,13 @@ func NewHandler(rt *Runtime, types []Type, log *slog.Logger) http.Handler {
 		prefix := "/classes/" + c.Name
 		mux.Handle(prefix+"/", http.StripPrefix(prefix, lb.NewHandler(c.Class, c.Token, log)))
 	}
+	mux.HandleFunc("GET /v1/zones", func(w http.ResponseWriter, _ *http.Request) {
+		wire.WriteJSON(w, http.StatusOK, describeZones(rt.Zones))
+	})
+	for _, z := range rt.Zones {
+		prefix := "/zones/" + z.Name
+		mux.Handle(prefix+"/", http.StripPrefix(prefix, dns.NewHandler(z.Zone, z.Token, log)))
+	}
 	// What no route takes: an unknown provider or class, in the shape of
 	// the contracts.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -61,6 +71,8 @@ func NewHandler(rt *Runtime, types []Type, log *slog.Logger) http.Handler {
 			msg = "unknown provider"
 		case strings.HasPrefix(r.URL.Path, "/classes/"):
 			msg = "unknown class"
+		case strings.HasPrefix(r.URL.Path, "/zones/"):
+			msg = "unknown zone"
 		}
 		wire.WriteError(w, http.StatusNotFound, wire.ReasonInvalid, msg)
 	})
@@ -75,6 +87,12 @@ type TypeInfo struct {
 	Parameters   []params.Info `json:"parameters"`
 	Node         *NodeInfo     `json:"node,omitempty"`
 	LoadBalancer *LBInfo       `json:"loadbalancer,omitempty"`
+	DNS          *DNSInfo      `json:"dns,omitempty"`
+}
+
+// DNSInfo describes the DNS provider of a type.
+type DNSInfo struct {
+	ZoneParameters []params.Info `json:"zone_parameters"`
 }
 
 // NodeInfo describes the node provider of a type.
@@ -99,6 +117,9 @@ func describeTypes(types []Type) []TypeInfo {
 		if t.LB != nil {
 			info.LoadBalancer = &LBInfo{ClassParameters: params.Infos(t.LB.Params)}
 		}
+		if t.DNS != nil {
+			info.DNS = &DNSInfo{ZoneParameters: params.Infos(t.DNS.Params)}
+		}
 		out = append(out, info)
 	}
 	return out
@@ -110,6 +131,28 @@ type providerInfo struct {
 	Node         *nodeInfo   `json:"node,omitempty"`
 	TokenChecked bool        `json:"tokenChecked"`
 	Classes      []classInfo `json:"classes,omitempty"`
+	Zones        []zoneInfo  `json:"zones,omitempty"`
+}
+
+type zoneInfo struct {
+	Zone         string         `json:"zone"`
+	Provider     string         `json:"provider"`
+	Type         string         `json:"type"`
+	Endpoint     string         `json:"endpoint"`
+	Parameters   map[string]any `json:"parameters"`
+	TokenChecked bool           `json:"tokenChecked"`
+}
+
+func describeZones(zones []*ServedZone) []zoneInfo {
+	out := make([]zoneInfo, 0, len(zones))
+	for _, z := range zones {
+		out = append(out, zoneInfo{
+			Zone: z.Name, Provider: z.ProviderName, Type: z.Type, Endpoint: z.Endpoint,
+			Parameters: z.Published, TokenChecked: z.Token != "",
+		})
+	}
+	slices.SortFunc(out, func(a, b zoneInfo) int { return strings.Compare(a.Zone, b.Zone) })
+	return out
 }
 
 type nodeInfo struct {
@@ -170,6 +213,10 @@ func describeProviders(rt *Runtime) []providerInfo {
 	for _, c := range describeClasses(rt.Classes) {
 		p := get(c.Provider, c.Type, c.TokenChecked)
 		p.Classes = append(p.Classes, c)
+	}
+	for _, z := range describeZones(rt.Zones) {
+		p := get(z.Provider, z.Type, z.TokenChecked)
+		p.Zones = append(p.Zones, z)
 	}
 	slices.Sort(order)
 	out := make([]providerInfo, 0, len(order))

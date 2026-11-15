@@ -23,7 +23,7 @@ func TestPrintTypes(t *testing.T) {
 	printTypes(&buf, provider.Default)
 	out := buf.String()
 	for _, want := range []string{
-		"mock - in memory, for trials and tests [node, loadbalancer]",
+		"mock - in memory, for trials and tests [node, loadbalancer, dns]",
 		"docker - ", "[node]", "nginx - ", "tcpproxy - ", "hcloud - ",
 		"node.groups[].params:", "loadbalancer.classes[].params:", "config_dir", "advertise_address", "host_addresses",
 	} {
@@ -38,7 +38,7 @@ func TestRun_Flags(t *testing.T) {
 	if err := run(context.Background(), []string{"-version"}, &out); err != nil || strings.TrimSpace(out.String()) != "dev" {
 		t.Fatalf("-version: %q %v", out.String(), err)
 	}
-	if err := run(context.Background(), []string{"-serve", "both"}, &out); err == nil || !strings.Contains(err.Error(), "want node, lb or all") {
+	if err := run(context.Background(), []string{"-serve", "both"}, &out); err == nil || !strings.Contains(err.Error(), "want node, lb, dns or all") {
 		t.Fatalf("-serve both: %v", err)
 	}
 	cfg := filepath.Join(t.TempDir(), "providers.json")

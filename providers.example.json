@@ -52,6 +52,14 @@
       }
     },
     {
+      "name": "dns-eu",
+      "type": "rfc2136",
+      "params": { "server": "ns1.example.com", "tsig_key": "norca-acme", "tsig_secret": "env:TSIG_SECRET" },
+      "token_file": "/secrets/dns-token",
+      "token_variable": "providers/dns-eu",
+      "dns": { "zones": [ { "zone": "example.com" }, { "zone": "example.org" } ] }
+    },
+    {
       "name": "mock",
       "type": "mock",
       "no_auth": true,
