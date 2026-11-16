@@ -122,6 +122,11 @@ type ZoneConfig struct {
 	// Endpoint is the full URL the operator calls for this zone. Without it
 	// the endpoint is advertise_url + "/zones/<zone>".
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// Records lets norca-dns write the records of the zone (A, AAAA,
+	// CNAME, TXT) through the records contract. Off by default: the zone
+	// then serves only the challenge records of norca-acme.
+	Records bool `json:"records,omitempty"`
 }
 
 // NodeSection configures the node provider of a provider.

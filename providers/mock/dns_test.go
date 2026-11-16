@@ -41,3 +41,42 @@ func TestMockDNS_Fail(t *testing.T) {
 		t.Fatal("a zone set to fail presented a record")
 	}
 }
+
+// The DNS provider of the mock keeps the records contract.
+func TestRecordsContract_MockDNS(t *testing.T) {
+	var current *mock.DNS
+	dnstest.RunRecords(t, dnstest.RecordsConfig{
+		Zone: "example.com",
+		New: func(t *testing.T) dns.Provider {
+			z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current = z.Provider.(*mock.DNS)
+			return current
+		},
+		Lookup: func(_ *testing.T, name, recordType string) []string { return current.RecordValues(name, recordType) },
+	})
+}
+
+// A CNAME stands alone at its name.
+func TestMockDNS_CNAMEAlone(t *testing.T) {
+	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := z.Provider.(*mock.DNS)
+	ctx := context.Background()
+	if err := p.SetRecords(ctx, dns.RecordSet{Name: "www.example.com", Type: dns.TypeA, TTL: 60, Values: []string{"192.0.2.1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetRecords(ctx, dns.RecordSet{Name: "www.example.com", Type: dns.TypeCNAME, TTL: 60, Values: []string{"web.example.com"}}); err == nil {
+		t.Fatal("a CNAME was set next to an A record")
+	}
+	if err := p.SetRecords(ctx, dns.RecordSet{Name: "alias.example.com", Type: dns.TypeCNAME, TTL: 60, Values: []string{"web.example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetRecords(ctx, dns.RecordSet{Name: "alias.example.com", Type: dns.TypeTXT, TTL: 60, Values: []string{"x"}}); err == nil {
+		t.Fatal("a TXT record was set next to a CNAME")
+	}
+}

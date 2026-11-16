@@ -10,6 +10,7 @@
         "provider":      {"type": "string", "description": "Name of the provider of the norca-provider configuration that serves the zone"},
         "endpoint":      {"type": "string", "pattern": "^https?://", "description": "Base URL of the DNS contract of the zone"},
         "tokenVariable": {"type": "string", "description": "Path of the Variable whose item token is the bearer token of the calls"},
+        "records":       {"type": "boolean", "description": "Whether norca-dns may write the records of the zone (the records contract)"},
         "parameters":    {"type": "object", "description": "Published settings of the provider; never a secret"}
       }
     },

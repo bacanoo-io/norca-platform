@@ -116,7 +116,7 @@ func (rt *Runtime) Registrations() []registrar.Registration {
 		out = append(out, registrar.LoadBalancerClass(c.Name, c.Endpoint, c.TokenVariable, c.Caps.Internal, c.Caps.Ports, c.Published))
 	}
 	for _, z := range rt.Zones {
-		out = append(out, registrar.DNSZone(z.Name, z.ProviderName, z.Endpoint, z.TokenVariable, z.Published))
+		out = append(out, registrar.DNSZone(z.Name, z.ProviderName, z.Endpoint, z.TokenVariable, z.Records, z.Published))
 	}
 	return out
 }
@@ -211,6 +211,12 @@ func (f *File) Build(reg *Registry, serve Serve, log *slog.Logger) (*Runtime, er
 				z, err := newZone(p.Name, t, zc.Zone, p.Params, zc.Params, log)
 				if err != nil {
 					return fail(fmt.Errorf("provider %q: %w", p.Name, err))
+				}
+				if zc.Records {
+					if _, ok := z.Provider.(dns.RecordProvider); !ok {
+						return fail(fmt.Errorf("provider %q: zone %q: type %s can't write records (records = true)", p.Name, zc.Zone, t.ID))
+					}
+					z.Records = true
 				}
 				sz := &ServedZone{Zone: z, ProviderName: p.Name, Endpoint: zc.Endpoint, Token: token, TokenVariable: p.TokenVariable}
 				if sz.Endpoint == "" {

@@ -141,6 +141,7 @@ type zoneInfo struct {
 	Endpoint     string         `json:"endpoint"`
 	Parameters   map[string]any `json:"parameters"`
 	TokenChecked bool           `json:"tokenChecked"`
+	Records      bool           `json:"records"`
 }
 
 func describeZones(zones []*ServedZone) []zoneInfo {
@@ -148,7 +149,7 @@ func describeZones(zones []*ServedZone) []zoneInfo {
 	for _, z := range zones {
 		out = append(out, zoneInfo{
 			Zone: z.Name, Provider: z.ProviderName, Type: z.Type, Endpoint: z.Endpoint,
-			Parameters: z.Published, TokenChecked: z.Token != "",
+			Parameters: z.Published, TokenChecked: z.Token != "", Records: z.Records,
 		})
 	}
 	slices.SortFunc(out, func(a, b zoneInfo) int { return strings.Compare(a.Zone, b.Zone) })

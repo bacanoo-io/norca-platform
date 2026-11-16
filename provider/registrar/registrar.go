@@ -145,13 +145,16 @@ func LoadBalancerClass(class, endpoint, tokenVariable string, internal bool, por
 
 // DNSZone returns the registration of a DNS zone: the name of the zone
 // (the name of the object), the provider of the configuration that serves
-// it, the endpoint the operator calls for the zone, the token Variable and
-// the published parameters.
-func DNSZone(zone, provider, endpoint, tokenVariable string, parameters map[string]any) Registration {
+// it, the endpoint the operator calls for the zone, the token Variable,
+// whether norca-dns may write its records, and the published parameters.
+func DNSZone(zone, provider, endpoint, tokenVariable string, records bool, parameters map[string]any) Registration {
 	spec := map[string]any{
 		"zone":     zone,
 		"provider": provider,
 		"endpoint": endpoint,
+	}
+	if records {
+		spec["records"] = true
 	}
 	if tokenVariable != "" {
 		spec["tokenVariable"] = tokenVariable

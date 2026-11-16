@@ -128,6 +128,11 @@ type Zone struct {
 
 	// Published are the parameters written to the DNSZone object.
 	Published map[string]any
+
+	// Records serves the records contract for the zone (records.go): the
+	// configuration of the zone allows it and the provider is a
+	// RecordProvider.
+	Records bool
 }
 
 // Close releases the provider if it holds resources.

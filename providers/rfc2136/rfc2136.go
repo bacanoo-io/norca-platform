@@ -3,7 +3,9 @@
 
 // Package rfc2136 is the platform "rfc2136": a DNS provider for name servers
 // that accept dynamic updates (RFC 2136) signed with a TSIG key (RFC 8945),
-// such as BIND, Knot DNS and PowerDNS. It has a DNS provider only.
+// such as BIND, Knot DNS and PowerDNS. It has a DNS provider only, which
+// writes the challenge records of norca-acme and, with records = true, the
+// records of norca-dns.
 //
 // A value is added to and removed from the TXT records of a name with one
 // update message each, sent over TCP to the server of the provider (the
@@ -17,6 +19,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -116,17 +119,129 @@ func (p *Provider) CleanUp(ctx context.Context, rec dns.Record) error {
 	return p.update(ctx, rec, func(m *mdns.Msg, rr mdns.RR) { m.Remove([]mdns.RR{rr}) })
 }
 
-// update sends one update message for the record and reads the answer of
-// the server.
+// update sends one update message for a challenge record.
 func (p *Provider) update(ctx context.Context, rec dns.Record, change func(*mdns.Msg, mdns.RR)) error {
 	rr := &mdns.TXT{
 		Hdr: mdns.RR_Header{Name: mdns.Fqdn(rec.Name), Rrtype: mdns.TypeTXT, Class: mdns.ClassINET, Ttl: uint32(rec.TTL)}, //nolint:gosec // the TTL is 1 to 3600
 		Txt: []string{rec.Value},
 	}
+	return p.send(ctx, rec.Name, func(m *mdns.Msg) { change(m, rr) })
+}
+
+// The records contract: the record sets are read with queries to the server
+// of the provider (the primary of the zone, which answers with authority)
+// and written with one update message each, which the server applies at
+// once: the old values of the name and type go and the new ones come in
+// the same message.
+
+var recordTypeCodes = map[string]uint16{
+	dns.TypeA:     mdns.TypeA,
+	dns.TypeAAAA:  mdns.TypeAAAA,
+	dns.TypeCNAME: mdns.TypeCNAME,
+	dns.TypeTXT:   mdns.TypeTXT,
+}
+
+// Records implements dns.RecordProvider.
+func (p *Provider) Records(ctx context.Context, name string) ([]dns.RecordSet, error) {
+	client := &mdns.Client{Net: "tcp", Timeout: p.timeout}
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	var out []dns.RecordSet
+	for _, t := range dns.RecordTypes {
+		code := recordTypeCodes[t]
+		q := new(mdns.Msg)
+		q.SetQuestion(mdns.Fqdn(name), code)
+		q.RecursionDesired = false
+		reply, _, err := client.ExchangeContext(ctx, q, p.server)
+		if err != nil {
+			return nil, fmt.Errorf("query of %s %s on %s: %w", name, t, p.server, err)
+		}
+		if reply.Rcode != mdns.RcodeSuccess && reply.Rcode != mdns.RcodeNameError {
+			return nil, fmt.Errorf("query of %s %s on %s: the server answered %s", name, t, p.server, mdns.RcodeToString[reply.Rcode])
+		}
+		set := dns.RecordSet{Name: name, Type: t}
+		for _, rr := range reply.Answer {
+			h := rr.Header()
+			if h.Rrtype != code || dns.Normalize(h.Name) != name {
+				continue
+			}
+			set.TTL = int(h.Ttl)
+			switch v := rr.(type) {
+			case *mdns.A:
+				set.Values = append(set.Values, v.A.String())
+			case *mdns.AAAA:
+				set.Values = append(set.Values, v.AAAA.String())
+			case *mdns.CNAME:
+				set.Values = append(set.Values, dns.Normalize(v.Target))
+			case *mdns.TXT:
+				set.Values = append(set.Values, strings.Join(v.Txt, ""))
+			}
+		}
+		if len(set.Values) > 0 {
+			slices.Sort(set.Values)
+			out = append(out, set)
+		}
+	}
+	return out, nil
+}
+
+// SetRecords implements dns.RecordProvider.
+func (p *Provider) SetRecords(ctx context.Context, set dns.RecordSet) error {
+	rrs := make([]mdns.RR, 0, len(set.Values))
+	for _, v := range set.Values {
+		rr, err := newRR(set, v)
+		if err != nil {
+			return dns.Invalid("%v", err)
+		}
+		rrs = append(rrs, rr)
+	}
+	return p.send(ctx, set.Name, func(m *mdns.Msg) {
+		m.RemoveRRset([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(set.Name), Rrtype: recordTypeCodes[set.Type], Class: mdns.ClassINET}}})
+		m.Insert(rrs)
+	})
+}
+
+// DeleteRecords implements dns.RecordProvider.
+func (p *Provider) DeleteRecords(ctx context.Context, name, recordType string) error {
+	code, ok := recordTypeCodes[recordType]
+	if !ok {
+		return dns.Invalid("unknown record type %q", recordType)
+	}
+	return p.send(ctx, name, func(m *mdns.Msg) {
+		m.RemoveRRset([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(name), Rrtype: code, Class: mdns.ClassINET}}})
+	})
+}
+
+// newRR returns the resource record of one value of a set.
+func newRR(set dns.RecordSet, value string) (mdns.RR, error) {
+	hdr := mdns.RR_Header{Name: mdns.Fqdn(set.Name), Rrtype: recordTypeCodes[set.Type], Class: mdns.ClassINET, Ttl: uint32(set.TTL)} //nolint:gosec // the TTL is 1 to 86400
+	switch set.Type {
+	case dns.TypeA:
+		ip := net.ParseIP(value).To4()
+		if ip == nil {
+			return nil, fmt.Errorf("%q is not an IPv4 address", value)
+		}
+		return &mdns.A{Hdr: hdr, A: ip}, nil
+	case dns.TypeAAAA:
+		ip := net.ParseIP(value)
+		if ip == nil || ip.To4() != nil {
+			return nil, fmt.Errorf("%q is not an IPv6 address", value)
+		}
+		return &mdns.AAAA{Hdr: hdr, AAAA: ip}, nil
+	case dns.TypeCNAME:
+		return &mdns.CNAME{Hdr: hdr, Target: mdns.Fqdn(value)}, nil
+	case dns.TypeTXT:
+		return &mdns.TXT{Hdr: hdr, Txt: []string{value}}, nil
+	}
+	return nil, fmt.Errorf("unknown record type %q", set.Type)
+}
+
+// send sends one update message of the zone, built by change, and reads the
+// answer of the server.
+func (p *Provider) send(ctx context.Context, name string, change func(*mdns.Msg)) error {
 	msg := new(mdns.Msg)
 	msg.SetUpdate(mdns.Fqdn(p.zone))
-	change(msg, rr)
-
+	change(msg)
 	client := &mdns.Client{Net: "tcp", Timeout: p.timeout}
 	if p.keyName != "" {
 		msg.SetTsig(p.keyName, p.algorithm, 300, time.Now().Unix())
@@ -136,10 +251,10 @@ func (p *Provider) update(ctx context.Context, rec dns.Record, change func(*mdns
 	defer cancel()
 	reply, _, err := client.ExchangeContext(ctx, msg, p.server)
 	if err != nil {
-		return fmt.Errorf("update of %s on %s: %w", rec.Name, p.server, err)
+		return fmt.Errorf("update of %s on %s: %w", name, p.server, err)
 	}
 	if reply.Rcode != mdns.RcodeSuccess {
-		return fmt.Errorf("update of %s on %s: the server answered %s", rec.Name, p.server, mdns.RcodeToString[reply.Rcode])
+		return fmt.Errorf("update of %s on %s: the server answered %s", name, p.server, mdns.RcodeToString[reply.Rcode])
 	}
 	return nil
 }
