@@ -650,6 +650,60 @@ func TestDNSRecord_RenamedWhileWritten(t *testing.T) {
 	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the set of the former name was left behind"))
 }
 
+// The heartbeat a provider writes into its DNSZone objects every 30 seconds
+// is no reason to compare every record with its zone: the zone source asks
+// for that only when a zone appears or goes, its spec changes, or it turns
+// available or unavailable.
+func TestZoneSource_HeartbeatsDoNotReconcile(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	src := zoneSource(e.r.zones).(*controller.EventSource)
+	keys := []controller.ObjectKey{{Namespace: "shop", Name: "a"}, {Namespace: "shop", Name: "b"}}
+	sc := &controller.SourceContext{Objects: func() []*controller.Object {
+		return []*controller.Object{{Key: keys[0]}, {Key: keys[1]}}
+	}}
+	event := func() []controller.ObjectKey { return src.Map(&api.Event{}, sc) }
+	heartbeat := func(at time.Time) {
+		_, err := e.b.UpdateObjectStatus(ctx, ZoneKind, "", "example.com", map[string]any{"heartbeat": at.UTC().Format(time.RFC3339)}, 0)
+		must.NoError(t, err)
+	}
+
+	must.Eq(t, keys, event(), must.Sprint("the first event: the zones are new to the source"))
+	must.Len(t, 0, event(), must.Sprint("nothing changed"))
+
+	heartbeat(time.Now().Add(-20 * time.Second))
+	must.Len(t, 0, event(), must.Sprint("the first heartbeat of a zone that was available"))
+	heartbeat(time.Now())
+	must.Len(t, 0, event(), must.Sprint("a heartbeat"))
+
+	// The spec of a zone.
+	e.zoneRecords(false)
+	must.Eq(t, keys, event(), must.Sprint("records switched off"))
+	must.Len(t, 0, event())
+	e.zoneRecords(true)
+	must.Eq(t, keys, event(), must.Sprint("records switched on"))
+
+	// A provider that was away is back: its zone is available again.
+	heartbeat(time.Now().Add(-time.Hour))
+	_ = event()
+	heartbeat(time.Now())
+	must.Eq(t, keys, event(), must.Sprint("the zone is available again"))
+	must.Len(t, 0, event())
+
+	// A zone goes, a zone comes.
+	e.b.RemoveObject(ZoneKind, "", "example.com")
+	must.Eq(t, keys, event(), must.Sprint("the zone is gone"))
+	e.zoneRecords(true)
+	must.Eq(t, keys, event(), must.Sprint("the zone is registered"))
+
+	// The event still drops the cached zones: a reconcile after it sees
+	// the zones as they are.
+	e.zoneRecords(false)
+	_ = event()
+	_, err := e.r.zones.find(ctx, "www.example.com")
+	must.ErrorIs(t, err, errRecordsDisabled)
+}
+
 func TestDNSRecord_ZoneWithoutRecords(t *testing.T) {
 	e := startOperator(t, false)
 	e.cluster.allow("shop", "shop.example.com")

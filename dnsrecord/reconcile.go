@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bacanoo-io/norca-platform/provider/dns"
@@ -520,14 +521,59 @@ func loadBalancerSource() controller.Source {
 	}
 }
 
-// zoneSource reconciles every record when a DNS zone changes (registered,
-// its records switch, its heartbeat back).
+// zoneSource reconciles every record when a DNS zone changes (registered
+// or gone, its spec with the records switch, its heartbeat back or away).
+//
+// A provider writes the heartbeat of each of its zones every 30 seconds,
+// and each of those writes is an event: the source remembers the zones and
+// asks for the records only when something of a zone changed that a record
+// depends on. A heartbeat that only says the provider is still there
+// changes nothing.
 func zoneSource(z *zones) controller.Source {
+	var (
+		mu    sync.Mutex
+		known bool
+		seen  map[string]zoneInfo
+	)
+	// changed reads the zones and compares them with those of the event
+	// before. When they can't be read, the records are reconciled: they
+	// read the zones themselves.
+	changed := func() bool {
+		z.forget()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		all, err := z.list(ctx)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			known = false
+			return true
+		}
+		now := z.now()
+		cur := make(map[string]zoneInfo, len(all))
+		for _, zone := range all {
+			cur[zone.Name] = *zone
+		}
+		differs := !known || len(cur) != len(seen)
+		for name, zone := range cur {
+			// The availability of both is taken now: a zone whose
+			// heartbeat was fresh at the last event and is too old by
+			// now turns available with this one.
+			old, ok := seen[name]
+			if !ok || old.Spec != zone.Spec || old.available(now, z.ttl) != zone.available(now, z.ttl) {
+				differs = true
+			}
+		}
+		known, seen = true, cur
+		return differs
+	}
 	return &controller.EventSource{
 		SourceName: "zones",
 		Topics:     map[api.Topic][]string{api.TopicCustomObject: {ZoneKind.Group + "/" + ZoneKind.Kind}},
 		Map: func(_ *api.Event, sc *controller.SourceContext) []controller.ObjectKey {
-			z.forget()
+			if !changed() {
+				return nil
+			}
 			var keys []controller.ObjectKey
 			for _, obj := range sc.Objects() {
 				keys = append(keys, obj.Key)
