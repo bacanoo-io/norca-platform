@@ -16,7 +16,9 @@ package rfc2136
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"slices"
@@ -143,46 +145,94 @@ var recordTypeCodes = map[string]uint16{
 
 // Records implements dns.RecordProvider.
 func (p *Provider) Records(ctx context.Context, name string) ([]dns.RecordSet, error) {
-	client := &mdns.Client{Net: "tcp", Timeout: p.timeout}
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 	var out []dns.RecordSet
 	for _, t := range dns.RecordTypes {
-		code := recordTypeCodes[t]
-		q := new(mdns.Msg)
-		q.SetQuestion(mdns.Fqdn(name), code)
-		q.RecursionDesired = false
-		reply, _, err := client.ExchangeContext(ctx, q, p.server)
+		set, err := p.query(ctx, name, t)
 		if err != nil {
-			return nil, fmt.Errorf("query of %s %s on %s: %w", name, t, p.server, err)
+			return nil, err
 		}
-		if reply.Rcode != mdns.RcodeSuccess && reply.Rcode != mdns.RcodeNameError {
-			return nil, fmt.Errorf("query of %s %s on %s: the server answered %s", name, t, p.server, mdns.RcodeToString[reply.Rcode])
+		if len(set.Values) == 0 || p.synthesized(ctx, set) {
+			continue
 		}
-		set := dns.RecordSet{Name: name, Type: t}
-		for _, rr := range reply.Answer {
-			h := rr.Header()
-			if h.Rrtype != code || dns.Normalize(h.Name) != name {
-				continue
-			}
-			set.TTL = int(h.Ttl)
-			switch v := rr.(type) {
-			case *mdns.A:
-				set.Values = append(set.Values, v.A.String())
-			case *mdns.AAAA:
-				set.Values = append(set.Values, v.AAAA.String())
-			case *mdns.CNAME:
-				set.Values = append(set.Values, dns.Normalize(v.Target))
-			case *mdns.TXT:
-				set.Values = append(set.Values, strings.Join(v.Txt, ""))
-			}
-		}
-		if len(set.Values) > 0 {
-			slices.Sort(set.Values)
-			out = append(out, set)
-		}
+		out = append(out, set)
 	}
 	return out, nil
+}
+
+// query asks the server for the records of a name and type. The records of
+// another type in the answer (the CNAME of a name that is an alias) are not
+// records of the type.
+func (p *Provider) query(ctx context.Context, name, recordType string) (dns.RecordSet, error) {
+	client := &mdns.Client{Net: "tcp", Timeout: p.timeout}
+	code := recordTypeCodes[recordType]
+	set := dns.RecordSet{Name: name, Type: recordType}
+	q := new(mdns.Msg)
+	q.SetQuestion(mdns.Fqdn(name), code)
+	q.RecursionDesired = false
+	reply, _, err := client.ExchangeContext(ctx, q, p.server)
+	if err != nil {
+		return set, fmt.Errorf("query of %s %s on %s: %w", name, recordType, p.server, err)
+	}
+	if reply.Rcode != mdns.RcodeSuccess && reply.Rcode != mdns.RcodeNameError {
+		return set, fmt.Errorf("query of %s %s on %s: the server answered %s", name, recordType, p.server, mdns.RcodeToString[reply.Rcode])
+	}
+	for _, rr := range reply.Answer {
+		h := rr.Header()
+		if h.Rrtype != code || dns.Normalize(h.Name) != name {
+			continue
+		}
+		set.TTL = int(h.Ttl)
+		switch v := rr.(type) {
+		case *mdns.A:
+			set.Values = append(set.Values, v.A.String())
+		case *mdns.AAAA:
+			set.Values = append(set.Values, v.AAAA.String())
+		case *mdns.CNAME:
+			set.Values = append(set.Values, dns.Normalize(v.Target))
+		case *mdns.TXT:
+			set.Values = append(set.Values, strings.Join(v.Txt, ""))
+		}
+	}
+	slices.Sort(set.Values)
+	return set, nil
+}
+
+// synthesized reports whether the answer of a query was made by the server
+// from a wildcard of the zone (RFC 4592) and is no record set of the name:
+// such an answer carries the name asked and can't be told from a set by
+// itself.
+//
+// A name beside it that can't exist is asked first: the same answer there
+// says a wildcard covers both. Then the name may still hold a set of its
+// own with the values of the wildcard, so the server is asked with an
+// update that has only a prerequisite, "the RRset exists" (RFC 2136 3.2.1),
+// and changes nothing: prerequisites are checked against the records of
+// the zone, not against wildcards. Whatever is not a clear "no such RRset"
+// leaves the answer a record set, which is the careful reading (a set that
+// is there is not written over without adopt).
+func (p *Provider) synthesized(ctx context.Context, set dns.RecordSet) bool {
+	_, parent, ok := strings.Cut(set.Name, ".")
+	if !ok || set.Name == p.zone || !dns.InZone(parent, p.zone) {
+		return false
+	}
+	var label [8]byte
+	if _, err := rand.Read(label[:]); err != nil {
+		return false
+	}
+	beside := "norca-probe-" + hex.EncodeToString(label[:]) + "." + parent
+	if !dns.ValidName(beside) {
+		return false
+	}
+	probe, err := p.query(ctx, beside, set.Type)
+	if err != nil || probe.TTL != set.TTL || !slices.Equal(probe.Values, set.Values) {
+		return false
+	}
+	reply, err := p.exchange(ctx, func(m *mdns.Msg) {
+		m.RRsetUsed([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(set.Name), Rrtype: recordTypeCodes[set.Type], Class: mdns.ClassINET}}})
+	})
+	return err == nil && (reply.Rcode == mdns.RcodeNXRrset || reply.Rcode == mdns.RcodeNameError)
 }
 
 // SetRecords implements dns.RecordProvider.
@@ -195,10 +245,35 @@ func (p *Provider) SetRecords(ctx context.Context, set dns.RecordSet) error {
 		}
 		rrs = append(rrs, rr)
 	}
-	return p.send(ctx, set.Name, func(m *mdns.Msg) {
+	if err := p.send(ctx, set.Name, func(m *mdns.Msg) {
 		m.RemoveRRset([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(set.Name), Rrtype: recordTypeCodes[set.Type], Class: mdns.ClassINET}}})
 		m.Insert(rrs)
-	})
+	}); err != nil {
+		return err
+	}
+
+	// A server answers an update with success also when it left records
+	// out of it: a CNAME for a name that has other data, and other data
+	// for a name that is a CNAME, are ignored (RFC 2136 3.4.2.2). So the
+	// set is read back, or a set that was never written would be reported
+	// as written.
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	have, err := p.query(ctx, set.Name, set.Type)
+	if err != nil {
+		return err
+	}
+	want := slices.Clone(set.Values)
+	slices.Sort(want)
+	if !slices.Equal(have.Values, want) {
+		why := "the name is a CNAME, which can't have other records"
+		if set.Type == dns.TypeCNAME {
+			why = "the name has other records, and a CNAME stands alone"
+		}
+		return dns.Invalid("the name server %s took the update of %s %s but does not hold its values (it holds %q): if %s, the server ignores the update",
+			p.server, set.Type, set.Name, have.Values, why)
+	}
+	return nil
 }
 
 // DeleteRecords implements dns.RecordProvider.
@@ -239,6 +314,19 @@ func newRR(set dns.RecordSet, value string) (mdns.RR, error) {
 // send sends one update message of the zone, built by change, and reads the
 // answer of the server.
 func (p *Provider) send(ctx context.Context, name string, change func(*mdns.Msg)) error {
+	reply, err := p.exchange(ctx, change)
+	if err != nil {
+		return fmt.Errorf("update of %s on %s: %w", name, p.server, err)
+	}
+	if reply.Rcode != mdns.RcodeSuccess {
+		return fmt.Errorf("update of %s on %s: the server answered %s", name, p.server, mdns.RcodeToString[reply.Rcode])
+	}
+	return nil
+}
+
+// exchange sends one update message of the zone, built by change, and
+// returns the answer of the server.
+func (p *Provider) exchange(ctx context.Context, change func(*mdns.Msg)) (*mdns.Msg, error) {
 	msg := new(mdns.Msg)
 	msg.SetUpdate(mdns.Fqdn(p.zone))
 	change(msg)
@@ -250,11 +338,5 @@ func (p *Provider) send(ctx context.Context, name string, change func(*mdns.Msg)
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 	reply, _, err := client.ExchangeContext(ctx, msg, p.server)
-	if err != nil {
-		return fmt.Errorf("update of %s on %s: %w", name, p.server, err)
-	}
-	if reply.Rcode != mdns.RcodeSuccess {
-		return fmt.Errorf("update of %s on %s: the server answered %s", name, p.server, mdns.RcodeToString[reply.Rcode])
-	}
-	return nil
+	return reply, err
 }
