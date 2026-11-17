@@ -7,9 +7,11 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,12 +50,34 @@ type env struct {
 	cluster *fakeCluster
 	zone    *mock.DNS
 	r       *reconciler
+
+	// failDeletes makes the provider fail the deletions of record sets
+	// (502), as a name server that is away for a while does.
+	failDeletes *atomic.Bool
 }
 
 // startOperator starts norca-dns on a fake backend with the zone
 // example.com of a mock provider, served over HTTP; records says whether the
 // zone lets norca-dns write.
 func startOperator(t *testing.T, records bool) *env {
+	t.Helper()
+	e, c := newOperator(t, records)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return e
+}
+
+// newOperator is startOperator without running the controller: the methods
+// of the reconciler are called by the test.
+func newOperator(t *testing.T, records bool) (*env, *controller.Controller) {
 	t.Helper()
 	b := fake.New()
 	// An object of another kind gives the first listing an index of its
@@ -63,7 +87,15 @@ func startOperator(t *testing.T, records bool) *env {
 	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
 	must.NoError(t, err)
 	z.Records = records
-	srv := httptest.NewServer(dns.NewHandler(z, "zone-token", nil))
+	failDeletes := &atomic.Bool{}
+	handler := dns.NewHandler(z, "zone-token", nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodDelete && failDeletes.Load() {
+			http.Error(w, "the name server is away", http.StatusBadGateway)
+			return
+		}
+		handler.ServeHTTP(w, req)
+	}))
 	t.Cleanup(srv.Close)
 	b.PutVariable(&api.Variable{Namespace: "default", Path: "providers/dns-lab", Items: api.VariableItems{"token": "zone-token"}})
 	b.PutObject(&api.CustomObject{Group: ZoneKind.Group, Kind: ZoneKind.Kind, Name: "example.com", Spec: map[string]any{
@@ -94,17 +126,7 @@ func startOperator(t *testing.T, records bool) *env {
 	})
 	must.NoError(t, err)
 	r.ctrl = c
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = c.Run(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r}
+	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r, failDeletes: failDeletes}, c
 }
 
 func (e *env) put(ns, name string, spec map[string]any) {
@@ -264,14 +286,229 @@ func TestDNSRecord_ConflictsAndAdopt(t *testing.T) {
 	must.SliceContains(t, e.events("shop", "mail"), "Adopted")
 
 	// A second record of the same name and type, in another namespace:
-	// the first one keeps it.
-	e.put("other", "mail", map[string]any{"name": "mail.shop.example.com", "type": "A", "values": []any{"203.0.113.9"}})
+	// the first one keeps it. The second one asks for the values the zone
+	// has, so it is the other record that stands in its way, not the zone
+	// (a set found as wanted would be taken over).
+	e.put("other", "mail", map[string]any{"name": "mail.shop.example.com", "type": "A", "values": []any{"192.0.2.25"}})
 	e.waitFor("conflict with another record", func() bool {
 		_, st := e.status("other", "mail")
 		return readyReason(st) == ConditionConflict
 	})
 	time.Sleep(300 * time.Millisecond)
+	_, st := e.status("other", "mail")
+	must.Eq(t, ConditionConflict, readyReason(st))
+	must.StrContains(t, st.Condition(ConditionConflict).Message, "the DNSRecord shop/mail writes")
+	must.False(t, st.Owned)
 	must.Eq(t, []string{"192.0.2.25"}, e.zone.RecordValues("mail.shop.example.com", "A"))
+
+	// The record that lost is deleted: the set of the first one stays.
+	e.b.RemoveObject(Kind, "other", "mail")
+	e.waitFor("the loser is gone", func() bool { return e.b.GetObject(Kind, "other", "mail") == nil })
+	time.Sleep(300 * time.Millisecond)
+	must.Eq(t, []string{"192.0.2.25"}, e.zone.RecordValues("mail.shop.example.com", "A"))
+	_, st = e.status("shop", "mail")
+	must.Zero(t, st.Drifts, must.Sprint("the set of the first record was deleted under it"))
+}
+
+// The record that holds a record set keeps it when an older record is
+// pointed at the same name and type; the record that lost holds nothing, and
+// deleting it leaves the set alone.
+func TestDNSRecord_HolderKeepsTheSet(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.cluster.allow("other", "example.com")
+	ready := func(ns, name string) func() bool {
+		return func() bool {
+			_, st := e.status(ns, name)
+			return readyReason(st) == "True" && st.Owned
+		}
+	}
+
+	e.put("other", "old", map[string]any{"name": "old.shop.example.com", "type": "A", "values": []any{"192.0.2.1"}})
+	e.waitFor("the older record", ready("other", "old"))
+	e.put("shop", "www", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.waitFor("the record that holds the name", ready("shop", "www"))
+
+	// The older record moves to the name the younger one holds, with the
+	// same values: it does not take the set over.
+	e.put("other", "old", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.waitFor("the older record is refused", func() bool {
+		_, st := e.status("other", "old")
+		return readyReason(st) == ConditionConflict
+	})
+	_, st := e.status("other", "old")
+	must.False(t, st.Owned, must.Sprint("a record that lost a name holds no set"))
+	must.StrContains(t, st.Condition(ConditionConflict).Message, "the DNSRecord shop/www writes")
+	must.Len(t, 0, e.zone.RecordValues("old.shop.example.com", "A"), must.Sprint("the set of the name it left"))
+	time.Sleep(300 * time.Millisecond)
+	_, st = e.status("shop", "www")
+	must.Eq(t, "True", readyReason(st))
+	must.True(t, st.Owned)
+
+	e.b.RemoveObject(Kind, "other", "old")
+	e.waitFor("the loser is gone", func() bool { return e.b.GetObject(Kind, "other", "old") == nil })
+	time.Sleep(300 * time.Millisecond)
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+	_, st = e.status("shop", "www")
+	must.Zero(t, st.Drifts, must.Sprint("the set was deleted under the record that holds it"))
+}
+
+// A record of a namespace that may not write a name does not keep the name
+// from the namespace that may, and deleting it removes nothing.
+func TestDNSRecord_NotAllowedRecordHoldsNothing(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+
+	e.put("evil", "www", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"203.0.113.66"}})
+	e.waitFor("the squatter is not allowed", func() bool {
+		_, st := e.status("evil", "www")
+		return readyReason(st) == "NotAllowed"
+	})
+	e.put("shop", "www", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.waitFor("the namespace that may write the name writes it", func() bool {
+		_, st := e.status("shop", "www")
+		return readyReason(st) == "True" && st.Owned
+	})
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+	e.b.RemoveObject(Kind, "evil", "www")
+	e.waitFor("the squatter is gone", func() bool { return e.b.GetObject(Kind, "evil", "www") == nil })
+	time.Sleep(300 * time.Millisecond)
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+	_, st := e.status("shop", "www")
+	must.Zero(t, st.Drifts)
+}
+
+// A deleted record holds its record set until the operator has removed it:
+// a new record of the same spec waits, and is not left with a set that the
+// deletion then removes under it.
+func TestDNSRecord_DeletedHolderGoesFirst(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}}
+
+	e.put("shop", "old", spec)
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "old")
+		return readyReason(st) == "True"
+	})
+	// The name server is away: the deletion can't remove the set yet.
+	e.failDeletes.Store(true)
+	e.b.RemoveObject(Kind, "shop", "old")
+	e.waitFor("the deletion waits for the name server", func() bool {
+		return slices.Contains(e.events("shop", "old"), "DeleteFailed")
+	})
+
+	e.put("shop", "new", spec)
+	e.waitFor("the new record waits for the deleted one", func() bool {
+		_, st := e.status("shop", "new")
+		return readyReason(st) == ConditionConflict
+	})
+	_, st := e.status("shop", "new")
+	must.False(t, st.Owned)
+
+	e.failDeletes.Store(false)
+	e.waitFor("the deleted record is gone and the new one wrote the set", func() bool {
+		_, st := e.status("shop", "new")
+		return e.b.GetObject(Kind, "shop", "old") == nil && readyReason(st) == "True" &&
+			slices.Equal(e.zone.RecordValues("www.shop.example.com", "A"), []string{"192.0.2.2"})
+	})
+	time.Sleep(300 * time.Millisecond)
+	_, st = e.status("shop", "new")
+	must.Zero(t, st.Drifts, must.Sprint("the set was deleted under the new record"))
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
+// hold writes into the status of a record that the operator holds the set
+// www.shop.example.com A for it.
+func (e *env) hold(ns, name string) {
+	e.t.Helper()
+	status := map[string]any{}
+	if cur := e.b.GetObject(Kind, ns, name); cur != nil {
+		for k, v := range cur.Status {
+			status[k] = v
+		}
+	}
+	for k, v := range map[string]any{"zone": "example.com", "name": "www.shop.example.com", "type": "A", "ttl": 300,
+		"values": []any{"192.0.2.2"}, "owned": true} {
+		status[k] = v
+	}
+	_, err := e.b.UpdateObjectStatus(context.Background(), Kind, ns, name, status, 0)
+	must.NoError(e.t, err)
+}
+
+// Two records whose statuses both hold one record set (both wrote it before
+// either saw the other): the older one keeps it, the other one gives it up
+// without removing it.
+func TestDNSRecord_TwoHoldersOfOneSet(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}}
+	e.put("shop", "first", spec)
+	e.waitFor("the first record", func() bool {
+		_, st := e.status("shop", "first")
+		return readyReason(st) == "True" && st.Owned
+	})
+	e.put("shop", "second", spec)
+	e.waitFor("the second record is refused", func() bool {
+		_, st := e.status("shop", "second")
+		return readyReason(st) == ConditionConflict
+	})
+
+	e.hold("shop", "second")
+	e.waitFor("the younger one gives the set up", func() bool {
+		_, st := e.status("shop", "second")
+		return readyReason(st) == ConditionConflict && !st.Owned
+	})
+	time.Sleep(300 * time.Millisecond)
+	_, st := e.status("shop", "first")
+	must.Eq(t, "True", readyReason(st))
+	must.True(t, st.Owned)
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+	// The record that lost is deleted: the set of the first one stays.
+	e.b.RemoveObject(Kind, "shop", "second")
+	e.waitFor("the loser is gone", func() bool { return e.b.GetObject(Kind, "shop", "second") == nil })
+	time.Sleep(300 * time.Millisecond)
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+	_, st = e.status("shop", "first")
+	must.Zero(t, st.Drifts, must.Sprint("the set was deleted under the record that holds it"))
+}
+
+// A deletion never removes a record set that the status of another record
+// that lives holds: whatever brought two holders about, the name stays
+// served.
+func TestRemove_LeavesTheSetOfAnotherHolder(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}}
+	for _, name := range []string{"first", "second"} {
+		e.put("shop", name, spec)
+		e.hold("shop", name)
+	}
+	get := func(name string) (*controller.Object, *Status) {
+		obj, err := e.r.ctrl.Objects().Get(ctx, controller.ObjectKey{Namespace: "shop", Name: name})
+		must.NoError(t, err)
+		var st Status
+		must.NoError(t, obj.DecodeStatus(&st))
+		must.True(t, st.Owned)
+		return obj, &st
+	}
+
+	obj, st := get("first")
+	kept, err := e.r.remove(ctx, obj, st)
+	must.NoError(t, err)
+	must.StrContains(t, kept, "the DNSRecord shop/second holds it")
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+	// The other holder is gone: the set goes with the last one.
+	e.b.RemoveObject(Kind, "shop", "second")
+	must.Nil(t, e.b.GetObject(Kind, "shop", "second"))
+	kept, err = e.r.remove(ctx, obj, st)
+	must.NoError(t, err)
+	must.Eq(t, "", kept)
+	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"))
 }
 
 func TestDNSRecord_ZoneWithoutRecords(t *testing.T) {

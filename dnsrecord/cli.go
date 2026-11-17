@@ -126,6 +126,7 @@ func Run(ctx context.Context, args []string, version string) error {
 		},
 		logger:         logger,
 		now:            time.Now,
+		namespace:      s.Namespace,
 		requeueReady:   s.Requeue,
 		requeueWaiting: time.Minute,
 	}

@@ -32,6 +32,10 @@ type reconciler struct {
 	logger  *slog.Logger
 	now     func() time.Time
 
+	// namespace is the namespace of the records the operator keeps ("*":
+	// every namespace).
+	namespace string
+
 	// requeueReady is how often a record that is as it should be is looked
 	// at again, which finds changes made in the zone by hand.
 	requeueReady time.Duration
@@ -116,7 +120,19 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			obj.Key.Namespace, spec.Name, MetaDNSSuffixes, meta[MetaDNSSuffixes])}, r.requeueWaiting, nil
 	}
 
-	if other := r.holder(obj, spec); other != "" {
+	other, err := r.holder(ctx, obj, spec, status)
+	if err != nil {
+		return outcome{}, 0, err
+	}
+	if other != "" {
+		// The record lost the name: it holds no record set from here on.
+		// The set of the contested name and type is the other record's and
+		// stays; a set it wrote under the name its spec had before goes.
+		if status.Owned && status.Name == spec.Name && status.Type == spec.Type {
+			status.Owned = false
+		} else if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", spec.Type, spec.Name)); err != nil {
+			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+		}
 		msg := fmt.Sprintf("the DNSRecord %s writes %s %s", other, spec.Type, spec.Name)
 		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
 	}
@@ -148,13 +164,9 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	// A set the operator wrote under another name, type or zone goes
 	// first: the spec moved it.
 	if status.Owned && (status.Name != want.Name || status.Type != want.Type || status.Zone != zone.Name) {
-		if err := r.remove(ctx, status); err != nil {
-			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", err.Error())
+		if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", want.Type, want.Name)); err != nil {
 			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
 		}
-		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordDeleted",
-			fmt.Sprintf("%s %s: the record moved to %s %s", status.Type, status.Name, want.Type, want.Name))
-		status.Owned = false
 	}
 
 	client, clientErr := r.zones.provider(ctx, zone)
@@ -229,28 +241,67 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		message: fmt.Sprintf("the zone %s holds %s %s", zone.Name, want.Type, want.Name)}, r.requeueReady, nil
 }
 
-// holder returns the namespace/name of another DNSRecord that writes the
-// same name and type and came first, or "".
-func (r *reconciler) holder(obj *controller.Object, spec Spec) string {
-	var first *controller.Object
+// holder returns the namespace/name of another DNSRecord that keeps this
+// record from the name and type of its spec, or "".
+//
+// The record whose status holds the record set keeps it, whichever record
+// is older: a record that is deleted holds its set until the operator has
+// removed it. A set nobody holds yet goes to the oldest record that may
+// write the name: a record of a namespace whose allow list does not hold
+// the name claims nothing.
+func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Spec, status *Status) (string, error) {
+	mine := status.Owned && status.Name == spec.Name && status.Type == spec.Type
+	var owner, first *controller.Object
 	for _, other := range r.ctrl.Informer().List() {
-		if other.Key == obj.Key || other.Deleting() {
+		if other.Key == obj.Key {
+			continue
+		}
+		if holds(other, spec.Name, spec.Type) {
+			if owner == nil || before(other, owner) {
+				owner = other
+			}
+			continue
+		}
+		if mine || other.Deleting() || !before(other, obj) || (first != nil && !before(other, first)) {
 			continue
 		}
 		var os Spec
 		if other.DecodeSpec(&os) != nil || os.normalize() != nil || os.Name != spec.Name || os.Type != spec.Type {
 			continue
 		}
-		if other.CreateIndex < obj.CreateIndex || (other.CreateIndex == obj.CreateIndex && keyLess(other.Key, obj.Key)) {
-			if first == nil || other.CreateIndex < first.CreateIndex {
-				first = other
-			}
+		meta, err := r.cluster.NamespaceMeta(ctx, other.Key.Namespace)
+		if err != nil && !errors.Is(err, controller.ErrNotFound) {
+			return "", fmt.Errorf("reading the namespace %s: %w", other.Key.Namespace, err)
+		}
+		if allowed(os.Name, meta) {
+			first = other
 		}
 	}
-	if first == nil {
-		return ""
+	switch {
+	case owner != nil && (!mine || before(owner, obj)):
+		// Two records that both hold the set (written at the same moment):
+		// the older one keeps it.
+		return owner.Key.Namespace + "/" + owner.Key.Name, nil
+	case owner == nil && first != nil:
+		return first.Key.Namespace + "/" + first.Key.Name, nil
 	}
-	return first.Key.Namespace + "/" + first.Key.Name
+	return "", nil
+}
+
+// holds reports whether the status of a record says the operator holds the
+// record set of the name and type for it. A deleted record holds it while
+// the finalizer of the operator is on it.
+func holds(o *controller.Object, name, recordType string) bool {
+	if o.Deleting() && !o.HasFinalizer(Finalizer) {
+		return false
+	}
+	var st Status
+	return o.DecodeStatus(&st) == nil && st.Owned && st.Name == name && st.Type == recordType
+}
+
+// before reports whether a record came before another one.
+func before(a, b *controller.Object) bool {
+	return a.CreateIndex < b.CreateIndex || (a.CreateIndex == b.CreateIndex && keyLess(a.Key, b.Key))
 }
 
 func keyLess(a, b controller.ObjectKey) bool {
@@ -285,23 +336,67 @@ func (r *reconciler) values(ctx context.Context, obj *controller.Object, spec Sp
 	return values, "", nil
 }
 
-// remove deletes the record set a status says the operator wrote. A zone
-// that is no longer registered can't be written: its records stay.
-func (r *reconciler) remove(ctx context.Context, status *Status) error {
+// release removes the record set the status of a record holds and gives it
+// up; why is for the event. A record that holds none is left as it is.
+func (r *reconciler) release(ctx context.Context, obj *controller.Object, status *Status, why string) error {
+	if !status.Owned {
+		return nil
+	}
+	kept, err := r.remove(ctx, obj, status)
+	if err != nil {
+		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", err.Error())
+		return err
+	}
+	if kept != "" {
+		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "RecordLeft",
+			fmt.Sprintf("%s %s stays in the zone %s: %s", status.Type, status.Name, status.Zone, kept))
+	} else {
+		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordDeleted",
+			fmt.Sprintf("%s %s removed from the zone %s: %s", status.Type, status.Name, status.Zone, why))
+	}
+	status.Owned = false
+	return nil
+}
+
+// remove deletes the record set a status says the operator wrote for obj.
+// kept says why the set stays in the zone instead: the status of another
+// record holds it too (two records that wrote it at the same moment), or
+// its zone is no longer registered and can't be written.
+func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status *Status) (kept string, err error) {
+	namespace := r.namespace
+	if namespace == "" {
+		namespace = "*"
+	}
+	// Read from the servers, not from the cache: a set that is deleted
+	// under a record that holds it is an outage of its name.
+	others, _, err := r.ctrl.Objects().List(ctx, namespace)
+	if err != nil {
+		return "", fmt.Errorf("listing the DNS records: %w", err)
+	}
+	for _, other := range others {
+		if other.Key == obj.Key || other.Deleting() {
+			continue
+		}
+		var st Status
+		if other.DecodeStatus(&st) == nil && st.Owned && st.Zone == status.Zone && st.Name == status.Name && st.Type == status.Type {
+			return fmt.Sprintf("the DNSRecord %s/%s holds it", other.Key.Namespace, other.Key.Name), nil
+		}
+	}
+
 	zone, err := r.zones.byName(ctx, status.Zone)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if zone == nil {
 		r.logger.Warn("the zone of a record is no longer registered: its record set stays", "zone", status.Zone,
 			"name", status.Name, "type", status.Type)
-		return nil
+		return "the zone is no longer registered", nil
 	}
 	client, err := r.zones.provider(ctx, zone)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return client.DeleteRecords(ctx, status.Name, status.Type)
+	return "", client.DeleteRecords(ctx, status.Name, status.Type)
 }
 
 // finishDeletion removes the record set of a deleted object and lets the
@@ -310,13 +405,8 @@ func (r *reconciler) finishDeletion(ctx context.Context, obj *controller.Object,
 	if !obj.HasFinalizer(Finalizer) {
 		return 0, nil
 	}
-	if status.Owned {
-		if err := r.remove(ctx, status); err != nil {
-			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", err.Error())
-			return 0, err
-		}
-		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordDeleted",
-			fmt.Sprintf("%s %s removed from the zone %s", status.Type, status.Name, status.Zone))
+	if err := r.release(ctx, obj, status, "the record was deleted"); err != nil {
+		return 0, err
 	}
 	_, err := r.ctrl.Objects().RemoveFinalizer(ctx, obj, Finalizer)
 	if errors.Is(err, controller.ErrNotFound) {
