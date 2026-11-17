@@ -58,10 +58,22 @@ type outcome struct {
 }
 
 func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (time.Duration, error) {
-	obj, ok := r.ctrl.Get(key)
-	if !ok {
+	if _, ok := r.ctrl.Get(key); !ok {
 		r.ctrl.Recorder().Forget(key)
 		return 0, nil
+	}
+	// What the record holds is in its status, and the cache can be behind
+	// the status the reconcile before this one wrote (a spec changed while
+	// it ran starts this one at once): a reconcile that acted on the old
+	// status would leave the set of a former name in the zone for good.
+	// So the object is read from the servers.
+	obj, err := r.ctrl.Objects().Get(ctx, key)
+	if errors.Is(err, controller.ErrNotFound) {
+		r.ctrl.Recorder().Forget(key)
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
 	}
 	var status Status
 	_ = obj.DecodeStatus(&status)

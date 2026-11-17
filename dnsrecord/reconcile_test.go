@@ -75,9 +75,9 @@ func (e *env) zoneRecords(records bool) {
 // startOperator starts norca-dns on a fake backend with the zone
 // example.com of a mock provider, served over HTTP; records says whether the
 // zone lets norca-dns write.
-func startOperator(t *testing.T, records bool) *env {
+func startOperator(t *testing.T, records bool, zoneParams ...map[string]any) *env {
 	t.Helper()
-	e, c := newOperator(t, records)
+	e, c := newOperator(t, records, zoneParams...)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -93,14 +93,18 @@ func startOperator(t *testing.T, records bool) *env {
 
 // newOperator is startOperator without running the controller: the methods
 // of the reconciler are called by the test.
-func newOperator(t *testing.T, records bool) (*env, *controller.Controller) {
+func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env, *controller.Controller) {
 	t.Helper()
 	b := fake.New()
 	// An object of another kind gives the first listing an index of its
 	// own (see the tests of the LoadBalancer operator).
 	b.PutObject(&api.CustomObject{Group: "test.norca.io", Kind: "Seed", Name: "seed"})
 
-	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
+	var params map[string]any
+	if len(zoneParams) > 0 {
+		params = zoneParams[0]
+	}
+	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, params)
 	must.NoError(t, err)
 	z.Records = records
 	failDeletes, recordsOff := &atomic.Bool{}, &atomic.Bool{}
@@ -620,6 +624,30 @@ func TestDNSRecord_LoadBalancerDeleted(t *testing.T) {
 		_, st := e.status("shop", "front")
 		return readyReason(st) == "NoValues" && !st.Owned && len(e.zone.RecordValues("front.shop.example.com", "A")) == 0
 	})
+}
+
+// A spec that is changed while its record is being written: the reconcile
+// that follows knows what the one before it wrote, and removes the set of
+// the former name. (The cache of the operator can be behind its own status
+// write at that moment.)
+func TestDNSRecord_RenamedWhileWritten(t *testing.T) {
+	e := startOperator(t, true, map[string]any{"latency": "100ms"})
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	// The reconcile has begun (the finalizer is on) and is at the slow
+	// provider: the name changes under it.
+	e.waitFor("the reconcile has begun", func() bool {
+		obj := e.b.GetObject(Kind, "shop", "web")
+		return obj != nil && slices.Contains(obj.Finalizers, Finalizer)
+	})
+	e.put("shop", "web", map[string]any{"name": "api.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+
+	e.waitFor("the new name is written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True" && st.Name == "api.shop.example.com" &&
+			slices.Equal(e.zone.RecordValues("api.shop.example.com", "A"), []string{"192.0.2.10"})
+	})
+	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the set of the former name was left behind"))
 }
 
 func TestDNSRecord_ZoneWithoutRecords(t *testing.T) {
