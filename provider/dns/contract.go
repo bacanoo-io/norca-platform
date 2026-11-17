@@ -17,9 +17,12 @@
 //
 // The contract is deliberately narrow. A name is the name of a challenge,
 // "_acme-challenge.<name in the zone>": nothing else can be written, so the
-// token of a zone cannot change what the zone serves. A name holds several
-// values at once: a certificate for example.com and *.example.com has two
-// challenges with the same name.
+// token of a zone cannot change what the zone serves, unless the zone is
+// configured with records = true: then the same token also covers the
+// records contract (records.go), which writes the A, AAAA, CNAME and TXT
+// record sets of the names of the zone. A name holds several values at
+// once: a certificate for example.com and *.example.com has two challenges
+// with the same name.
 package dns
 
 import (

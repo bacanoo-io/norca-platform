@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,46 @@ type RecordsConfig struct {
 	Lookup func(t *testing.T, name, recordType string) []string
 }
 
+// countedProvider counts the calls that reach a provider.
+type countedProvider struct {
+	dns.Provider
+	records dns.RecordProvider
+	calls   atomic.Int64
+}
+
+func (c *countedProvider) Present(ctx context.Context, rec dns.Record) error {
+	c.calls.Add(1)
+	return c.Provider.Present(ctx, rec)
+}
+
+func (c *countedProvider) CleanUp(ctx context.Context, rec dns.Record) error {
+	c.calls.Add(1)
+	return c.Provider.CleanUp(ctx, rec)
+}
+
+func (c *countedProvider) Records(ctx context.Context, name string) ([]dns.RecordSet, error) {
+	c.calls.Add(1)
+	return c.records.Records(ctx, name)
+}
+
+func (c *countedProvider) SetRecords(ctx context.Context, set dns.RecordSet) error {
+	c.calls.Add(1)
+	return c.records.SetRecords(ctx, set)
+}
+
+func (c *countedProvider) DeleteRecords(ctx context.Context, name, recordType string) error {
+	c.calls.Add(1)
+	return c.records.DeleteRecords(ctx, name, recordType)
+}
+
+// Close implements dns.Closer.
+func (c *countedProvider) Close() error {
+	if cl, ok := c.Provider.(dns.Closer); ok {
+		return cl.Close()
+	}
+	return nil
+}
+
 // RunRecords checks the records contract the way norca-dns relies on it:
 //
 //   - a record set is set, read back and set again without a change;
@@ -45,13 +86,18 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 	if !dns.ValidZone(cfg.Zone) {
 		t.Fatalf("dnstest: invalid zone %q", cfg.Zone)
 	}
+	// calls counts the calls that reached the provider of the last client.
+	var calls *atomic.Int64
 	newClient := func(t *testing.T, token string, records bool) *dns.Client {
 		t.Helper()
 		p := cfg.New(t)
-		if _, ok := p.(dns.RecordProvider); !ok {
+		rp, ok := p.(dns.RecordProvider)
+		if !ok {
 			t.Fatalf("dnstest: the provider is not a dns.RecordProvider")
 		}
-		z := &dns.Zone{Name: cfg.Zone, Type: "test", Provider: p, Records: records}
+		counted := &countedProvider{Provider: p, records: rp}
+		calls = &counted.calls
+		z := &dns.Zone{Name: cfg.Zone, Type: "test", Provider: counted, Records: records}
 		srv := httptest.NewServer(dns.NewHandler(z, token, nil))
 		t.Cleanup(srv.Close)
 		t.Cleanup(func() { _ = z.Close() })
@@ -187,6 +233,12 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 			c.SetRecords(ctx(t), dns.RecordSet{Name: name, Type: dns.TypeA}))
 		_, err := c.Records(ctx(t), "www.other-zone.example")
 		invalid(t, "reading a name of another zone", err)
+		invalid(t, "deleting a name of another zone", c.DeleteRecords(ctx(t), "www.other-zone.example", dns.TypeA))
+		invalid(t, "deleting a challenge name", c.DeleteRecords(ctx(t), dns.ChallengeName("www."+cfg.Zone), dns.TypeTXT))
+		invalid(t, "deleting an unknown type", c.DeleteRecords(ctx(t), name, "MX"))
+		if n := calls.Load(); n != 0 {
+			t.Fatalf("%d of the refused requests reached the provider", n)
+		}
 	})
 
 	t.Run("token", func(t *testing.T) {
@@ -197,6 +249,9 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 		if !errors.As(err, &re) || re.Status != http.StatusUnauthorized {
 			t.Fatalf("a wrong token: %v", err)
 		}
+		if n := calls.Load(); n != 0 {
+			t.Fatalf("%d requests with a wrong token reached the provider", n)
+		}
 	})
 
 	t.Run("records not enabled", func(t *testing.T) {
@@ -205,6 +260,9 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 		var re *dns.ResponseError
 		if !errors.As(err, &re) || re.Status != http.StatusForbidden {
 			t.Fatalf("a zone without records = true: %v", err)
+		}
+		if n := calls.Load(); n != 0 {
+			t.Fatalf("%d requests of a zone without records = true reached the provider", n)
 		}
 	})
 }
