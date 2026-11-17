@@ -47,6 +47,9 @@ type outcome struct {
 	ready           bool
 	reason, message string
 	conflict        string
+
+	// evented says the reconcile recorded the event of the outcome itself.
+	evented bool
 }
 
 func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (time.Duration, error) {
@@ -75,11 +78,16 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// keep compares with the generation the operator acted on last; the
 	// status observes the current one when it is written.
 	out, requeue, err := r.keep(ctx, obj, &status)
+	if err != nil && out.reason == "" {
+		out = outcome{reason: "Failed", message: err.Error()}
+	}
+	// A failure is an outcome too: the status says it before the reconcile
+	// is tried again, or a record that can't be written stays Ready.
+	if werr := r.writeStatus(ctx, obj, &status, out); werr != nil && err == nil {
+		return 0, werr
+	}
 	if err != nil {
 		return 0, err
-	}
-	if werr := r.writeStatus(ctx, obj, &status, out); werr != nil {
-		return 0, werr
 	}
 	return requeue, nil
 }
@@ -142,7 +150,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	if status.Owned && (status.Name != want.Name || status.Type != want.Type || status.Zone != zone.Name) {
 		if err := r.remove(ctx, status); err != nil {
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", err.Error())
-			return outcome{reason: "Failed", message: err.Error()}, 0, err
+			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
 		}
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordDeleted",
 			fmt.Sprintf("%s %s: the record moved to %s %s", status.Type, status.Name, want.Type, want.Name))
@@ -156,7 +164,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	sets, err := client.Records(ctx, want.Name)
 	if err != nil {
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", "reading the zone: "+err.Error())
-		return outcome{reason: "Failed", message: "reading the zone: " + err.Error()}, 0, err
+		return outcome{reason: "Failed", message: "reading the zone: " + err.Error(), evented: true}, 0, err
 	}
 	var have *dns.RecordSet
 	for i := range sets {
@@ -186,9 +194,9 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", err.Error())
 			var re *dns.ResponseError
 			if errors.As(err, &re) && re.Invalid() {
-				return outcome{reason: "Failed", message: err.Error()}, r.requeueWaiting, nil
+				return outcome{reason: "Failed", message: err.Error(), evented: true}, r.requeueWaiting, nil
 			}
-			return outcome{reason: "Failed", message: err.Error()}, 0, err
+			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
 		}
 		now := r.now().UTC().Format(time.RFC3339)
 		status.WrittenAt = now
@@ -336,7 +344,7 @@ func (r *reconciler) writeStatus(ctx context.Context, obj *controller.Object, st
 		degraded = controller.ConditionFalse
 	}
 	status.SetCondition(controller.Condition{Type: controller.ConditionDegraded, Status: degraded, Reason: out.reason}, now)
-	if !out.ready {
+	if !out.ready && !out.evented {
 		if c := previousReady(obj); c == nil || c.Reason != out.reason {
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, out.reason, out.message)
 		}

@@ -284,6 +284,42 @@ func TestDNSRecord_ZoneWithoutRecords(t *testing.T) {
 	})
 }
 
+// A failure of the provider is in the status: a record that was ready does
+// not stay Ready, and a new one gets its condition.
+func TestDNSRecord_FailedIsInTheStatus(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	})
+
+	// The provider refuses the token from now on (401).
+	e.b.PutVariable(&api.Variable{Namespace: "default", Path: "providers/dns-lab", Items: api.VariableItems{"token": "wrong"}})
+	e.waitFor("the ready record is Failed", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "Failed"
+	})
+	_, st := e.status("shop", "web")
+	must.True(t, st.Owned, must.Sprint("a failure does not give up the record set"))
+	must.Eq(t, controller.ConditionTrue, st.Condition(controller.ConditionDegraded).Status)
+
+	e.put("shop", "new", map[string]any{"name": "new.shop.example.com", "type": "A", "values": []any{"192.0.2.11"}})
+	e.waitFor("the new record is Failed", func() bool {
+		_, st := e.status("shop", "new")
+		return readyReason(st) == "Failed"
+	})
+
+	// The token is right again: both are written.
+	e.b.PutVariable(&api.Variable{Namespace: "default", Path: "providers/dns-lab", Items: api.VariableItems{"token": "zone-token"}})
+	e.waitFor("ready again", func() bool {
+		_, a := e.status("shop", "web")
+		_, b := e.status("shop", "new")
+		return readyReason(a) == "True" && readyReason(b) == "True"
+	})
+}
+
 func TestDNSRecord_LoadBalancerSource(t *testing.T) {
 	e := startOperator(t, true)
 	e.cluster.allow("shop", "shop.example.com")
