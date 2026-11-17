@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/bacanoo-io/norca-platform/provider"
 	"github.com/bacanoo-io/norca-platform/provider/dns"
+	"github.com/bacanoo-io/norca-platform/provider/wire"
 	"github.com/bacanoo-io/norca-platform/providers/mock"
 	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
@@ -54,6 +56,20 @@ type env struct {
 	// failDeletes makes the provider fail the deletions of record sets
 	// (502), as a name server that is away for a while does.
 	failDeletes *atomic.Bool
+
+	// recordsOff makes the provider refuse the records contract (403), as
+	// a zone whose configuration no longer says records = true does.
+	recordsOff *atomic.Bool
+
+	// zoneURL is the endpoint of the zone.
+	zoneURL string
+}
+
+// zoneRecords writes the records switch of the DNSZone object.
+func (e *env) zoneRecords(records bool) {
+	e.b.PutObject(&api.CustomObject{Group: ZoneKind.Group, Kind: ZoneKind.Kind, Name: "example.com", Spec: map[string]any{
+		"zone": "example.com", "provider": "dns-lab", "endpoint": e.zoneURL, "tokenVariable": "providers/dns-lab", "records": records,
+	}})
 }
 
 // startOperator starts norca-dns on a fake backend with the zone
@@ -87,11 +103,15 @@ func newOperator(t *testing.T, records bool) (*env, *controller.Controller) {
 	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
 	must.NoError(t, err)
 	z.Records = records
-	failDeletes := &atomic.Bool{}
+	failDeletes, recordsOff := &atomic.Bool{}, &atomic.Bool{}
 	handler := dns.NewHandler(z, "zone-token", nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodDelete && failDeletes.Load() {
 			http.Error(w, "the name server is away", http.StatusBadGateway)
+			return
+		}
+		if recordsOff.Load() && strings.HasPrefix(req.URL.Path, "/v1/records/") {
+			wire.WriteError(w, http.StatusForbidden, wire.ReasonInvalid, "the zone example.com does not write records")
 			return
 		}
 		handler.ServeHTTP(w, req)
@@ -126,7 +146,8 @@ func newOperator(t *testing.T, records bool) (*env, *controller.Controller) {
 	})
 	must.NoError(t, err)
 	r.ctrl = c
-	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r, failDeletes: failDeletes}, c
+	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r, failDeletes: failDeletes,
+		recordsOff: recordsOff, zoneURL: srv.URL}, c
 }
 
 func (e *env) put(ns, name string, spec map[string]any) {
@@ -509,6 +530,33 @@ func TestRemove_LeavesTheSetOfAnotherHolder(t *testing.T) {
 	must.NoError(t, err)
 	must.Eq(t, "", kept)
 	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
+// A record of a zone that no longer lets norca-dns write can be deleted: its
+// record set stays in the zone, and an event says so.
+func TestDNSRecord_DeletedAfterRecordsSwitchedOff(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		off  func(e *env)
+	}{
+		{"the DNSZone object says records = false", func(e *env) { e.recordsOff.Store(true); e.zoneRecords(false) }},
+		{"the provider refuses, the DNSZone object is behind", func(e *env) { e.recordsOff.Store(true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := startOperator(t, true)
+			e.cluster.allow("shop", "shop.example.com")
+			e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+			e.waitFor("written", func() bool {
+				_, st := e.status("shop", "web")
+				return readyReason(st) == "True"
+			})
+
+			tc.off(e)
+			e.b.RemoveObject(Kind, "shop", "web")
+			e.waitFor("the record is gone", func() bool { return e.b.GetObject(Kind, "shop", "web") == nil })
+			must.Eq(t, []string{"192.0.2.10"}, e.zone.RecordValues("www.shop.example.com", "A"))
+		})
+	}
 }
 
 func TestDNSRecord_ZoneWithoutRecords(t *testing.T) {

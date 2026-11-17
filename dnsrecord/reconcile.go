@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -361,7 +362,8 @@ func (r *reconciler) release(ctx context.Context, obj *controller.Object, status
 // remove deletes the record set a status says the operator wrote for obj.
 // kept says why the set stays in the zone instead: the status of another
 // record holds it too (two records that wrote it at the same moment), or
-// its zone is no longer registered and can't be written.
+// its zone can't be written any more (no longer registered, or records
+// switched off).
 func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status *Status) (kept string, err error) {
 	namespace := r.namespace
 	if namespace == "" {
@@ -392,11 +394,29 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 			"name", status.Name, "type", status.Type)
 		return "the zone is no longer registered", nil
 	}
+	// A zone that no longer lets norca-dns write is like one that is no
+	// longer registered: nothing of it can be removed, and a record of it
+	// must not wait for that forever.
+	const switchedOff = "the zone no longer lets norca-dns write records (records = true in the configuration of norca-provider)"
+	if !zone.Spec.Records {
+		r.logger.Warn("the zone of a record no longer allows records: its record set stays", "zone", status.Zone,
+			"name", status.Name, "type", status.Type)
+		return switchedOff, nil
+	}
 	client, err := r.zones.provider(ctx, zone)
 	if err != nil {
 		return "", err
 	}
-	return "", client.DeleteRecords(ctx, status.Name, status.Type)
+	err = client.DeleteRecords(ctx, status.Name, status.Type)
+	// The provider answers 403 for the records of a zone without the
+	// switch; the DNSZone object may not say so yet.
+	var re *dns.ResponseError
+	if errors.As(err, &re) && re.Status == http.StatusForbidden {
+		r.logger.Warn("the provider of the zone refuses the records contract: the record set stays", "zone", status.Zone,
+			"name", status.Name, "type", status.Type, "answer", re.Message)
+		return switchedOff, nil
+	}
+	return "", err
 }
 
 // finishDeletion removes the record set of a deleted object and lets the
