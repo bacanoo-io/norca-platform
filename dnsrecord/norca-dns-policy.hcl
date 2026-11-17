@@ -31,6 +31,13 @@ namespace "*" {
 }
 
 namespace "default" {
+  # A block of a namespace by name takes the place of the "*" block above for
+  # that namespace: without a capability of its own here the operator could
+  # not read the metadata of this namespace, and no record of it would be
+  # written. Any capability lets the namespace be read; list-jobs is the
+  # narrowest.
+  capabilities = ["list-jobs"]
+
   variables {
     # The tokens the operator sends to the DNS providers are Variables of
     # the namespace -zone-token-namespace, at the paths the DNSZone objects
