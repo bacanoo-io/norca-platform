@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -450,14 +451,10 @@ func (e *env) hold(ns, name string) {
 	e.t.Helper()
 	status := map[string]any{}
 	if cur := e.b.GetObject(Kind, ns, name); cur != nil {
-		for k, v := range cur.Status {
-			status[k] = v
-		}
+		maps.Copy(status, cur.Status)
 	}
-	for k, v := range map[string]any{"zone": "example.com", "name": "www.shop.example.com", "type": "A", "ttl": 300,
-		"values": []any{"192.0.2.2"}, "owned": true} {
-		status[k] = v
-	}
+	maps.Copy(status, map[string]any{"zone": "example.com", "name": "www.shop.example.com", "type": "A", "ttl": 300,
+		"values": []any{"192.0.2.2"}, "owned": true})
 	_, err := e.b.UpdateObjectStatus(context.Background(), Kind, ns, name, status, 0)
 	must.NoError(e.t, err)
 }
