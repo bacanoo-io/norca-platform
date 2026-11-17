@@ -559,6 +559,69 @@ func TestDNSRecord_DeletedAfterRecordsSwitchedOff(t *testing.T) {
 	}
 }
 
+// A namespace that lost the right to a name no longer has it served: the
+// record set the operator wrote for it goes.
+func TestDNSRecord_AllowListWithdrawn(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	})
+
+	e.cluster.allow("shop", "other.example.com")
+	e.waitFor("not allowed, and the set is gone", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "NotAllowed" && !st.Owned && len(e.zone.RecordValues("www.shop.example.com", "A")) == 0
+	})
+	must.SliceContains(t, e.events("shop", "web"), "RecordDeleted")
+
+	e.cluster.allow("shop", "shop.example.com")
+	e.waitFor("written again", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True" && st.Owned && slices.Equal(e.zone.RecordValues("www.shop.example.com", "A"), []string{"192.0.2.10"})
+	})
+}
+
+// The record set of a record that follows a load balancer stays while the
+// load balancer has no address for a while, and goes when the load balancer
+// is deleted: its addresses are someone else's from then on.
+func TestDNSRecord_LoadBalancerDeleted(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.b.PutObject(&api.CustomObject{Group: LoadBalancerKind.Group, Kind: LoadBalancerKind.Kind, Namespace: "shop", Name: "front",
+		Spec: map[string]any{"service": "front", "port": 443}})
+	setAddresses := func(addresses ...any) {
+		_, err := e.b.UpdateObjectStatus(context.Background(), LoadBalancerKind, "shop", "front", map[string]any{"addresses": addresses}, 0)
+		must.NoError(t, err)
+	}
+	setAddresses("198.51.100.7:443")
+	e.put("shop", "front", map[string]any{"name": "front.shop.example.com", "type": "A", "source": map[string]any{"load_balancer": "front"}})
+	e.waitFor("the address of the load balancer", func() bool {
+		return slices.Equal(e.zone.RecordValues("front.shop.example.com", "A"), []string{"198.51.100.7"})
+	})
+
+	// No address for a while: the last one stays served.
+	setAddresses()
+	e.waitFor("no values", func() bool {
+		_, st := e.status("shop", "front")
+		return readyReason(st) == "NoValues"
+	})
+	time.Sleep(300 * time.Millisecond)
+	_, st := e.status("shop", "front")
+	must.True(t, st.Owned)
+	must.Eq(t, []string{"198.51.100.7"}, e.zone.RecordValues("front.shop.example.com", "A"))
+
+	// The load balancer is deleted: the name no longer points at its
+	// address.
+	e.b.RemoveObject(LoadBalancerKind, "shop", "front")
+	e.waitFor("the set is gone with the load balancer", func() bool {
+		_, st := e.status("shop", "front")
+		return readyReason(st) == "NoValues" && !st.Owned && len(e.zone.RecordValues("front.shop.example.com", "A")) == 0
+	})
+}
+
 func TestDNSRecord_ZoneWithoutRecords(t *testing.T) {
 	e := startOperator(t, false)
 	e.cluster.allow("shop", "shop.example.com")

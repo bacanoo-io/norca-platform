@@ -116,6 +116,11 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		return outcome{}, 0, fmt.Errorf("reading the namespace %s: %w", obj.Key.Namespace, err)
 	}
 	if !allowed(spec.Name, meta) {
+		// The namespace has no right to the name (any more): a record set
+		// the operator wrote for it while it had is not served on.
+		if err := r.release(ctx, obj, status, fmt.Sprintf("the namespace %q may no longer write the name", obj.Key.Namespace)); err != nil {
+			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+		}
 		return outcome{reason: "NotAllowed", message: fmt.Sprintf(
 			"the namespace %q may not write %s: its allow list (namespace metadata %s) is %q",
 			obj.Key.Namespace, spec.Name, MetaDNSSuffixes, meta[MetaDNSSuffixes])}, r.requeueWaiting, nil
@@ -138,11 +143,19 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
 	}
 
-	values, why, err := r.values(ctx, obj, spec)
+	values, why, gone, err := r.values(ctx, obj, spec)
 	if err != nil {
 		return outcome{}, 0, err
 	}
 	if why != "" {
+		// A source that has no value for a while leaves the last values
+		// served. A source that was deleted does not: its addresses are
+		// free for someone else, and the name must not point at them.
+		if gone {
+			if err := r.release(ctx, obj, status, why); err != nil {
+				return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+			}
+		}
 		return outcome{reason: "NoValues", message: why}, r.requeueWaiting, nil
 	}
 
@@ -313,17 +326,18 @@ func keyLess(a, b controller.ObjectKey) bool {
 }
 
 // values returns the values of a record: from the spec, or from its
-// source. why says why there are none yet.
-func (r *reconciler) values(ctx context.Context, obj *controller.Object, spec Spec) (values []string, why string, err error) {
+// source. why says why there are none yet; gone says the source itself does
+// not exist.
+func (r *reconciler) values(ctx context.Context, obj *controller.Object, spec Spec) (values []string, why string, gone bool, err error) {
 	if spec.Source == nil || spec.Source.LoadBalancer == "" {
-		return spec.Values, "", nil
+		return spec.Values, "", false, nil
 	}
 	lb, err := r.ctrl.Backend().ReadObject(ctx, LoadBalancerKind, obj.Key.Namespace, spec.Source.LoadBalancer)
 	if errors.Is(err, controller.ErrNotFound) {
-		return nil, fmt.Sprintf("the LoadBalancer %q of the namespace does not exist", spec.Source.LoadBalancer), nil
+		return nil, fmt.Sprintf("the LoadBalancer %q of the namespace does not exist", spec.Source.LoadBalancer), true, nil
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("reading the LoadBalancer %s: %w", spec.Source.LoadBalancer, err)
+		return nil, "", false, fmt.Errorf("reading the LoadBalancer %s: %w", spec.Source.LoadBalancer, err)
 	}
 	var st struct {
 		Addresses []string `json:"addresses"`
@@ -332,9 +346,9 @@ func (r *reconciler) values(ctx context.Context, obj *controller.Object, spec Sp
 	values = loadBalancerValues(spec.Type, st.Addresses)
 	if len(values) == 0 {
 		return nil, fmt.Sprintf("the LoadBalancer %q has no %s address yet (addresses: %s)",
-			spec.Source.LoadBalancer, spec.Type, strings.Join(st.Addresses, ", ")), nil
+			spec.Source.LoadBalancer, spec.Type, strings.Join(st.Addresses, ", ")), false, nil
 	}
-	return values, "", nil
+	return values, "", false, nil
 }
 
 // release removes the record set the status of a record holds and gives it
