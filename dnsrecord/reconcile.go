@@ -502,19 +502,29 @@ func previousReady(obj *controller.Object) *controller.Condition {
 	return st.Condition(controller.ConditionReady)
 }
 
-// loadBalancerSource reconciles the records with a load balancer source
-// when a load balancer changes.
+// loadBalancerSource reconciles the records that take their values from a
+// load balancer when it changes. An event that does not say which load
+// balancer changed reconciles every record with a load balancer source.
 func loadBalancerSource() controller.Source {
 	return &controller.EventSource{
 		SourceName: "loadbalancers",
 		Topics:     map[api.Topic][]string{api.TopicCustomObject: {LoadBalancerKind.Group + "/" + LoadBalancerKind.Kind}},
-		Map: func(_ *api.Event, sc *controller.SourceContext) []controller.ObjectKey {
+		Map: func(ev *api.Event, sc *controller.SourceContext) []controller.ObjectKey {
+			lb, err := ev.CustomObject()
+			if err != nil {
+				// An event that can't be read names no load balancer.
+				lb = nil
+			}
 			var keys []controller.ObjectKey
 			for _, obj := range sc.Objects() {
 				var spec Spec
-				if obj.DecodeSpec(&spec) == nil && spec.Source != nil && spec.Source.LoadBalancer != "" {
-					keys = append(keys, obj.Key)
+				if obj.DecodeSpec(&spec) != nil || spec.Source == nil || spec.Source.LoadBalancer == "" {
+					continue
 				}
+				if lb != nil && (obj.Key.Namespace != lb.Namespace || spec.Source.LoadBalancer != lb.Name) {
+					continue
+				}
+				keys = append(keys, obj.Key)
 			}
 			return keys
 		},

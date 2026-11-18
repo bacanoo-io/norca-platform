@@ -5,6 +5,7 @@ package dnsrecord
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"maps"
@@ -775,6 +776,44 @@ func TestDNSRecord_LoadBalancerSource(t *testing.T) {
 	})
 	_, st := e.status("shop", "front")
 	must.Zero(t, st.Drifts)
+}
+
+// A change of a load balancer reconciles the records that take their values
+// from it, not every record that has a load balancer as its source.
+func TestLoadBalancerSource_OnlyTheRecordsOfTheLoadBalancer(t *testing.T) {
+	src := loadBalancerSource().(*controller.EventSource)
+	record := func(ns, name string, spec map[string]any) *controller.Object {
+		raw, err := json.Marshal(spec)
+		must.NoError(t, err)
+		return &controller.Object{Kind: Kind, Key: controller.ObjectKey{Namespace: ns, Name: name}, Spec: raw}
+	}
+	objects := []*controller.Object{
+		record("shop", "front", map[string]any{"name": "front.shop.example.com", "type": "A", "source": map[string]any{"load_balancer": "front"}}),
+		record("shop", "front6", map[string]any{"name": "front.shop.example.com", "type": "AAAA", "source": map[string]any{"load_balancer": "front"}}),
+		record("shop", "back", map[string]any{"name": "back.shop.example.com", "type": "A", "source": map[string]any{"load_balancer": "back"}}),
+		record("blog", "front", map[string]any{"name": "front.blog.example.com", "type": "A", "source": map[string]any{"load_balancer": "front"}}),
+		record("shop", "www", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.1"}}),
+	}
+	sc := &controller.SourceContext{Objects: func() []*controller.Object { return objects }}
+	event := func(lb *api.CustomObject) *api.Event {
+		raw, err := json.Marshal(map[string]any{"Object": lb})
+		must.NoError(t, err)
+		var payload map[string]any
+		must.NoError(t, json.Unmarshal(raw, &payload))
+		return &api.Event{Topic: api.TopicCustomObject, Namespace: lb.Namespace, Payload: payload}
+	}
+
+	keys := src.Map(event(&api.CustomObject{Group: LoadBalancerKind.Group, Kind: LoadBalancerKind.Kind, Namespace: "shop", Name: "front"}), sc)
+	must.Eq(t, []controller.ObjectKey{{Namespace: "shop", Name: "front"}, {Namespace: "shop", Name: "front6"}}, keys)
+
+	keys = src.Map(event(&api.CustomObject{Group: LoadBalancerKind.Group, Kind: LoadBalancerKind.Kind, Namespace: "shop", Name: "gone"}), sc)
+	must.Len(t, 0, keys, must.Sprint("a load balancer no record takes its values from"))
+
+	// An event without the object: every record with a load balancer as
+	// its source is looked at, as nothing says which one changed.
+	keys = src.Map(&api.Event{Topic: api.TopicCustomObject}, sc)
+	must.Eq(t, []controller.ObjectKey{{Namespace: "shop", Name: "front"}, {Namespace: "shop", Name: "front6"},
+		{Namespace: "shop", Name: "back"}, {Namespace: "blog", Name: "front"}}, keys)
 }
 
 func TestSpecAndValues(t *testing.T) {
