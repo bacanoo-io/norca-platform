@@ -39,7 +39,7 @@ func NewHandler(z *Zone, token string, log *slog.Logger) http.Handler {
 		mux.HandleFunc("DELETE /v1/records/{name}/{type}", h.deleteRecords)
 	} else {
 		mux.HandleFunc("/v1/records/", func(w http.ResponseWriter, _ *http.Request) {
-			wire.WriteError(w, http.StatusForbidden, wire.ReasonInvalid,
+			wire.WriteError(w, http.StatusForbidden, ReasonRecordsDisabled,
 				"the zone "+z.Name+" does not write records: set records = true in its configuration (a type that can write them)")
 		})
 	}

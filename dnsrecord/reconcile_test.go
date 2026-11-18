@@ -63,6 +63,10 @@ type env struct {
 	// a zone whose configuration no longer says records = true does.
 	recordsOff *atomic.Bool
 
+	// forbidDeletes makes something in front of the provider (a proxy)
+	// refuse the deletions of record sets with a 403 of its own.
+	forbidDeletes *atomic.Bool
+
 	// zoneURL is the endpoint of the zone.
 	zoneURL string
 }
@@ -109,15 +113,19 @@ func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env
 	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, params)
 	must.NoError(t, err)
 	z.Records = records
-	failDeletes, recordsOff := &atomic.Bool{}, &atomic.Bool{}
+	failDeletes, recordsOff, forbidDeletes := &atomic.Bool{}, &atomic.Bool{}, &atomic.Bool{}
 	handler := dns.NewHandler(z, "zone-token", nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodDelete && failDeletes.Load() {
 			http.Error(w, "the name server is away", http.StatusBadGateway)
 			return
 		}
+		if req.Method == http.MethodDelete && forbidDeletes.Load() {
+			http.Error(w, "403 Forbidden", http.StatusForbidden)
+			return
+		}
 		if recordsOff.Load() && strings.HasPrefix(req.URL.Path, "/v1/records/") {
-			wire.WriteError(w, http.StatusForbidden, wire.ReasonInvalid, "the zone example.com does not write records")
+			wire.WriteError(w, http.StatusForbidden, dns.ReasonRecordsDisabled, "the zone example.com does not write records")
 			return
 		}
 		handler.ServeHTTP(w, req)
@@ -153,7 +161,7 @@ func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env
 	must.NoError(t, err)
 	r.ctrl = c
 	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r, failDeletes: failDeletes,
-		recordsOff: recordsOff, zoneURL: srv.URL}, c
+		recordsOff: recordsOff, forbidDeletes: forbidDeletes, zoneURL: srv.URL}, c
 }
 
 func (e *env) put(ns, name string, spec map[string]any) {
@@ -559,6 +567,31 @@ func TestDNSRecord_DeletedAfterRecordsSwitchedOff(t *testing.T) {
 			must.Eq(t, []string{"192.0.2.10"}, e.zone.RecordValues("www.shop.example.com", "A"))
 		})
 	}
+}
+
+// A 403 that is not the answer of the provider for a zone without records
+// (a proxy in front of it, say) is a failure of the deletion like any
+// other: the record stays until its record set is removed.
+func TestDNSRecord_ForbiddenDeletionIsNoSwitchedOffZone(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	})
+
+	e.forbidDeletes.Store(true)
+	e.b.RemoveObject(Kind, "shop", "web")
+	e.waitFor("the deletion fails", func() bool { return slices.Contains(e.events("shop", "web"), "DeleteFailed") })
+	time.Sleep(300 * time.Millisecond)
+	must.NotNil(t, e.b.GetObject(Kind, "shop", "web"), must.Sprint("the record went with its record set left in the zone"))
+	must.SliceNotContains(t, e.events("shop", "web"), "RecordLeft")
+
+	e.forbidDeletes.Store(false)
+	e.waitFor("the record and its set are gone", func() bool {
+		return e.b.GetObject(Kind, "shop", "web") == nil && len(e.zone.RecordValues("www.shop.example.com", "A")) == 0
+	})
 }
 
 // A namespace that lost the right to a name no longer has it served: the

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -435,10 +434,12 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 		return "", err
 	}
 	err = client.DeleteRecords(ctx, status.Name, status.Type)
-	// The provider answers 403 for the records of a zone without the
-	// switch; the DNSZone object may not say so yet.
+	// The provider answers so for the records of a zone without the switch;
+	// the DNSZone object may not say so yet. Another 403 (of a proxy in
+	// front of the provider, say) is a failure like any other: the record
+	// must not go while its set is in the zone.
 	var re *dns.ResponseError
-	if errors.As(err, &re) && re.Status == http.StatusForbidden {
+	if errors.As(err, &re) && re.RecordsDisabled() {
 		r.logger.Warn("the provider of the zone refuses the records contract: the record set stays", "zone", status.Zone,
 			"name", status.Name, "type", status.Type, "answer", re.Message)
 		return switchedOff, nil

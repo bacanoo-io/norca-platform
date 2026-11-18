@@ -28,6 +28,14 @@ import (
 //
 // A record set is every value of one name and type. The challenge names of
 // the TXT contract are not written through here: they belong to norca-acme.
+//
+// A zone that does not serve them answers every request of the records
+// contract with 403 and the reason ReasonRecordsDisabled.
+
+// ReasonRecordsDisabled is the reason of the answer of a zone that does not
+// write records. Only this answer says so: a 403 without it (from a proxy
+// in front of the provider, for example) says nothing of the zone.
+const ReasonRecordsDisabled = "records_disabled"
 
 // The record types of the contract.
 const (

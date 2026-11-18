@@ -258,8 +258,8 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 		c := newClient(t, "", false)
 		_, err := c.Records(ctx(t), name)
 		var re *dns.ResponseError
-		if !errors.As(err, &re) || re.Status != http.StatusForbidden {
-			t.Fatalf("a zone without records = true: %v", err)
+		if !errors.As(err, &re) || !re.RecordsDisabled() {
+			t.Fatalf("a zone without records = true: %v, want a 403 with the reason %s", err, dns.ReasonRecordsDisabled)
 		}
 		if n := calls.Load(); n != 0 {
 			t.Fatalf("%d requests of a zone without records = true reached the provider", n)

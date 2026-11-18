@@ -51,7 +51,13 @@ func (e *ResponseError) Error() string {
 // Invalid reports whether the provider refused the request as one it
 // cannot satisfy (the same request fails again).
 func (e *ResponseError) Invalid() bool {
-	return e.Reason == wire.ReasonInvalid || e.Status == http.StatusUnprocessableEntity
+	return e.Reason == wire.ReasonInvalid || e.Status == http.StatusUnprocessableEntity || e.RecordsDisabled()
+}
+
+// RecordsDisabled reports whether the provider answered that its zone does
+// not write records (records = true is not in its configuration).
+func (e *ResponseError) RecordsDisabled() bool {
+	return e.Status == http.StatusForbidden && e.Reason == ReasonRecordsDisabled
 }
 
 // Present adds the value to the TXT records of the name. A TTL of 0 leaves
