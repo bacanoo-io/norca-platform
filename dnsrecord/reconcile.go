@@ -145,7 +145,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	if err != nil {
 		return outcome{}, 0, err
 	}
-	if other != "" {
+	if other != (controller.ObjectKey{}) {
 		// The record lost the name: it holds no record set from here on.
 		// The set of the contested name and type is the other record's and
 		// stays; a set it wrote under the name its spec had before goes.
@@ -154,7 +154,13 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		} else if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", spec.Type, spec.Name)); err != nil {
 			return failed("removing the record set", err), 0, err
 		}
-		msg := fmt.Sprintf("the DNSRecord %s writes %s %s", other, spec.Type, spec.Name)
+		msg := fmt.Sprintf("%s writes %s %s", otherRecord(obj.Key, other), spec.Type, spec.Name)
+		// The message may not name the other record; the log does, once
+		// for every new conflict, not at every requeue while it lasts.
+		if c := status.Condition(ConditionConflict); c == nil || c.Status != controller.ConditionTrue || c.Message != msg {
+			r.logger.Info("another record holds the name and type of a record", "record", obj.Key.String(),
+				"holder", other.String(), "name", spec.Name, "type", spec.Type)
+		}
 		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
 	}
 
@@ -279,19 +285,19 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		message: fmt.Sprintf("the zone %s holds %s %s", zone.Name, want.Type, want.Name)}, r.requeueReady, nil
 }
 
-// holder returns the namespace/name of another DNSRecord that keeps this
-// record from the name and type of its spec, or "".
+// holder returns the key of another DNSRecord that keeps this record from
+// the name and type of its spec, or the zero key.
 //
 // The record whose status holds the record set keeps it, whichever record
 // is older: a record that is deleted holds its set until the operator has
 // removed it. A set nobody holds yet goes to the oldest record that may
 // write the name: a record of a namespace whose allow list does not hold
 // the name claims nothing.
-func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Spec, status *Status) (string, error) {
+func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Spec, status *Status) (controller.ObjectKey, error) {
 	mine := status.Owned && status.Name == spec.Name && status.Type == spec.Type
 	all, err := r.records(ctx)
 	if err != nil {
-		return "", err
+		return controller.ObjectKey{}, err
 	}
 	var owner, first *controller.Object
 	for _, other := range all {
@@ -313,7 +319,7 @@ func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Sp
 		}
 		meta, err := r.cluster.NamespaceMeta(ctx, other.Key.Namespace)
 		if err != nil && !errors.Is(err, controller.ErrNotFound) {
-			return "", fmt.Errorf("reading the namespace %s: %w", other.Key.Namespace, err)
+			return controller.ObjectKey{}, fmt.Errorf("reading the namespace %s: %w", other.Key.Namespace, err)
 		}
 		if allowed(os.Name, meta) {
 			first = other
@@ -323,11 +329,23 @@ func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Sp
 	case owner != nil && (!mine || before(owner, obj)):
 		// Two records that both hold the set (written at the same moment):
 		// the older one keeps it.
-		return owner.Key.Namespace + "/" + owner.Key.Name, nil
+		return owner.Key, nil
 	case owner == nil && first != nil:
-		return first.Key.Namespace + "/" + first.Key.Name, nil
+		return first.Key, nil
 	}
-	return "", nil
+	return controller.ObjectKey{}, nil
+}
+
+// otherRecord names another DNSRecord in a condition or an event of the
+// record key, which the team of its namespace reads: by namespace and name
+// when it is in the same namespace, and only as a record of another
+// namespace otherwise. A team does not learn the namespaces and records of
+// the others from a conflict over a name; the operator logs the full key.
+func otherRecord(key, other controller.ObjectKey) string {
+	if other.Namespace == key.Namespace {
+		return "the DNSRecord " + other.Namespace + "/" + other.Name
+	}
+	return "a DNSRecord in another namespace"
 }
 
 // records returns the DNSRecords of every namespace. A name is one for the
@@ -437,7 +455,9 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 		}
 		var st Status
 		if other.DecodeStatus(&st) == nil && st.Owned && st.Zone == status.Zone && st.Name == status.Name && st.Type == status.Type {
-			return fmt.Sprintf("the DNSRecord %s/%s holds it", other.Key.Namespace, other.Key.Name), nil
+			r.logger.Info("a record set stays: another record holds it", "record", obj.Key.String(),
+				"holder", other.Key.String(), "zone", status.Zone, "name", status.Name, "type", status.Type)
+			return otherRecord(obj.Key, other.Key) + " holds it", nil
 		}
 	}
 

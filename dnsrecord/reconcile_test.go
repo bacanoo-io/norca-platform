@@ -349,7 +349,8 @@ func TestDNSRecord_ConflictsAndAdopt(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	_, st := e.status("other", "mail")
 	must.Eq(t, ConditionConflict, readyReason(st))
-	must.StrContains(t, st.Condition(ConditionConflict).Message, "the DNSRecord shop/mail writes")
+	must.StrContains(t, st.Condition(ConditionConflict).Message, "a DNSRecord in another namespace writes A mail.shop.example.com")
+	must.StrNotContains(t, st.Condition(ConditionConflict).Message, "shop/")
 	must.False(t, st.Owned)
 	must.Eq(t, []string{"192.0.2.25"}, e.zone.RecordValues("mail.shop.example.com", "A"))
 
@@ -390,7 +391,8 @@ func TestDNSRecord_HolderKeepsTheSet(t *testing.T) {
 	})
 	_, st := e.status("other", "old")
 	must.False(t, st.Owned, must.Sprint("a record that lost a name holds no set"))
-	must.StrContains(t, st.Condition(ConditionConflict).Message, "the DNSRecord shop/www writes")
+	must.StrContains(t, st.Condition(ConditionConflict).Message, "a DNSRecord in another namespace writes")
+	must.StrNotContains(t, st.Condition(ConditionConflict).Message, "shop/")
 	must.Len(t, 0, e.zone.RecordValues("old.shop.example.com", "A"), must.Sprint("the set of the name it left"))
 	time.Sleep(300 * time.Millisecond)
 	_, st = e.status("shop", "www")
@@ -610,7 +612,8 @@ func TestDNSRecord_OneNamespaceSeesTheHoldersOfAll(t *testing.T) {
 	})
 	_, st := e.status("shop", "www")
 	must.Eq(t, ConditionConflict, readyReason(st))
-	must.StrContains(t, st.Condition(ConditionConflict).Message, "the DNSRecord other/www writes")
+	must.StrContains(t, st.Condition(ConditionConflict).Message, "a DNSRecord in another namespace writes")
+	must.StrNotContains(t, st.Condition(ConditionConflict).Message, "other/")
 	must.False(t, st.Owned)
 
 	// Deleted here: the set of the other namespace stays.
@@ -637,7 +640,7 @@ func TestRemove_OneNamespaceLeavesTheSetOfAnotherNamespace(t *testing.T) {
 
 	kept, err := e.r.remove(ctx, obj, &st)
 	must.NoError(t, err)
-	must.StrContains(t, kept, "the DNSRecord other/www holds it")
+	must.Eq(t, "a DNSRecord in another namespace holds it", kept)
 	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
 }
 
@@ -1087,4 +1090,13 @@ func TestSpecAndValues(t *testing.T) {
 	must.Eq(t, []string{"198.51.100.7"}, loadBalancerValues("A", addrs))
 	must.Eq(t, []string{"2001:db8::7"}, loadBalancerValues("AAAA", addrs))
 	must.Eq(t, []string{"lb-1.cloud.example.net"}, loadBalancerValues("CNAME", addrs))
+}
+
+// A condition or an event of a record names another record of its own
+// namespace, and of another namespace only that it is one: a team does not
+// learn the records of the other namespaces from a conflict over a name.
+func TestOtherRecord_NamesOnlyRecordsOfTheSameNamespace(t *testing.T) {
+	key := controller.ObjectKey{Namespace: "shop", Name: "www"}
+	must.Eq(t, "the DNSRecord shop/web", otherRecord(key, controller.ObjectKey{Namespace: "shop", Name: "web"}))
+	must.Eq(t, "a DNSRecord in another namespace", otherRecord(key, controller.ObjectKey{Namespace: "team-b", Name: "web"}))
 }
