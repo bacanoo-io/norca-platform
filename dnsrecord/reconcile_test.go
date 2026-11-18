@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -117,7 +118,7 @@ func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env
 	handler := dns.NewHandler(z, "zone-token", nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodDelete && failDeletes.Load() {
-			http.Error(w, "the name server is away", http.StatusBadGateway)
+			wire.WriteError(w, http.StatusBadGateway, wire.ReasonError, "update of www on ns1.internal.example:53: the name server is away")
 			return
 		}
 		if req.Method == http.MethodDelete && forbidDeletes.Load() {
@@ -592,6 +593,69 @@ func TestDNSRecord_ForbiddenDeletionIsNoSwitchedOffZone(t *testing.T) {
 	e.waitFor("the record and its set are gone", func() bool {
 		return e.b.GetObject(Kind, "shop", "web") == nil && len(e.zone.RecordValues("www.shop.example.com", "A")) == 0
 	})
+}
+
+// The conditions and the events of a record are read by the team of its
+// namespace: a failure shows there without the configuration of the
+// operator (the endpoint of a zone, the path of its token Variable) and
+// without what the provider says of its name server.
+func TestDNSRecord_FailuresDoNotShowTheConfiguration(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	ready := func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	}
+	e.waitFor("written", ready)
+	zone := func(endpoint, tokenVariable string) {
+		e.b.PutObject(&api.CustomObject{Group: ZoneKind.Group, Kind: ZoneKind.Kind, Name: "example.com", Spec: map[string]any{
+			"zone": "example.com", "provider": "dns-lab", "endpoint": endpoint, "tokenVariable": tokenVariable, "records": true,
+		}})
+	}
+	reason := func(want string) func() bool {
+		return func() bool {
+			_, st := e.status("shop", "web")
+			return readyReason(st) == want
+		}
+	}
+	hidden := func(what string, secret string) {
+		t.Helper()
+		_, st := e.status("shop", "web")
+		texts := []string{st.Condition(controller.ConditionReady).Message}
+		for _, ev := range e.b.ObjectEvents(Kind, "shop", "web") {
+			texts = append(texts, ev.Message)
+		}
+		for _, text := range texts {
+			if strings.Contains(text, secret) {
+				t.Fatalf("%s: the record shows %q: %q", what, secret, text)
+			}
+		}
+	}
+
+	// A provider that can't be reached.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	must.NoError(t, err)
+	away := ln.Addr().String()
+	must.NoError(t, ln.Close())
+	zone("http://"+away+"/zones/example.com", "providers/dns-lab")
+	e.waitFor("failed", reason("Failed"))
+	hidden("an endpoint that can't be reached", away)
+
+	// A token Variable that is not there.
+	zone(e.zoneURL, "providers/missing-token")
+	e.waitFor("the zone can't be used", reason("ZoneUnavailable"))
+	hidden("a token Variable that is missing", "providers/missing-token")
+
+	// The provider fails a deletion with the error of its name server.
+	zone(e.zoneURL, "providers/dns-lab")
+	e.waitFor("written again", ready)
+	e.failDeletes.Store(true)
+	e.cluster.allow("shop", "other.example.com")
+	e.waitFor("the removal failed", func() bool {
+		return slices.Contains(e.events("shop", "web"), "DeleteFailed") && reason("Failed")()
+	})
+	hidden("a deletion the provider failed", "ns1.internal.example")
 }
 
 // A namespace that lost the right to a name no longer has it served: the

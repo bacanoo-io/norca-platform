@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -96,7 +97,9 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// status observes the current one when it is written.
 	out, requeue, err := r.keep(ctx, obj, &status)
 	if err != nil && out.reason == "" {
-		out = outcome{reason: "Failed", message: err.Error()}
+		// What keep returns without an outcome are failures to read the
+		// cluster; the controller logs the error.
+		out = outcome{reason: "Failed", message: failureText("reading the cluster", err)}
 	}
 	// A failure is an outcome too: the status says it before the reconcile
 	// is tried again, or a record that can't be written stays Ready.
@@ -131,7 +134,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		// The namespace has no right to the name (any more): a record set
 		// the operator wrote for it while it had is not served on.
 		if err := r.release(ctx, obj, status, fmt.Sprintf("the namespace %q may no longer write the name", obj.Key.Namespace)); err != nil {
-			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+			return failed("removing the record set", err), 0, err
 		}
 		return outcome{reason: "NotAllowed", message: fmt.Sprintf(
 			"the namespace %q may not write %s: its allow list (namespace metadata %s) is %q",
@@ -149,7 +152,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		if status.Owned && status.Name == spec.Name && status.Type == spec.Type {
 			status.Owned = false
 		} else if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", spec.Type, spec.Name)); err != nil {
-			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+			return failed("removing the record set", err), 0, err
 		}
 		msg := fmt.Sprintf("the DNSRecord %s writes %s %s", other, spec.Type, spec.Name)
 		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
@@ -165,7 +168,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		// free for someone else, and the name must not point at them.
 		if gone {
 			if err := r.release(ctx, obj, status, why); err != nil {
-				return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+				return failed("removing the record set", err), 0, err
 			}
 		}
 		return outcome{reason: "NoValues", message: why}, r.requeueWaiting, nil
@@ -191,18 +194,23 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	// first: the spec moved it.
 	if status.Owned && (status.Name != want.Name || status.Type != want.Type || status.Zone != zone.Name) {
 		if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", want.Type, want.Name)); err != nil {
-			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+			return failed("removing the record set", err), 0, err
 		}
 	}
 
-	client, clientErr := r.zones.provider(ctx, zone)
-	if msg := problem(clientErr); msg != "" {
+	client, err := r.zones.provider(ctx, zone)
+	if err != nil {
+		// The endpoint of the zone or its token Variable is wrong; the log
+		// says which, the record does not.
+		r.logger.Warn("the registration of a DNS zone can't be used", "zone", zone.Name, "record", obj.Key.String(), "error", err)
+		msg := fmt.Sprintf("norca-dns can't use the registration of the DNS zone %s (its endpoint or its token); the error is in the log of norca-dns", zone.Name)
 		return outcome{reason: "ZoneUnavailable", message: msg}, r.requeueWaiting, nil
 	}
 	sets, err := client.Records(ctx, want.Name)
 	if err != nil {
-		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", "reading the zone: "+err.Error())
-		return outcome{reason: "Failed", message: "reading the zone: " + err.Error(), evented: true}, 0, err
+		out := failed("reading the zone", err)
+		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", out.message)
+		return out, 0, err
 	}
 	var have *dns.RecordSet
 	for i := range sets {
@@ -229,12 +237,16 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 
 	default:
 		if err := client.SetRecords(ctx, want); err != nil {
-			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", err.Error())
+			out := failed("writing the record set", err)
+			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", out.message)
 			var re *dns.ResponseError
 			if errors.As(err, &re) && re.Invalid() {
-				return outcome{reason: "Failed", message: err.Error(), evented: true}, r.requeueWaiting, nil
+				// Not retried before something changes: the error is not
+				// returned, so it is logged here.
+				r.logger.Warn("the provider refused a record set", "zone", zone.Name, "record", obj.Key.String(), "error", err)
+				return out, r.requeueWaiting, nil
 			}
-			return outcome{reason: "Failed", message: err.Error(), evented: true}, 0, err
+			return out, 0, err
 		}
 		now := r.now().UTC().Format(time.RFC3339)
 		status.WrittenAt = now
@@ -371,7 +383,8 @@ func (r *reconciler) release(ctx context.Context, obj *controller.Object, status
 	}
 	kept, err := r.remove(ctx, obj, status)
 	if err != nil {
-		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", err.Error())
+		// The caller returns the error, and the controller logs it.
+		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", failureText("removing the record set", err))
 		return err
 	}
 	if kept != "" {
@@ -607,4 +620,35 @@ func problem(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// The conditions and the events of a record are read by whoever may read
+// the record, the team of its namespace too. Of a failure they say what
+// failed, not the configuration of the operator (the endpoint of a zone,
+// the path of its token Variable) nor what the provider or the cluster API
+// says of their own failures (addresses of name servers and servers): the
+// error itself goes to the log of norca-dns.
+
+// failed is the outcome of a failure whose event the reconcile records
+// itself.
+func failed(what string, err error) outcome {
+	return outcome{reason: "Failed", message: failureText(what, err), evented: true}
+}
+
+// failureText returns what the status and the events of a record say of a
+// failure. A request the provider refuses as one it can't satisfy (the
+// values of the record, a zone without records) is shown with the answer
+// of the provider, which is about the request.
+func failureText(what string, err error) string {
+	if re, ok := errors.AsType[*dns.ResponseError](err); ok {
+		switch {
+		case re.Status == http.StatusUnauthorized:
+			return what + ": the provider of the zone refused the token of norca-dns"
+		case re.Invalid() && re.Reason != "":
+			return what + ": the provider of the zone refused the request: " + re.Message
+		default:
+			return fmt.Sprintf("%s: the provider of the zone answered %d; the error is in the log of norca-dns", what, re.Status)
+		}
+	}
+	return what + " failed; the error is in the log of norca-dns"
 }

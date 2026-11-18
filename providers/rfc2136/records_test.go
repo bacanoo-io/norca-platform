@@ -285,6 +285,11 @@ func TestRecords_CNAMEStandsAlone(t *testing.T) {
 	if !errors.Is(err, dns.ErrInvalid) {
 		t.Fatalf("a CNAME next to an A record: %v, want an error wrapping ErrInvalid", err)
 	}
+	// The refusal goes to the writer of the record, who has no business
+	// with the address of the name server.
+	if strings.Contains(err.Error(), rs.addr) {
+		t.Fatalf("the refusal names the name server: %v", err)
+	}
 	if got := rs.values(www, dns.TypeCNAME); len(got) != 0 {
 		t.Fatalf("the name server holds the CNAME %q", got)
 	}

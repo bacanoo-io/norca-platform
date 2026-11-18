@@ -272,8 +272,10 @@ func (p *Provider) SetRecords(ctx context.Context, set dns.RecordSet) error {
 		if set.Type == dns.TypeCNAME {
 			why = "the name has other records, and a CNAME stands alone"
 		}
-		return dns.Invalid("the name server %s took the update of %s %s but does not hold its values (it holds %q): if %s, the server ignores the update",
-			p.server, set.Type, set.Name, have.Values, why)
+		// The refusal is shown to the writer of the record: it does not
+		// name the server.
+		return dns.Invalid("the name server took the update of %s %s but does not hold its values (it holds %q): if %s, the server ignores the update",
+			set.Type, set.Name, have.Values, why)
 	}
 	return nil
 }
