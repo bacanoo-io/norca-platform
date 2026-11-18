@@ -478,12 +478,30 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 }
 
 // finishDeletion removes the record set of a deleted object and lets the
-// object go.
+// object go. A record whose deletion policy is retain goes without touching
+// the zone. A removal that fails is tried again, and the status says how to
+// let the record go instead: a set must not be left in the zone unless the
+// writer of the record asks for it, and the spec can be changed while the
+// record is being deleted.
 func (r *reconciler) finishDeletion(ctx context.Context, obj *controller.Object, status *Status) (time.Duration, error) {
 	if !obj.HasFinalizer(Finalizer) {
 		return 0, nil
 	}
-	if err := r.release(ctx, obj, status, "the record was deleted"); err != nil {
+	var spec Spec
+	if obj.DecodeSpec(&spec) == nil && spec.DeletionPolicy == DeletionRetain {
+		if status.Owned {
+			r.logger.Info("a deleted record leaves its record set in the zone (deletion_policy = retain)", "record", obj.Key.String(),
+				"zone", status.Zone, "name", status.Name, "type", status.Type)
+			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordLeft",
+				fmt.Sprintf("%s %s stays in the zone %s: the record says deletion_policy = %q", status.Type, status.Name, status.Zone, DeletionRetain))
+		}
+	} else if err := r.release(ctx, obj, status, "the record was deleted"); err != nil {
+		out := failed("removing the record set", err)
+		out.reason = "DeleteFailed"
+		out.message += fmt.Sprintf(`; it is tried again. deletion_policy = %q in the spec lets the record go and leaves the record set in the zone`, DeletionRetain)
+		if werr := r.writeStatus(ctx, obj, status, out); werr != nil {
+			r.logger.Warn("writing the status of a record failed", "record", obj.Key.String(), "error", werr)
+		}
 		return 0, err
 	}
 	_, err := r.ctrl.Objects().RemoveFinalizer(ctx, obj, Finalizer)

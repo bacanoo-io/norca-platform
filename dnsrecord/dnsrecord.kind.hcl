@@ -37,6 +37,7 @@ kind "DNSRecord" {
     column "Type" { path = "spec.type" }
     column "Values" { path = "status.values" }
     column "Zone" { path = "status.zone" }
+    column "Deletion" { path = "spec.deletion_policy" }
     column "Ready" { path = "status.conditions[?type=='Ready'].status" }
   }
 }

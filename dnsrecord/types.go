@@ -52,6 +52,18 @@ const MetaDNSSuffixes = "norca.io/dns-suffixes"
 // the name and type.
 const ConditionConflict = "Conflict"
 
+// The deletion policies of a record: what its deletion does with the record
+// set the operator holds for it.
+const (
+	// DeletionDelete removes the record set; the record stays until that
+	// succeeds. The default.
+	DeletionDelete = "delete"
+
+	// DeletionRetain leaves the record set in the zone: the record goes at
+	// once. It is the way out of a deletion that can't remove the set.
+	DeletionRetain = "retain"
+)
+
 // Spec is the spec of a DNSRecord object.
 type Spec struct {
 	// Name is the fully qualified name of the record set.
@@ -72,6 +84,9 @@ type Spec struct {
 	// Adopt takes over a record set of the name and type that the operator
 	// did not write.
 	Adopt bool `json:"adopt,omitempty"`
+
+	// DeletionPolicy is DeletionDelete (also when empty) or DeletionRetain.
+	DeletionPolicy string `json:"deletion_policy,omitempty"`
 }
 
 // Source takes the values of a record set from an object of the cluster.
@@ -120,6 +135,9 @@ func (s *Spec) normalize() error {
 	}
 	if s.TTL < 0 || s.TTL > dns.MaxRecordTTL {
 		return fmt.Errorf("ttl must be 0 (the default) to %d seconds", dns.MaxRecordTTL)
+	}
+	if s.DeletionPolicy != "" && s.DeletionPolicy != DeletionDelete && s.DeletionPolicy != DeletionRetain {
+		return fmt.Errorf("deletion_policy %q is not %q or %q", s.DeletionPolicy, DeletionDelete, DeletionRetain)
 	}
 	hasSource := s.Source != nil && s.Source.LoadBalancer != ""
 	switch {

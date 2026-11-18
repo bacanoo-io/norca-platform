@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -728,6 +729,55 @@ func TestDNSRecord_FailuresDoNotShowTheConfiguration(t *testing.T) {
 	hidden("a deletion the provider failed", "ns1.internal.example")
 }
 
+// A deletion that can't remove the record set (here: the token Variable of
+// the zone is gone) is tried again and again, and the status says how to
+// let the record go: deletion_policy = "retain", set while the record is
+// being deleted, removes the finalizer and leaves the record set in the
+// zone.
+func TestDNSRecord_RetainLetsAStuckDeletionGo(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}}
+	e.put("shop", "web", spec)
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	})
+
+	e.b.RemoveVariable("default", "providers/dns-lab")
+	e.b.RemoveObject(Kind, "shop", "web")
+	e.waitFor("the deletion fails, and the status says so", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "DeleteFailed"
+	})
+	time.Sleep(300 * time.Millisecond)
+	obj, st := e.status("shop", "web")
+	must.NotNil(t, obj, must.Sprint("the record went while its record set is in the zone"))
+	must.StrContains(t, st.Condition(controller.ConditionReady).Message, `deletion_policy = "retain"`)
+	must.True(t, st.Owned)
+
+	retained := maps.Clone(spec)
+	retained["deletion_policy"] = "retain"
+	e.put("shop", "web", retained)
+	e.waitFor("the record is gone", func() bool { return e.b.GetObject(Kind, "shop", "web") == nil })
+	must.Eq(t, []string{"192.0.2.10"}, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the record set stays"))
+}
+
+// With deletion_policy = "retain" a deleted record leaves its record set
+// in the zone also when it could be removed.
+func TestDNSRecord_RetainedRecordSetStays(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}, "deletion_policy": "retain"})
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	})
+	e.b.RemoveObject(Kind, "shop", "web")
+	e.waitFor("the record is gone", func() bool { return e.b.GetObject(Kind, "shop", "web") == nil })
+	must.Eq(t, []string{"192.0.2.10"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
 // A namespace that lost the right to a name no longer has it served: the
 // record set the operator wrote for it goes.
 func TestDNSRecord_AllowListWithdrawn(t *testing.T) {
@@ -983,6 +1033,29 @@ func TestLoadBalancerSource_OnlyTheRecordsOfTheLoadBalancer(t *testing.T) {
 		{Namespace: "shop", Name: "back"}, {Namespace: "blog", Name: "front"}}, keys)
 }
 
+// The kind definition declares every field of Spec, with the deletion
+// policies the operator knows.
+func TestDNSRecord_KindFiles(t *testing.T) {
+	raw, err := os.ReadFile("dnsrecord.schema.json")
+	must.NoError(t, err)
+	var schema struct {
+		Properties map[string]struct {
+			Properties map[string]map[string]any `json:"properties"`
+		} `json:"properties"`
+	}
+	must.NoError(t, json.Unmarshal(raw, &schema))
+	spec := schema.Properties["spec"].Properties
+	for _, field := range []string{"name", "type", "ttl", "values", "source", "adopt", "deletion_policy"} {
+		must.MapContainsKey(t, spec, field)
+	}
+	must.Eq[any](t, []any{DeletionDelete, DeletionRetain}, spec["deletion_policy"]["enum"])
+	must.Eq[any](t, DeletionDelete, spec["deletion_policy"]["default"])
+
+	kind, err := os.ReadFile("dnsrecord.kind.hcl")
+	must.NoError(t, err)
+	must.StrContains(t, string(kind), `column "Deletion" { path = "spec.deletion_policy" }`)
+}
+
 func TestSpecAndValues(t *testing.T) {
 	for _, tc := range []struct {
 		spec Spec
@@ -994,6 +1067,8 @@ func TestSpecAndValues(t *testing.T) {
 		{Spec{Name: "www.example.com", Type: "MX", Values: []string{"x"}}, "type"},
 		{Spec{Name: "*.example.com", Type: "A", Values: []string{"192.0.2.1"}}, "not a DNS name"},
 		{Spec{Name: "www.example.com", Type: "a", Values: []string{"192.0.2.1"}}, ""},
+		{Spec{Name: "www.example.com", Type: "A", Values: []string{"192.0.2.1"}, DeletionPolicy: "retain"}, ""},
+		{Spec{Name: "www.example.com", Type: "A", Values: []string{"192.0.2.1"}, DeletionPolicy: "keep"}, "deletion_policy"},
 	} {
 		err := tc.spec.normalize()
 		if tc.err == "" {
