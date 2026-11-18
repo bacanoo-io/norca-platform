@@ -7,8 +7,12 @@
 #   norca acl policy apply -namespace default -job norca-dns \
 #     norca-dns norca-dns-policy.hcl
 #
-# The records are namespaced: the rules below are for every namespace ("*");
-# an operator for some namespaces only (-namespace) needs them there only.
+# The records are namespaced: the rules below are for every namespace ("*").
+# An operator for one namespace (-namespace) needs write-status, write-events
+# and manage-finalizers there only, but it still reads the records and the
+# metadata of every namespace: a name is one for the whole cluster, and the
+# record that holds it can be in any namespace. Without that read it can't
+# see such a record, and writes over or removes its record set.
 namespace "*" {
   # The allow list of a namespace is its metadata (norca.io/dns-suffixes).
   capabilities = ["read-job"]

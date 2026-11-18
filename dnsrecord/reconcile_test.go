@@ -84,7 +84,14 @@ func (e *env) zoneRecords(records bool) {
 // zone lets norca-dns write.
 func startOperator(t *testing.T, records bool, zoneParams ...map[string]any) *env {
 	t.Helper()
-	e, c := newOperator(t, records, zoneParams...)
+	return startOperatorIn(t, "*", records, zoneParams...)
+}
+
+// startOperatorIn is startOperator for the records of one namespace
+// (-namespace).
+func startOperatorIn(t *testing.T, namespace string, records bool, zoneParams ...map[string]any) *env {
+	t.Helper()
+	e, c := newOperatorIn(t, namespace, records, zoneParams...)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -101,6 +108,13 @@ func startOperator(t *testing.T, records bool, zoneParams ...map[string]any) *en
 // newOperator is startOperator without running the controller: the methods
 // of the reconciler are called by the test.
 func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env, *controller.Controller) {
+	t.Helper()
+	return newOperatorIn(t, "*", records, zoneParams...)
+}
+
+// newOperatorIn is newOperator for the records of one namespace
+// (-namespace).
+func newOperatorIn(t *testing.T, namespace string, records bool, zoneParams ...map[string]any) (*env, *controller.Controller) {
 	t.Helper()
 	b := fake.New()
 	// An object of another kind gives the first listing an index of its
@@ -147,6 +161,7 @@ func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env
 		},
 		logger:         logger,
 		now:            time.Now,
+		namespace:      namespace,
 		requeueReady:   200 * time.Millisecond,
 		requeueWaiting: 100 * time.Millisecond,
 	}
@@ -154,7 +169,7 @@ func newOperator(t *testing.T, records bool, zoneParams ...map[string]any) (*env
 		Name:        "norca-dns",
 		Kind:        Kind,
 		Storage:     controller.StorageNative,
-		Namespace:   "*",
+		Namespace:   namespace,
 		Sources:     []controller.Source{loadBalancerSource(), zoneSource(r.zones)},
 		Logger:      logger,
 		RateLimiter: controller.NewExponentialBackoff[controller.ObjectKey](10*time.Millisecond, 100*time.Millisecond),
@@ -568,6 +583,61 @@ func TestDNSRecord_DeletedAfterRecordsSwitchedOff(t *testing.T) {
 			must.Eq(t, []string{"192.0.2.10"}, e.zone.RecordValues("www.shop.example.com", "A"))
 		})
 	}
+}
+
+// An operator for one namespace (-namespace) does not keep the records of
+// the others, but a name is one for the whole cluster: a record of another
+// namespace that holds a record set keeps it from the records of this one,
+// and a deletion here does not remove it.
+func TestDNSRecord_OneNamespaceSeesTheHoldersOfAll(t *testing.T) {
+	e := startOperatorIn(t, "shop", true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.cluster.allow("other", "example.com")
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}}
+
+	// The record of the other namespace holds the set (the operator of
+	// that namespace wrote it).
+	must.NoError(t, e.zone.SetRecords(context.Background(), dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+	e.put("other", "www", spec)
+	e.hold("other", "www")
+
+	// A record here with the same spec: the set is not taken over.
+	e.put("shop", "www", spec)
+	e.waitFor("the record waits for the holder of the other namespace", func() bool {
+		_, st := e.status("shop", "www")
+		return readyReason(st) != ""
+	})
+	_, st := e.status("shop", "www")
+	must.Eq(t, ConditionConflict, readyReason(st))
+	must.StrContains(t, st.Condition(ConditionConflict).Message, "the DNSRecord other/www writes")
+	must.False(t, st.Owned)
+
+	// Deleted here: the set of the other namespace stays.
+	e.b.RemoveObject(Kind, "shop", "www")
+	e.waitFor("the record is gone", func() bool { return e.b.GetObject(Kind, "shop", "www") == nil })
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
+// The removal of an operator for one namespace leaves a record set that a
+// record of another namespace holds too.
+func TestRemove_OneNamespaceLeavesTheSetOfAnotherNamespace(t *testing.T) {
+	e, _ := newOperatorIn(t, "shop", true)
+	ctx := context.Background()
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}}
+	for _, ns := range []string{"shop", "other"} {
+		e.put(ns, "www", spec)
+		e.hold(ns, "www")
+	}
+	obj, err := e.r.ctrl.Objects().Get(ctx, controller.ObjectKey{Namespace: "shop", Name: "www"})
+	must.NoError(t, err)
+	var st Status
+	must.NoError(t, obj.DecodeStatus(&st))
+
+	kept, err := e.r.remove(ctx, obj, &st)
+	must.NoError(t, err)
+	must.StrContains(t, kept, "the DNSRecord other/www holds it")
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
 }
 
 // A 403 that is not the answer of the provider for a zone without records

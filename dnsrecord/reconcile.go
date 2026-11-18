@@ -289,8 +289,12 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 // the name claims nothing.
 func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Spec, status *Status) (string, error) {
 	mine := status.Owned && status.Name == spec.Name && status.Type == spec.Type
+	all, err := r.records(ctx)
+	if err != nil {
+		return "", err
+	}
 	var owner, first *controller.Object
-	for _, other := range r.ctrl.Informer().List() {
+	for _, other := range all {
 		if other.Key == obj.Key {
 			continue
 		}
@@ -324,6 +328,22 @@ func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Sp
 		return first.Key.Namespace + "/" + first.Key.Name, nil
 	}
 	return "", nil
+}
+
+// records returns the DNSRecords of every namespace. A name is one for the
+// whole cluster: the records that hold or claim it can be in any namespace,
+// also in those an operator for one namespace (-namespace) does not keep.
+// The operator of every namespace has them in its cache; the operator of
+// one reads them from the servers.
+func (r *reconciler) records(ctx context.Context) ([]*controller.Object, error) {
+	if r.namespace == "" || r.namespace == "*" {
+		return r.ctrl.Informer().List(), nil
+	}
+	all, _, err := r.ctrl.Objects().List(ctx, "*")
+	if err != nil {
+		return nil, fmt.Errorf("listing the DNS records: %w", err)
+	}
+	return all, nil
 }
 
 // holds reports whether the status of a record says the operator holds the
@@ -404,13 +424,10 @@ func (r *reconciler) release(ctx context.Context, obj *controller.Object, status
 // its zone can't be written any more (no longer registered, or records
 // switched off).
 func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status *Status) (kept string, err error) {
-	namespace := r.namespace
-	if namespace == "" {
-		namespace = "*"
-	}
 	// Read from the servers, not from the cache: a set that is deleted
-	// under a record that holds it is an outage of its name.
-	others, _, err := r.ctrl.Objects().List(ctx, namespace)
+	// under a record that holds it is an outage of its name. Every
+	// namespace: the record that holds it can be in any (see records).
+	others, _, err := r.ctrl.Objects().List(ctx, "*")
 	if err != nil {
 		return "", fmt.Errorf("listing the DNS records: %w", err)
 	}

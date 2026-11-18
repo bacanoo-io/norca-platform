@@ -38,7 +38,7 @@ type Settings struct {
 }
 
 func (s *Settings) register(fs *flag.FlagSet) {
-	fs.StringVar(&s.Namespace, "namespace", "*", `namespace of the DNSRecord objects ("*": every namespace)`)
+	fs.StringVar(&s.Namespace, "namespace", "*", `namespace of the DNSRecord objects ("*": every namespace); the records of every namespace are read for the names they hold`)
 	fs.IntVar(&s.Workers, "workers", 2, "records reconciled at once")
 	fs.DurationVar(&s.Resync, "resync", 10*time.Minute, "time between two full looks at every record")
 	fs.DurationVar(&s.Requeue, "requeue", 5*time.Minute, "time after which a record is compared with its zone again (finds changes made in the zone by hand)")
