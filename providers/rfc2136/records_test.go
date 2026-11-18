@@ -39,6 +39,13 @@ type recordServer struct {
 
 	mu  sync.Mutex
 	rrs map[string]map[uint16][]mdns.RR
+
+	// unsignedQueries counts the queries that came without a signature.
+	unsignedQueries int
+
+	// stripSignatures sends the answers without their signature, as a
+	// forger between the provider and the server would.
+	stripSignatures bool
 }
 
 func startRecordServer(t *testing.T) *recordServer {
@@ -64,8 +71,12 @@ func (rs *recordServer) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 	reply := new(mdns.Msg)
 	reply.SetReply(r)
 	rs.mu.Lock()
+	strip := rs.stripSignatures
 	switch {
 	case r.Opcode == mdns.OpcodeQuery && len(r.Question) == 1:
+		if r.IsTsig() == nil {
+			rs.unsignedQueries++
+		}
 		q := r.Question[0]
 		reply.Authoritative = true
 		reply.Answer, reply.Rcode = rs.answer(strings.ToLower(q.Name), q.Qtype)
@@ -122,7 +133,7 @@ func (rs *recordServer) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 		}
 	}
 	rs.mu.Unlock()
-	if tsig := r.IsTsig(); tsig != nil && w.TsigStatus() == nil {
+	if tsig := r.IsTsig(); tsig != nil && w.TsigStatus() == nil && !strip {
 		reply.SetTsig(tsig.Hdr.Name, tsig.Algorithm, 300, time.Now().Unix())
 	}
 	_ = w.WriteMsg(reply)
@@ -354,5 +365,40 @@ func TestRecords_WildcardIsNotARecordSet(t *testing.T) {
 	}
 	if got := types(shop); len(got) != 0 {
 		t.Fatalf("after the deletion: %q", got)
+	}
+}
+
+// With a TSIG key the provider signs its queries too, and takes no answer
+// that is not signed: what it reads back decides whether a set is written
+// and whose it is.
+func TestRecords_AnswersAreSigned(t *testing.T) {
+	rs, p := newRecords(t)
+	ctx := context.Background()
+	www := "www." + testZone
+	set := dns.RecordSet{Name: www, Type: dns.TypeA, TTL: 300, Values: []string{"192.0.2.1"}}
+
+	if err := p.SetRecords(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Records(ctx, www); err != nil {
+		t.Fatal(err)
+	}
+	rs.mu.Lock()
+	unsigned := rs.unsignedQueries
+	rs.stripSignatures = true
+	rs.mu.Unlock()
+	if unsigned != 0 {
+		t.Fatalf("%d queries were sent without a signature", unsigned)
+	}
+
+	if sets, err := p.Records(ctx, www); err == nil {
+		t.Fatalf("the record sets of unsigned answers were taken: %+v", sets)
+	}
+	set.Values = []string{"192.0.2.2"}
+	if err := p.SetRecords(ctx, set); err == nil {
+		t.Fatal("a write was confirmed by unsigned answers")
+	}
+	if err := p.DeleteRecords(ctx, www, dns.TypeA); err == nil {
+		t.Fatal("a deletion was confirmed by an unsigned answer")
 	}
 }

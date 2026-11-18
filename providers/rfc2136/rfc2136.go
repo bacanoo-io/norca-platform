@@ -12,6 +12,9 @@
 // primary of the zone). Adding a record that is there and removing one that
 // is not are no changes for the server, so both calls are idempotent as the
 // contract asks.
+//
+// With a TSIG key the queries that read the records are signed too, and
+// an answer of the server is taken only when it is signed with the key.
 package rfc2136
 
 import (
@@ -46,7 +49,7 @@ var sharedParams = []params.Param{
 	{Name: "server", Type: params.ParamString, Required: true,
 		Description: "address of the name server that accepts the updates (the primary of the zones), host:port or host (port 53)"},
 	{Name: "tsig_key", Type: params.ParamString,
-		Description: "name of the TSIG key the updates are signed with; without it they are not signed"},
+		Description: "name of the TSIG key the updates and queries are signed with, and the answers must be; without it nothing is signed"},
 	{Name: "tsig_secret", Type: params.ParamString, Secret: true,
 		Description: "secret of the TSIG key, base64 (supports env:NAME or file:/path)"},
 	{Name: "tsig_algorithm", Type: params.ParamString, Default: "hmac-sha256", Enum: []string{"hmac-sha256", "hmac-sha384", "hmac-sha512"},
@@ -165,13 +168,12 @@ func (p *Provider) Records(ctx context.Context, name string) ([]dns.RecordSet, e
 // another type in the answer (the CNAME of a name that is an alias) are not
 // records of the type.
 func (p *Provider) query(ctx context.Context, name, recordType string) (dns.RecordSet, error) {
-	client := &mdns.Client{Net: "tcp", Timeout: p.timeout}
 	code := recordTypeCodes[recordType]
 	set := dns.RecordSet{Name: name, Type: recordType}
 	q := new(mdns.Msg)
 	q.SetQuestion(mdns.Fqdn(name), code)
 	q.RecursionDesired = false
-	reply, _, err := client.ExchangeContext(ctx, q, p.server)
+	reply, err := p.roundTrip(ctx, q)
 	if err != nil {
 		return set, fmt.Errorf("query of %s %s on %s: %w", name, recordType, p.server, err)
 	}
@@ -330,13 +332,31 @@ func (p *Provider) exchange(ctx context.Context, change func(*mdns.Msg)) (*mdns.
 	msg := new(mdns.Msg)
 	msg.SetUpdate(mdns.Fqdn(p.zone))
 	change(msg)
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	return p.roundTrip(ctx, msg)
+}
+
+// roundTrip sends a message to the server over TCP and returns its answer.
+// With a TSIG key, queries are signed like updates, and only an answer
+// signed with the key is taken (RFC 8945 5.3: a server signs the answer to
+// a signed message). The client of the library verifies the signature of
+// an answer that has one, but takes an answer without one as it is; such
+// an answer comes from a server that does not know the key, or from
+// someone between the provider and the server, and what the provider reads
+// back decides whether a set is written and whose it is.
+func (p *Provider) roundTrip(ctx context.Context, msg *mdns.Msg) (*mdns.Msg, error) {
 	client := &mdns.Client{Net: "tcp", Timeout: p.timeout}
 	if p.keyName != "" {
 		msg.SetTsig(p.keyName, p.algorithm, 300, time.Now().Unix())
 		client.TsigSecret = map[string]string{p.keyName: p.secret}
 	}
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
 	reply, _, err := client.ExchangeContext(ctx, msg, p.server)
-	return reply, err
+	if err != nil {
+		return nil, err
+	}
+	if p.keyName != "" && reply.IsTsig() == nil {
+		return nil, fmt.Errorf("the answer (%s) is not signed with the TSIG key %s", mdns.RcodeToString[reply.Rcode], p.keyName)
+	}
+	return reply, nil
 }
