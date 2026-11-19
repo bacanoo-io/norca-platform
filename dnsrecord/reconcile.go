@@ -107,6 +107,12 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// keep compares with the generation the operator acted on last; the
 	// status observes the current one when it is written.
 	out, requeue, err := r.keep(ctx, obj, &status)
+	if errors.Is(err, controller.ErrNotLeader) {
+		// The operator may no longer lead (Leading refused a zone write):
+		// nothing was written to the zone, and the record is no worse for
+		// it. The leader reconciles it.
+		return 0, err
+	}
 	if err != nil && out.reason == "" {
 		// What keep returns without an outcome are failures to read the
 		// cluster; the controller logs the error.
@@ -310,6 +316,11 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			return out, 0, err
 		}
 		if err := r.setRecords(ctx, client, zone.Name, want, read); err != nil {
+			if errors.Is(err, controller.ErrNotLeader) {
+				// Nothing was written; the status says the set is pending,
+				// which a write that did not happen leaves harmless.
+				return outcome{}, 0, err
+			}
 			var re *dns.ResponseError
 			if errors.As(err, &re) && (re.PreconditionFailed() || re.Invalid()) {
 				// Nothing was written.
@@ -543,6 +554,10 @@ func (r *reconciler) release(ctx context.Context, obj *controller.Object, status
 	target := *status
 	target.Zone, target.Name, target.Type, target.TTL, target.Values, target.Owned = c.Zone, c.Name, c.Type, c.TTL, c.Values, true
 	kept, err := r.remove(ctx, obj, &target)
+	if errors.Is(err, controller.ErrNotLeader) {
+		// Nothing was removed, and nothing failed.
+		return err
+	}
 	if err != nil {
 		// The caller returns the error, and the controller logs it.
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", failureText("removing the record set", err))
@@ -651,9 +666,16 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 	}
 
 	// Removed only if the set still holds what was read (review finding
-	// ATM-9): a set changed after the read stays.
+	// ATM-9): a set changed after the read stays. Only by the leader
+	// (review finding CON-6b).
+	if err := r.ctrl.Leading(ctx); err != nil {
+		return "", err
+	}
 	err = client.DeleteRecordsIf(ctx, status.Name, status.Type, dns.Expect{Values: have.Values})
 	if r.unconditional(zone.Name, err) {
+		if err := r.ctrl.Leading(ctx); err != nil {
+			return "", err
+		}
 		err = client.DeleteRecords(ctx, status.Name, status.Type)
 	}
 	if disabled(err) {
@@ -671,14 +693,22 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 // was read (have; nil: none of the name and type), checked by the provider
 // in the same step (review finding ATM-9): a set written or changed after
 // the read is not written over. A provider that can't check it gets the
-// write without the check; the set was read right before.
+// write without the check; the set was read right before. Only the leader
+// writes (Leading; review finding CON-6b): an error wrapping
+// controller.ErrNotLeader says nothing was written.
 func (r *reconciler) setRecords(ctx context.Context, client *dns.Client, zone string, want dns.RecordSet, have *dns.RecordSet) error {
 	expect := dns.Expect{Absent: have == nil}
 	if have != nil {
 		expect.Values = have.Values
 	}
+	if err := r.ctrl.Leading(ctx); err != nil {
+		return err
+	}
 	err := client.SetRecordsIf(ctx, want, expect)
 	if r.unconditional(zone, err) {
+		if err := r.ctrl.Leading(ctx); err != nil {
+			return err
+		}
 		return client.SetRecords(ctx, want)
 	}
 	return err
@@ -763,6 +793,9 @@ func (r *reconciler) finishDeletion(ctx context.Context, obj *controller.Object,
 				fmt.Sprintf("%s %s stays in the zone %s: the record says deletion_policy = %q", status.Type, status.Name, status.Zone, DeletionRetain))
 		}
 	} else if err := r.release(ctx, obj, status, "the record was deleted"); err != nil {
+		if errors.Is(err, controller.ErrNotLeader) {
+			return 0, err
+		}
 		out := failed("removing the record set", err)
 		out.reason = "DeleteFailed"
 		out.message += fmt.Sprintf(`; it is tried again. deletion_policy = %q in the spec lets the record go and leaves the record set in the zone`, DeletionRetain)

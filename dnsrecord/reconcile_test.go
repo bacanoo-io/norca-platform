@@ -1108,6 +1108,66 @@ func (e *env) get(ns, name string) (*controller.Object, *Status) {
 	return obj, &st
 }
 
+// follow makes the reconciler the one of a candidate that does not lead:
+// another one holds the lease. Its informer runs, so Reconcile finds the
+// records.
+func (e *env) follow() {
+	e.t.Helper()
+	e.b.PutVariable(&api.Variable{Namespace: "default", Path: controller.LeaseRoot + "/norca-dns", Items: api.VariableItems{
+		"holder": "the-leader", "leaseDurationSeconds": "3600"}})
+	c, err := controller.New(e.b, e.r, controller.Options{
+		Name: "norca-dns", Kind: Kind, Storage: controller.StorageNative, Namespace: e.r.namespace, Logger: e.r.logger,
+		LeaderElection: &controller.LeaderElectionConfig{Namespace: "default", Identity: "follower"},
+	})
+	must.NoError(e.t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.Run(ctx)
+	}()
+	e.t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	e.r.ctrl = c
+}
+
+// An operator that may no longer lead writes nothing to a zone: no record
+// set and no removal, and the status does not say the record failed
+// (review finding CON-6b: a reconcile that went on after the lease could
+// pass to another instance still wrote).
+func TestReconcile_NotLeadingWritesNothing(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	e.cluster.allow("shop", "shop.example.com")
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.hold("shop", "web")
+	e.put("shop", "new", map[string]any{"name": "new.shop.example.com", "type": "A", "values": []any{"192.0.2.3"}})
+	e.follow()
+	key := controller.ObjectKey{Namespace: "shop", Name: "new"}
+	e.waitFor("the follower sees the records", func() bool { _, ok := e.r.ctrl.Get(key); return ok })
+
+	_, err := e.r.Reconcile(ctx, key)
+	must.Len(t, 0, e.zone.RecordValues("new.shop.example.com", "A"), must.Sprint("written by an operator that does not lead"))
+	must.ErrorIs(t, err, controller.ErrNotLeader)
+	_, st := e.status("shop", "new")
+	must.Nil(t, st.Condition(controller.ConditionReady), must.Sprint("the refusal is no outcome of the record"))
+	must.SliceNotContains(t, e.events("shop", "new"), "Failed")
+
+	// The removal of a set it holds.
+	obj, held := e.get("shop", "web")
+	kept, err := e.r.remove(ctx, obj, held)
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("removed by an operator that does not lead"))
+	must.ErrorIs(t, err, controller.ErrNotLeader)
+	must.Eq(t, "", kept)
+	must.ErrorIs(t, e.r.release(ctx, obj, held, "the record moved"), controller.ErrNotLeader)
+	must.True(t, held.Owned)
+	must.SliceNotContains(t, e.events("shop", "web"), "DeleteFailed")
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
 // A record whose namespace lost the right to the name it holds gives the
 // record set up also when its spec can't be read: a spec made invalid on
 // purpose does not keep a name the namespace no longer has (review finding
