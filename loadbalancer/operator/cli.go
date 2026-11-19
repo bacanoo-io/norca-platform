@@ -124,6 +124,12 @@ func runProxy(ctx context.Context, args []string) error {
 	return p.serve(ctx, ln)
 }
 
+// systemNamespace is the operations namespace of the Norca operators, the
+// default namespace of the controller's own Variables: its leases and the
+// tokens of the registered classes. The LoadBalancer objects it watches are
+// in -namespace.
+const systemNamespace = "norca-system"
+
 type controllerFlags struct {
 	objects        string
 	namespace      string
@@ -151,7 +157,7 @@ func runController(ctx context.Context, args []string) error {
 	fs.StringVar(&f.watchMode, "watch-mode", "", `"stream", "poll", or empty for the event stream with fallback to polling`)
 	fs.IntVar(&f.workers, "workers", 2, "concurrent reconciles")
 	fs.BoolVar(&f.leaderElection, "leader-election", true, "run reconciles only on the elected leader")
-	fs.StringVar(&f.leaseNamespace, "lease-namespace", "", "namespace of the lease variables (default: -namespace, or default)")
+	fs.StringVar(&f.leaseNamespace, "lease-namespace", systemNamespace, "namespace of the lease variables")
 	fs.BoolVar(&f.discover, "discover-services", true, "create LoadBalancer objects from marked services")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "address of the /metrics endpoint (disabled if empty)")
 	fs.StringVar(&f.logLevel, "log-level", "info", "log level")
@@ -159,7 +165,7 @@ func runController(ctx context.Context, args []string) error {
 	fs.DurationVar(&f.classTTL, "class-ttl", 3*time.Minute, "how old the heartbeat of a registered LoadBalancerClass provider may be (native objects)")
 	fs.StringVar(&f.classCAFile, "class-ca-file", "", "PEM file with the CA (or certificate) that signed the https certificates of registered providers, in addition to the system roots")
 	fs.BoolVar(&f.classAllowHTTP, "class-allow-http", false, "accept http endpoints of registered providers (development only)")
-	fs.StringVar(&f.classTokenNS, "class-token-namespace", "default", "namespace of the Variables holding the tokens of registered providers")
+	fs.StringVar(&f.classTokenNS, "class-token-namespace", systemNamespace, "namespace of the Variables holding the tokens of registered providers")
 	fs.StringVar(&f.provider.JobPrefix, "job-prefix", "lb-", "prefix of the proxy job IDs")
 	fs.StringVar(&f.provider.Driver, "proxy-driver", "raw_exec", "task driver of the proxy jobs: raw_exec, exec or docker")
 	fs.StringVar(&f.provider.Command, "proxy-command", self, "path of this binary on the nodes (raw_exec, exec)")
@@ -206,8 +212,8 @@ func runController(ctx context.Context, args []string) error {
 	}
 
 	leaseNS := f.leaseNamespace
-	if leaseNS == "" && f.namespace != "*" {
-		leaseNS = f.namespace
+	if leaseNS == "" {
+		leaseNS = systemNamespace
 	}
 	election := func() *controller.LeaderElectionConfig {
 		if !f.leaderElection {

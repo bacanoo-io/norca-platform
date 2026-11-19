@@ -54,6 +54,11 @@ func TestE2E_OperatorPack(t *testing.T) {
 		return string(out)
 	}
 
+	// The pack runs the controller job in the operations namespace and
+	// expects it to exist, as norca-deployer creates it.
+	_, err := client.Namespaces().Register(&api.Namespace{Name: systemNamespace, Description: "Norca operators"}, nil)
+	must.NoError(t, err)
+
 	out := norca("pack", "run", pack, "--name=lb", "--detach",
 		"--var=driver=mock_driver", "--var=proxy_driver=mock_driver")
 	must.StrContains(t, out, `Release "lb" deployed at revision 1`)
@@ -61,7 +66,7 @@ func TestE2E_OperatorPack(t *testing.T) {
 	kind, _, err := client.ObjectKinds().Info(Kind.Group, Kind.Kind, nil)
 	must.NoError(t, err)
 	must.NotNil(t, kind.Limits)
-	_, _, err = client.Jobs().Info("loadbalancer-controller", nil)
+	_, _, err = client.Jobs().Info("loadbalancer-controller", &api.QueryOptions{Namespace: systemNamespace})
 	must.NoError(t, err)
 
 	// A service with an instance: a mock driver job with a static port.

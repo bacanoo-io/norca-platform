@@ -538,7 +538,10 @@ is reported as `UnknownClass`, one whose heartbeat is older than
 the `loadbalancer-operator` pack of the registry; `loadbalancer.norca.hcl`
 and `loadbalancer-policy.hcl` run it by hand, after
 `norca object-kind apply loadbalancer.kind.hcl` and
-`loadbalancerclass.kind.hcl`.
+`loadbalancerclass.kind.hcl`. It serves the objects of `-namespace`
+(`default`, `*` for every namespace); its leases and the token Variables of
+the registered classes are in `norca-system` (`-lease-namespace`,
+`-class-token-namespace`), where the job runs too.
 
 ```shell
 norca-loadbalancer -objects native -class-ca-file /secrets/ca.pem

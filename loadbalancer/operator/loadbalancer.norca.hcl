@@ -4,11 +4,15 @@
 # The LoadBalancer operator, one per region.
 #
 #   1. Build the binary for the nodes and install it on them (the proxy jobs
-#      the operator creates run the same binary with raw_exec):
+#      the operator creates run the same binary with exec):
 #        cd norca-platform && go build -o /usr/local/bin/norca-loadbalancer ./cmd/norca-loadbalancer
-#   2. Bind the ACL policy to this job (loadbalancer-policy.hcl).
-#   3. norca job run loadbalancer.norca.hcl
-#   4. Create a load balancer:
+#   2. The job runs in the operations namespace norca-system (var.namespace),
+#      with its leases and the tokens of the registered classes; it must
+#      exist (norca-deployer creates it):
+#        norca namespace apply -description "Norca operators" norca-system
+#   3. Bind the ACL policy to this job (loadbalancer-policy.hcl).
+#   4. norca job run loadbalancer.norca.hcl
+#   5. Create a load balancer in the watched namespace (var.watch_namespace):
 #        norca var put crd/norca-io/LoadBalancer/web spec='{"service":"web","port":8080}'
 #        norca var get -item=status crd/norca-io/LoadBalancer/web
 #      or mark a service with the norca_lb_class / norca_lb_port meta keys.
@@ -18,7 +22,10 @@
 #        norca object list norca.io/LoadBalancer
 #
 # Two instances run; leader election over a Variables lease makes one of
-# them reconcile while the other keeps a warm cache.
+# them reconcile while the other keeps a warm cache. Like the
+# loadbalancer-operator pack, the job keeps off nodes with the raw_exec
+# driver: a raw_exec task there could read the identity token of this job
+# and the policy bound to it.
 #
 # The controller reaches the API on the task API socket with its workload
 # identity (NORCA_TOKEN, set by identity { env = true }). In this Nomad version the event stream accepts
@@ -32,7 +39,16 @@ variable "binary" {
   default = "/usr/local/bin/norca-loadbalancer"
 }
 
+# Namespace of the controller job, of its leases and of the token Variables
+# of the registered classes.
 variable "namespace" {
+  type    = string
+  default = "norca-system"
+}
+
+# Namespace of the LoadBalancer objects the controller reconciles ("*" for
+# every namespace).
+variable "watch_namespace" {
   type    = string
   default = "default"
 }
@@ -45,7 +61,13 @@ variable "objects" {
 }
 
 job "loadbalancer-controller" {
-  type = "service"
+  type      = "service"
+  namespace = var.namespace
+
+  constraint {
+    attribute = "${attr.driver.raw_exec}"
+    operator  = "is_not_set"
+  }
 
   group "controller" {
     count = 2
@@ -55,15 +77,17 @@ job "loadbalancer-controller" {
     }
 
     task "controller" {
-      driver = "raw_exec"
+      driver = "exec"
 
       config {
         command = var.binary
         args = [
           "controller",
-          "-namespace", var.namespace,
+          "-namespace", var.watch_namespace,
+          "-lease-namespace", var.namespace,
+          "-class-token-namespace", var.namespace,
           "-objects", var.objects,
-          "-proxy-driver", "raw_exec",
+          "-proxy-driver", "exec",
           "-proxy-command", var.binary,
           "-metrics-addr", "${NORCA_ADDR_metrics}",
         ]

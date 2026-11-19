@@ -142,7 +142,7 @@ type classRegistry struct {
 
 func newClassRegistry(b controller.Backend, tokenNamespace string, ttl time.Duration) *classRegistry {
 	if tokenNamespace == "" {
-		tokenNamespace = "default"
+		tokenNamespace = systemNamespace
 	}
 	return &classRegistry{
 		objs:           b,
