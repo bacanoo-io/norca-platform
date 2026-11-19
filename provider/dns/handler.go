@@ -179,7 +179,7 @@ func (h *handler) putRecords(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, err.Error())
 		return
 	}
-	cond, ok := h.condition(w, set.Type, body.Expect, false)
+	cond, conditional, ok := h.condition(w, set.Type, body.Expect, false)
 	if !ok {
 		return
 	}
@@ -188,7 +188,7 @@ func (h *handler) putRecords(w http.ResponseWriter, r *http.Request) {
 	unlock := h.lock(set.Name)
 	defer unlock()
 	if cond != nil {
-		err = h.records.(ConditionalRecordProvider).SetRecordsIf(ctx, set, *cond)
+		err = conditional.SetRecordsIf(ctx, set, *cond)
 	} else {
 		err = h.records.SetRecords(ctx, set)
 	}
@@ -219,7 +219,7 @@ func (h *handler) deleteRecords(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, http.StatusBadRequest, wire.ReasonInvalid, "invalid body: "+err.Error())
 		return
 	}
-	cond, ok := h.condition(w, recordType, body.Expect, true)
+	cond, conditional, ok := h.condition(w, recordType, body.Expect, true)
 	if !ok {
 		return
 	}
@@ -229,7 +229,7 @@ func (h *handler) deleteRecords(w http.ResponseWriter, r *http.Request) {
 	defer unlock()
 	var err error
 	if cond != nil {
-		err = h.records.(ConditionalRecordProvider).DeleteRecordsIf(ctx, name, recordType, *cond)
+		err = conditional.DeleteRecordsIf(ctx, name, recordType, *cond)
 	} else {
 		err = h.records.DeleteRecords(ctx, name, recordType)
 	}
@@ -243,23 +243,24 @@ func (h *handler) deleteRecords(w http.ResponseWriter, r *http.Request) {
 
 // condition checks the condition of a write of the records contract
 // (nil: none) and returns it normalized. A condition the provider can't
-// check is refused, never ignored. ok is false when the request was
-// answered.
-func (h *handler) condition(w http.ResponseWriter, recordType string, expect *Expect, deletion bool) (cond *Expect, ok bool) {
+// check is refused, never ignored. With a condition, conditional is the
+// provider that checks it. ok is false when the request was answered.
+func (h *handler) condition(w http.ResponseWriter, recordType string, expect *Expect, deletion bool) (cond *Expect, conditional ConditionalRecordProvider, ok bool) {
 	if expect == nil {
-		return nil, true
+		return nil, nil, true
 	}
 	checked, err := CheckExpect(recordType, *expect, deletion)
 	if err != nil {
 		wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, err.Error())
-		return nil, false
+		return nil, nil, false
 	}
-	if _, conditional := h.records.(ConditionalRecordProvider); !conditional {
+	conditional, supported := h.records.(ConditionalRecordProvider)
+	if !supported {
 		wire.WriteError(w, http.StatusNotImplemented, ReasonConditionsUnsupported,
 			"the provider of the zone "+h.z.Name+" can't make a write depend on the record set")
-		return nil, false
+		return nil, nil, false
 	}
-	return &checked, true
+	return &checked, conditional, true
 }
 
 // failRecords answers the failure of a provider for the records contract.
