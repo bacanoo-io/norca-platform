@@ -5,11 +5,14 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -520,6 +523,61 @@ func TestReconcile_RequestAfterALostStatusWrite(t *testing.T) {
 	insts := e.instances()
 	if len(insts) != 3 || insts[2].RequestID == insts[0].RequestID {
 		t.Fatalf("instances: %+v", insts)
+	}
+}
+
+// A create whose answer was lost, asked again while the provider does not
+// list its instances yet (or by a second leader that saw what the first one
+// saw), creates nothing more: the request has the same ID, and the provider
+// answers with the instances of the first one (review finding CON-6b).
+func TestReconcile_LostCreateAnswerCreatesOnce(t *testing.T) {
+	e := newEnv(t, "")
+	inner := provider.NewHandler(e.mock, "", nil)
+	var answered, hide atomic.Bool
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPost {
+			posts.Add(1)
+		}
+		rec := httptest.NewRecorder()
+		inner.ServeHTTP(rec, req)
+		switch {
+		case req.Method == http.MethodPost && !answered.Swap(true):
+			// Created, but the answer is lost.
+			http.Error(w, "the connection was reset", http.StatusBadGateway)
+			return
+		case req.Method == http.MethodGet && hide.Load():
+			// The listing does not show the new instances yet.
+			var g provider.Group
+			if err := json.Unmarshal(rec.Body.Bytes(), &g); err == nil && g.Name != "" {
+				g.Instances = []provider.Instance{}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(g)
+				return
+			}
+		}
+		maps.Copy(w.Header(), rec.Header())
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+	e.url = srv.URL
+	e.registerProvider(e.now, "")
+
+	e.putGroup(2, nil)
+	e.reconcile()
+	if n := len(e.instances()); n != 2 {
+		t.Fatalf("instances after the first request: %d", n)
+	}
+	hide.Store(true)
+	e.reconcile()
+	hide.Store(false)
+	insts := e.instances()
+	if len(insts) != 2 || insts[0].RequestID != insts[1].RequestID {
+		t.Fatalf("the request was made twice: %+v", insts)
+	}
+	if n := posts.Load(); n != 2 {
+		t.Fatalf("%d create calls, want 2 (the request asked again)", n)
 	}
 }
 
