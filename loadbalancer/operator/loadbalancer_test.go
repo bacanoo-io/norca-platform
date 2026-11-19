@@ -420,5 +420,7 @@ func TestLoadBalancer_LeavingNode(t *testing.T) {
 	e.b.Publish(api.Event{Topic: api.TopicNode, Type: "NodeRegistration", Key: "n2",
 		Payload: map[string]any{"Node": map[string]any{"ID": "n2"}}})
 	waitFor(t, "target back", func() bool { return e.targetsVar("lb-web") == "10.0.0.1:8001\n10.0.0.2:8002" })
-	must.Nil(t, e.status(t, "web").LeavingNodes)
+	// The provider writes the targets before the reconcile writes the
+	// status: wait for the status as well.
+	waitFor(t, "leaving node gone", func() bool { return e.status(t, "web").LeavingNodes == nil })
 }
