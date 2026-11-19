@@ -32,15 +32,25 @@ var (
 	errGone     = errors.New("the object is gone")
 )
 
+// errSecretConflict is the error of a checked secret write when the secret
+// changed since it was read.
+var errSecretConflict = errors.New("the secret changed")
+
 // secretStore keeps the secrets of the operator: the keys of its accounts
 // and the certificates it issued, which a revocation needs.
 type secretStore interface {
-	// Read returns the items of a secret; nil if it does not exist.
-	Read(ctx context.Context, path string) (map[string]string, error)
+	// Read returns the items of a secret and its modify index; nil and 0 if
+	// it does not exist.
+	Read(ctx context.Context, path string) (map[string]string, uint64, error)
 
 	// Write writes a new version of a secret. With expiresAt the secret
 	// expires then.
 	Write(ctx context.Context, path string, items map[string]string, expiresAt *time.Time) error
+
+	// CheckedWrite writes a new version of a secret if its modify index is
+	// checkIndex; 0 creates a secret that must not exist yet. A mismatch
+	// fails with an error wrapping errSecretConflict.
+	CheckedWrite(ctx context.Context, path string, checkIndex uint64, items map[string]string) error
 }
 
 // The paths of the secrets of the operator, below its prefix.
@@ -207,7 +217,7 @@ func (o *Operator) account(ctx context.Context, name string, cfg IssuerConfig) (
 	}
 
 	path := o.secretPrefix + secretAccounts + name
-	items, err := o.secrets.Read(ctx, path)
+	items, index, err := o.secrets.Read(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("reading the account secret %s: %w", path, err)
 	}
@@ -230,13 +240,30 @@ func (o *Operator) account(ctx context.Context, name string, cfg IssuerConfig) (
 			return nil, err
 		}
 		// The key is stored before the account is opened: a key that was
-		// registered and then lost could not be used again.
-		if err := o.secrets.Write(ctx, path, map[string]string{"key": encoded, "directory": cfg.Directory}, nil); err != nil {
+		// registered and then lost could not be used again. It is stored
+		// only over the secret that was read, so a key another instance of
+		// the operator (a rolling update runs two) stored meanwhile is
+		// never lost either: that key is used instead.
+		err = o.secrets.CheckedWrite(ctx, path, index, map[string]string{"key": encoded, "directory": cfg.Directory})
+		switch {
+		case errors.Is(err, errSecretConflict):
+			if items, _, err = o.secrets.Read(ctx, path); err != nil {
+				return nil, fmt.Errorf("reading the account secret %s: %w", path, err)
+			}
+			if items["key"] == "" || items["directory"] != cfg.Directory {
+				// Not a key for this directory: the next pass reads it again.
+				return nil, fmt.Errorf("the account secret %s changed while it was written", path)
+			}
+			if req.Key, err = decodeKey(items["key"]); err != nil {
+				return nil, fmt.Errorf("the account secret %s: %w", path, err)
+			}
+			fresh = false
+		case err != nil:
 			return nil, fmt.Errorf("writing the account secret %s: %w", path, err)
 		}
 	}
 	if cfg.EABSecret != "" {
-		eab, err := o.secrets.Read(ctx, cfg.EABSecret)
+		eab, _, err := o.secrets.Read(ctx, cfg.EABSecret)
 		if err != nil {
 			return nil, fmt.Errorf("reading the external account binding %s: %w", cfg.EABSecret, err)
 		}
@@ -761,7 +788,7 @@ func (o *Operator) rootOf(is *issuer, certs []*x509.Certificate) (*x509.Certific
 // order. The operator kept the certificates it issued.
 func (o *Operator) revoke(ctx context.Context, is *issuer, spec *OrderSpec) error {
 	path := o.secretPrefix + secretIssued + is.obj.Name + "/" + strings.ToLower(spec.Revoke)
-	items, err := o.secrets.Read(ctx, path)
+	items, _, err := o.secrets.Read(ctx, path)
 	if err != nil {
 		return fmt.Errorf("reading the certificate to revoke (%s): %w", path, err)
 	}

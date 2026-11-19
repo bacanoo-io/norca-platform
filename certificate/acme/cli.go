@@ -282,16 +282,20 @@ type apiSecrets struct {
 	namespace string
 }
 
-func (s *apiSecrets) Read(ctx context.Context, path string) (map[string]string, error) {
+func (s *apiSecrets) Read(ctx context.Context, path string) (map[string]string, uint64, error) {
 	q := (&api.QueryOptions{Namespace: s.namespace}).WithContext(ctx)
 	value, _, err := s.client.Secrets().Read(path, 0, q)
 	if errors.Is(err, api.ErrSecretNotFound) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return value.Items, nil
+	var index uint64
+	if value.Secret != nil {
+		index = value.Secret.ModifyIndex
+	}
+	return value.Items, index, nil
 }
 
 func (s *apiSecrets) Write(ctx context.Context, path string, items map[string]string, expiresAt *time.Time) error {
@@ -301,5 +305,15 @@ func (s *apiSecrets) Write(ctx context.Context, path string, items map[string]st
 		write.Meta = &api.SecretMeta{ExpiresAt: expiresAt}
 	}
 	_, _, err := s.client.Secrets().Write(path, write, w)
+	return err
+}
+
+func (s *apiSecrets) CheckedWrite(ctx context.Context, path string, checkIndex uint64, items map[string]string) error {
+	w := (&api.WriteOptions{Namespace: s.namespace}).WithContext(ctx)
+	_, _, err := s.client.Secrets().CheckedWrite(path, checkIndex, &api.SecretWrite{Items: items}, w)
+	var respErr api.UnexpectedResponseError
+	if errors.As(err, &respErr) && respErr.StatusCode() == http.StatusConflict {
+		return fmt.Errorf("%w: %w", errSecretConflict, err)
+	}
 	return err
 }

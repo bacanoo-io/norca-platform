@@ -79,6 +79,69 @@ func TestIssuer_AccountAndStatus(t *testing.T) {
 	}
 }
 
+// An account key that another instance of the operator (a rolling update
+// runs two) stores between this instance's read of the account secret and
+// its write is not overwritten: a key for the issuer's directory is used,
+// and a key for another directory fails this pass and is replaced on the
+// next one, after a fresh read (review finding ATM-10).
+func TestIssuer_AccountKeyStoredMeanwhile(t *testing.T) {
+	tests := []struct {
+		name      string
+		directory string // of the key the other instance stores
+	}{
+		{name: "same directory", directory: testDirectory},
+		{name: "other directory", directory: "https://other.test/directory"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.issuer("ca", nil)
+			theirs, err := newAccountKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := encodeKey(theirs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const path = "norca-acme/accounts/ca"
+			e.secrets.writeBeforeNextWrite(path, map[string]string{"key": encoded, "directory": tt.directory})
+			e.pass()
+
+			if stored := e.secrets.items[path]; stored["key"] != encoded || stored["directory"] != tt.directory {
+				t.Fatalf("the key of the other instance was overwritten (directory %q)", stored["directory"])
+			}
+			if tt.directory == testDirectory {
+				if st := e.issuerStatus("ca"); st.Problem != "" {
+					t.Fatalf("the issuer has a problem: %s", st.Problem)
+				}
+				if !theirs.Equal(e.ca.lastKey) {
+					t.Fatal("the account was not opened with the stored key")
+				}
+				return
+			}
+			if st := e.issuerStatus("ca"); st.Problem == "" || e.ca.accounts != 0 {
+				t.Fatalf("a key for another directory was used: problem %q, %d accounts", st.Problem, e.ca.accounts)
+			}
+
+			// The next pass reads the key of the other directory and replaces
+			// it with a key of its own.
+			e.pass()
+			if st := e.issuerStatus("ca"); st.Problem != "" {
+				t.Fatalf("the issuer has a problem after the next pass: %s", st.Problem)
+			}
+			stored := e.secrets.items[path]
+			ours, err := decodeKey(stored["key"])
+			if err != nil || stored["directory"] != testDirectory || stored["key"] == encoded {
+				t.Fatalf("the account secret after the next pass: %v, directory %q", err, stored["directory"])
+			}
+			if !ours.Equal(e.ca.lastKey) {
+				t.Fatal("the account was not opened with the stored key")
+			}
+		})
+	}
+}
+
 // An issuer that cannot work has a problem and no heartbeat, so the
 // servers order nothing from it.
 func TestIssuer_Problems(t *testing.T) {

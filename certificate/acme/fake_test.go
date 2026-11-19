@@ -5,6 +5,7 @@ package acme
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -115,25 +116,71 @@ type fakeSecrets struct {
 	mu      sync.Mutex
 	items   map[string]map[string]string
 	expires map[string]time.Time
+	indexes map[string]uint64 // the modify index of each secret
+	index   uint64            // the latest index
+
+	// racing are the items somebody else writes at a path right before the
+	// next write there: between the operator's read and its write.
+	racing map[string]map[string]string
 }
 
 func newFakeSecrets() *fakeSecrets {
-	return &fakeSecrets{items: map[string]map[string]string{}, expires: map[string]time.Time{}}
+	return &fakeSecrets{
+		items: map[string]map[string]string{}, expires: map[string]time.Time{},
+		indexes: map[string]uint64{}, racing: map[string]map[string]string{},
+	}
 }
 
-func (s *fakeSecrets) Read(_ context.Context, path string) (map[string]string, error) {
+// writeBeforeNextWrite makes somebody else write items at path right
+// before the next write there.
+func (s *fakeSecrets) writeBeforeNextWrite(path string, items map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.items[path], nil
+	s.racing[path] = items
+}
+
+// raceLocked applies the racing write of path, if any. The caller holds
+// the lock.
+func (s *fakeSecrets) raceLocked(path string) {
+	if items, ok := s.racing[path]; ok {
+		delete(s.racing, path)
+		s.putLocked(path, items)
+	}
+}
+
+// putLocked stores the items of a secret with a new modify index. The
+// caller holds the lock.
+func (s *fakeSecrets) putLocked(path string, items map[string]string) {
+	s.index++
+	s.items[path] = items
+	s.indexes[path] = s.index
+}
+
+func (s *fakeSecrets) Read(_ context.Context, path string) (map[string]string, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.items[path], s.indexes[path], nil
 }
 
 func (s *fakeSecrets) Write(_ context.Context, path string, items map[string]string, expiresAt *time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.items[path] = items
+	s.raceLocked(path)
+	s.putLocked(path, items)
 	if expiresAt != nil {
 		s.expires[path] = *expiresAt
 	}
+	return nil
+}
+
+func (s *fakeSecrets) CheckedWrite(_ context.Context, path string, checkIndex uint64, items map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.raceLocked(path)
+	if s.indexes[path] != checkIndex {
+		return fmt.Errorf("%w: %s has the modify index %d, not %d", errSecretConflict, path, s.indexes[path], checkIndex)
+	}
+	s.putLocked(path, items)
 	return nil
 }
 
@@ -165,6 +212,9 @@ type fakeCA struct {
 	authzs   map[string]*xacme.Authorization
 	placed   int
 	revoked  [][]byte
+
+	// lastKey is the key of the account opened last.
+	lastKey crypto.Signer
 
 	// checkHTTP and checkDNS say whether the proof of a name can be seen.
 	checkHTTP func(name, token, want string) bool
@@ -228,6 +278,7 @@ func (ca *fakeCA) connect(_ context.Context, req accountRequest) (authority, str
 		return nil, "", err
 	}
 	ca.accounts++
+	ca.lastKey = req.Key
 	return ca, fmt.Sprintf("%s/acct/%d", req.Directory, ca.accounts), nil
 }
 
