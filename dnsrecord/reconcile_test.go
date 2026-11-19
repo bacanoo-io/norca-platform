@@ -562,6 +562,32 @@ func TestRemove_LeavesTheSetOfAnotherHolder(t *testing.T) {
 	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"))
 }
 
+// A removal leaves a record set whose values are not the ones the status
+// says the operator wrote: changed by hand, or written by a record that took
+// the set over and whose status does not say so yet (ATM-20: a record that
+// lost the right to its name and the record that takes the set over do not
+// fight).
+func TestRemove_LeavesASetWithOtherValues(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.9"}}))
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.hold("shop", "web")
+
+	obj, st := e.get("shop", "web")
+	kept, err := e.r.remove(ctx, obj, st)
+	must.NoError(t, err)
+	must.StrContains(t, kept, "other values than norca-dns wrote")
+	must.Eq(t, []string{"192.0.2.9"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+	// Another TTL is another set too.
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 60, Values: []string{"192.0.2.2"}}))
+	kept, err = e.r.remove(ctx, obj, st)
+	must.NoError(t, err)
+	must.StrContains(t, kept, "other values than norca-dns wrote")
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
 // A record of a zone that no longer lets norca-dns write can be deleted: its
 // record set stays in the zone, and an event says so.
 func TestDNSRecord_DeletedAfterRecordsSwitchedOff(t *testing.T) {
@@ -805,6 +831,137 @@ func TestDNSRecord_AllowListWithdrawn(t *testing.T) {
 		_, st := e.status("shop", "web")
 		return readyReason(st) == "True" && st.Owned && slices.Equal(e.zone.RecordValues("www.shop.example.com", "A"), []string{"192.0.2.10"})
 	})
+}
+
+// get reads a record from the servers with its status, as Reconcile does.
+func (e *env) get(ns, name string) (*controller.Object, *Status) {
+	e.t.Helper()
+	obj, err := e.r.ctrl.Objects().Get(context.Background(), controller.ObjectKey{Namespace: ns, Name: name})
+	must.NoError(e.t, err)
+	var st Status
+	must.NoError(e.t, obj.DecodeStatus(&st))
+	return obj, &st
+}
+
+// A record whose namespace lost the right to the name it holds gives the
+// record set up also when its spec can't be read: a spec made invalid on
+// purpose does not keep a name the namespace no longer has (review finding
+// SEC-9, ATM-20).
+func TestKeep_LostRightReleasesWithAnInvalidSpec(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+	e.put("shop", "web", map[string]any{"name": "*.x.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.hold("shop", "web")
+	e.cluster.allow("shop", "other.example.com")
+
+	obj, st := e.get("shop", "web")
+	out, _, err := e.r.keep(ctx, obj, st)
+	must.NoError(t, err)
+	must.Eq(t, "InvalidSpec", out.reason)
+	must.False(t, st.Owned)
+	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the set of the name the namespace lost"))
+	must.SliceContains(t, e.events("shop", "web"), "RecordDeleted")
+}
+
+// A spec moved to another name or type gives the set of the former one up
+// also when the new one can't be written yet (no zone, a zone without
+// records or without a heartbeat, no values yet): a name the record no
+// longer asks for is not served on (ATM-20).
+func TestKeep_MovedSpecReleasesBeforeItWaits(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason string
+		spec         map[string]any
+		setup        func(e *env)
+	}{
+		{"no zone", "ZoneNotFound",
+			map[string]any{"name": "www.example.org", "type": "A", "values": []any{"192.0.2.2"}}, nil},
+		{"a zone without records", "RecordsNotEnabled",
+			map[string]any{"name": "www.example.net", "type": "A", "values": []any{"192.0.2.2"}},
+			func(e *env) {
+				e.b.PutObject(&api.CustomObject{Group: ZoneKind.Group, Kind: ZoneKind.Kind, Name: "example.net", Spec: map[string]any{
+					"zone": "example.net", "provider": "dns-lab", "endpoint": e.zoneURL, "tokenVariable": "providers/dns-lab", "records": false,
+				}})
+			}},
+		{"a zone without a heartbeat", "ZoneUnavailable",
+			map[string]any{"name": "www.example.net", "type": "A", "values": []any{"192.0.2.2"}},
+			func(e *env) {
+				e.b.PutObject(&api.CustomObject{Group: ZoneKind.Group, Kind: ZoneKind.Kind, Name: "example.net", Spec: map[string]any{
+					"zone": "example.net", "provider": "dns-lab", "endpoint": e.zoneURL, "tokenVariable": "providers/dns-lab", "records": true,
+				}})
+				_, err := e.b.UpdateObjectStatus(context.Background(), ZoneKind, "", "example.net",
+					map[string]any{"heartbeat": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)}, 0)
+				must.NoError(e.t, err)
+			}},
+		{"no values yet", "NoValues",
+			map[string]any{"name": "api.shop.example.com", "type": "A", "source": map[string]any{"load_balancer": "front"}},
+			func(e *env) {
+				e.b.PutObject(&api.CustomObject{Group: LoadBalancerKind.Group, Kind: LoadBalancerKind.Kind, Namespace: "shop", Name: "front",
+					Spec: map[string]any{"service": "front", "port": 443}})
+			}},
+		{"another type without values yet", "NoValues",
+			map[string]any{"name": "www.shop.example.com", "type": "AAAA", "source": map[string]any{"load_balancer": "front"}},
+			func(e *env) {
+				e.b.PutObject(&api.CustomObject{Group: LoadBalancerKind.Group, Kind: LoadBalancerKind.Kind, Namespace: "shop", Name: "front",
+					Spec: map[string]any{"service": "front", "port": 443}})
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newOperator(t, true)
+			ctx := context.Background()
+			e.cluster.allow("shop", "shop.example.com, example.org, example.net")
+			if tc.setup != nil {
+				tc.setup(e)
+			}
+			must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+			e.put("shop", "web", tc.spec)
+			e.hold("shop", "web")
+
+			obj, st := e.get("shop", "web")
+			out, _, err := e.r.keep(ctx, obj, st)
+			must.NoError(t, err)
+			must.Eq(t, tc.reason, out.reason)
+			must.False(t, st.Owned)
+			must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the set of the former name"))
+		})
+	}
+}
+
+// The scenario of review finding SEC-9: a namespace makes the spec of its
+// record invalid and then loses the suffix of its name to another
+// namespace. The set it held goes, and the record of the namespace that may
+// write the name now is not refused for good (ATM-20).
+func TestDNSRecord_LostRightDoesNotBlockTheNewOwner(t *testing.T) {
+	e := startOperator(t, true)
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	e.waitFor("written", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "True"
+	})
+	e.put("shop", "web", map[string]any{"name": "*.x.example.com", "type": "A", "values": []any{"192.0.2.10"}})
+	e.waitFor("invalid", func() bool {
+		_, st := e.status("shop", "web")
+		return readyReason(st) == "InvalidSpec"
+	})
+
+	e.cluster.allow("shop", "other.example.com")
+	e.cluster.allow("newshop", "shop.example.com")
+	e.put("newshop", "www", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.20"}})
+	e.waitFor("the namespace that may write the name now writes it", func() bool {
+		_, st := e.status("newshop", "www")
+		return readyReason(st) == "True" && st.Owned &&
+			slices.Equal(e.zone.RecordValues("www.shop.example.com", "A"), []string{"192.0.2.20"})
+	})
+	e.waitFor("the record that lost the right holds nothing", func() bool {
+		_, st := e.status("shop", "web")
+		return !st.Owned
+	})
+	time.Sleep(300 * time.Millisecond)
+	must.Eq(t, []string{"192.0.2.20"}, e.zone.RecordValues("www.shop.example.com", "A"))
+	_, st := e.status("newshop", "www")
+	must.Eq(t, "True", readyReason(st))
+	must.Zero(t, st.Drifts, must.Sprint("the set was deleted under the new owner"))
 }
 
 // The record set of a record that follows a load balancer stays while the

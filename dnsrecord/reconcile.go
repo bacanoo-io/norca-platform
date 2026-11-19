@@ -122,6 +122,20 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 // keep brings the record set of an object to what its spec says, and
 // returns what it found and when to look again.
 func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *Status) (outcome, time.Duration, error) {
+	meta, err := r.cluster.NamespaceMeta(ctx, obj.Key.Namespace)
+	if err != nil && !errors.Is(err, controller.ErrNotFound) {
+		return outcome{}, 0, fmt.Errorf("reading the namespace %s: %w", obj.Key.Namespace, err)
+	}
+	// The set the record holds goes first when the namespace may no longer
+	// write its name, whatever the spec says: a spec that can't be read, or
+	// one that waits for a zone or for values, keeps no name the namespace
+	// lost (review finding SEC-9).
+	if status.Owned && !allowed(status.Name, meta) {
+		if err := r.release(ctx, obj, status, fmt.Sprintf("the namespace %q may no longer write the name", obj.Key.Namespace)); err != nil {
+			return failed("removing the record set", err), 0, err
+		}
+	}
+
 	// A problem of the spec or of the zone is an outcome for the status,
 	// not an error of the reconcile: it is not retried until something
 	// changes.
@@ -133,10 +147,6 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		return outcome{reason: "InvalidSpec", message: msg}, 0, nil
 	}
 
-	meta, err := r.cluster.NamespaceMeta(ctx, obj.Key.Namespace)
-	if err != nil && !errors.Is(err, controller.ErrNotFound) {
-		return outcome{}, 0, fmt.Errorf("reading the namespace %s: %w", obj.Key.Namespace, err)
-	}
 	if !allowed(spec.Name, meta) {
 		// The namespace has no right to the name (any more): a record set
 		// the operator wrote for it while it had is not served on.
@@ -148,19 +158,25 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			obj.Key.Namespace, spec.Name, MetaDNSSuffixes, meta[MetaDNSSuffixes])}, r.requeueWaiting, nil
 	}
 
-	other, err := r.holder(ctx, obj, spec, status)
+	// A set the record holds under another name or type goes before
+	// anything can keep the record from its new one (a zone that is not
+	// there or can't be written, values that are not there yet): a name
+	// the record no longer asks for is not served on.
+	if status.Owned && (status.Name != spec.Name || status.Type != spec.Type) {
+		if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", spec.Type, spec.Name)); err != nil {
+			return failed("removing the record set", err), 0, err
+		}
+	}
+
+	other, lapsed, err := r.holder(ctx, obj, spec, status)
 	if err != nil {
 		return outcome{}, 0, err
 	}
 	if other != (controller.ObjectKey{}) {
 		// The record lost the name: it holds no record set from here on.
 		// The set of the contested name and type is the other record's and
-		// stays; a set it wrote under the name its spec had before goes.
-		if status.Owned && status.Name == spec.Name && status.Type == spec.Type {
-			status.Owned = false
-		} else if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", spec.Type, spec.Name)); err != nil {
-			return failed("removing the record set", err), 0, err
-		}
+		// stays (a set under a former name went above).
+		status.Owned = false
 		msg := fmt.Sprintf("%s writes %s %s", otherRecord(obj.Key, other), spec.Type, spec.Name)
 		// The message may not name the other record; the log does, once
 		// for every new conflict, not at every requeue while it lasts.
@@ -241,9 +257,16 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		}
 	}
 	owned := status.Owned && status.Name == want.Name && status.Type == want.Type && status.Zone == zone.Name
+	// A set that a record whose namespace may no longer write the name
+	// holds, as its status says it wrote it, is the operator's: the record
+	// that may write the name takes it over, and the other one gives it up
+	// at its own next reconcile (review finding SEC-9).
+	takeOver := have != nil && !owned && slices.ContainsFunc(lapsed, func(st Status) bool {
+		return st.Zone == zone.Name && wrote(&st, zone.Name, *have)
+	})
 
 	switch {
-	case have != nil && !owned && !spec.Adopt && !dns.SameRecords(*have, want):
+	case have != nil && !owned && !takeOver && !spec.Adopt && !dns.SameRecords(*have, want):
 		msg := fmt.Sprintf("the zone %s has %s records of %s that norca-dns did not write (%s); set adopt = true to take them over",
 			zone.Name, want.Type, want.Name, strings.Join(have.Values, ", "))
 		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
@@ -281,8 +304,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DriftCorrected",
 				fmt.Sprintf("%s %s was changed outside norca-dns (%s) and was set back", want.Type, want.Name, found))
 		case have != nil && !owned:
-			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "Adopted",
-				fmt.Sprintf("%s %s taken over: %s", want.Type, want.Name, strings.Join(want.Values, ", ")))
+			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "Adopted", adoptedText(want, takeOver))
 		default:
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordWritten",
 				fmt.Sprintf("%s %s: %s (TTL %d)", want.Type, want.Name, strings.Join(want.Values, ", "), want.TTL))
@@ -296,26 +318,67 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		message: fmt.Sprintf("the zone %s holds %s %s", zone.Name, want.Type, want.Name)}, r.requeueReady, nil
 }
 
+// adoptedText is the message of the event of a record that took a record
+// set over; lapsed says it was the set of a record whose namespace may no
+// longer write the name.
+func adoptedText(want dns.RecordSet, lapsed bool) string {
+	if lapsed {
+		return fmt.Sprintf("%s %s taken over from a record whose namespace may no longer write the name: %s",
+			want.Type, want.Name, strings.Join(want.Values, ", "))
+	}
+	return fmt.Sprintf("%s %s taken over: %s", want.Type, want.Name, strings.Join(want.Values, ", "))
+}
+
 // holder returns the key of another DNSRecord that keeps this record from
-// the name and type of its spec, or the zero key.
+// the name and type of its spec, or the zero key, and the statuses of the
+// records that hold the set although their namespace may no longer write
+// the name.
 //
 // The record whose status holds the record set keeps it, whichever record
 // is older: a record that is deleted holds its set until the operator has
 // removed it. A set nobody holds yet goes to the oldest record that may
 // write the name: a record of a namespace whose allow list does not hold
-// the name claims nothing.
-func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Spec, status *Status) (controller.ObjectKey, error) {
+// the name claims nothing, and holds nothing either (review finding SEC-9):
+// such a record is asked to give its set up (when this operator keeps it),
+// and keeps no other record from the name.
+func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Spec, status *Status) (controller.ObjectKey, []Status, error) {
 	mine := status.Owned && status.Name == spec.Name && status.Type == spec.Type
 	all, err := r.records(ctx)
 	if err != nil {
-		return controller.ObjectKey{}, err
+		return controller.ObjectKey{}, nil, err
+	}
+	metas := map[string]map[string]string{}
+	mayWrite := func(namespace string) (bool, error) {
+		if meta, ok := metas[namespace]; ok {
+			return allowed(spec.Name, meta), nil
+		}
+		meta, err := r.cluster.NamespaceMeta(ctx, namespace)
+		if err != nil && !errors.Is(err, controller.ErrNotFound) {
+			return false, fmt.Errorf("reading the namespace %s: %w", namespace, err)
+		}
+		metas[namespace] = meta
+		return allowed(spec.Name, meta), nil
 	}
 	var owner, first *controller.Object
+	var lapsed []Status
 	for _, other := range all {
 		if other.Key == obj.Key {
 			continue
 		}
 		if holds(other, spec.Name, spec.Type) {
+			ok, err := mayWrite(other.Key.Namespace)
+			if err != nil {
+				return controller.ObjectKey{}, nil, err
+			}
+			if !ok {
+				var st Status
+				_ = other.DecodeStatus(&st)
+				lapsed = append(lapsed, st)
+				if r.namespace == "" || r.namespace == "*" || other.Key.Namespace == r.namespace {
+					r.ctrl.Enqueue(other.Key)
+				}
+				continue
+			}
 			if owner == nil || before(other, owner) {
 				owner = other
 			}
@@ -328,11 +391,11 @@ func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Sp
 		if other.DecodeSpec(&os) != nil || os.normalize() != nil || os.Name != spec.Name || os.Type != spec.Type {
 			continue
 		}
-		meta, err := r.cluster.NamespaceMeta(ctx, other.Key.Namespace)
-		if err != nil && !errors.Is(err, controller.ErrNotFound) {
-			return controller.ObjectKey{}, fmt.Errorf("reading the namespace %s: %w", other.Key.Namespace, err)
+		ok, err := mayWrite(other.Key.Namespace)
+		if err != nil {
+			return controller.ObjectKey{}, nil, err
 		}
-		if allowed(os.Name, meta) {
+		if ok {
 			first = other
 		}
 	}
@@ -340,11 +403,11 @@ func (r *reconciler) holder(ctx context.Context, obj *controller.Object, spec Sp
 	case owner != nil && (!mine || before(owner, obj)):
 		// Two records that both hold the set (written at the same moment):
 		// the older one keeps it.
-		return owner.Key, nil
+		return owner.Key, nil, nil
 	case owner == nil && first != nil:
-		return first.Key, nil
+		return first.Key, nil, nil
 	}
-	return controller.ObjectKey{}, nil
+	return controller.ObjectKey{}, lapsed, nil
 }
 
 // otherRecord names another DNSRecord in a condition or an event of the
@@ -449,29 +512,11 @@ func (r *reconciler) release(ctx context.Context, obj *controller.Object, status
 
 // remove deletes the record set a status says the operator wrote for obj.
 // kept says why the set stays in the zone instead: the status of another
-// record holds it too (two records that wrote it at the same moment), or
-// its zone can't be written any more (no longer registered, or records
-// switched off).
+// record holds it too (two records that wrote it at the same moment, or a
+// record that took it over), the zone holds other values than the operator
+// wrote, or the zone can't be written any more (no longer registered, or
+// records switched off).
 func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status *Status) (kept string, err error) {
-	// Read from the servers, not from the cache: a set that is deleted
-	// under a record that holds it is an outage of its name. Every
-	// namespace: the record that holds it can be in any (see records).
-	others, _, err := r.ctrl.Objects().List(ctx, "*")
-	if err != nil {
-		return "", fmt.Errorf("listing the DNS records: %w", err)
-	}
-	for _, other := range others {
-		if other.Key == obj.Key || other.Deleting() {
-			continue
-		}
-		var st Status
-		if other.DecodeStatus(&st) == nil && st.Owned && st.Zone == status.Zone && st.Name == status.Name && st.Type == status.Type {
-			r.logger.Info("a record set stays: another record holds it", "record", obj.Key.String(),
-				"holder", other.Key.String(), "zone", status.Zone, "name", status.Name, "type", status.Type)
-			return otherRecord(obj.Key, other.Key) + " holds it", nil
-		}
-	}
-
 	zone, err := r.zones.byName(ctx, status.Zone)
 	if err != nil {
 		return "", err
@@ -494,18 +539,84 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 	if err != nil {
 		return "", err
 	}
-	err = client.DeleteRecords(ctx, status.Name, status.Type)
 	// The provider answers so for the records of a zone without the switch;
 	// the DNSZone object may not say so yet. Another 403 (of a proxy in
 	// front of the provider, say) is a failure like any other: the record
 	// must not go while its set is in the zone.
-	var re *dns.ResponseError
-	if errors.As(err, &re) && re.RecordsDisabled() {
-		r.logger.Warn("the provider of the zone refuses the records contract: the record set stays", "zone", status.Zone,
-			"name", status.Name, "type", status.Type, "answer", re.Message)
+	disabled := func(err error) bool {
+		re, ok := errors.AsType[*dns.ResponseError](err)
+		if ok && re.RecordsDisabled() {
+			r.logger.Warn("the provider of the zone refuses the records contract: the record set stays", "zone", status.Zone,
+				"name", status.Name, "type", status.Type, "answer", re.Message)
+		}
+		return ok && re.RecordsDisabled()
+	}
+
+	// The set is read first and the records that hold it after: a record
+	// that takes a set over writes it before its status says so, and then
+	// the zone already holds its values.
+	sets, err := client.Records(ctx, status.Name)
+	if disabled(err) {
+		return switchedOff, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var have *dns.RecordSet
+	for i := range sets {
+		if strings.EqualFold(sets[i].Type, status.Type) {
+			have = &sets[i]
+		}
+	}
+	if have == nil {
+		// Nothing to remove: the set is gone already.
+		return "", nil
+	}
+
+	// Read from the servers, not from the cache: a set that is deleted
+	// under a record that holds it is an outage of its name. Every
+	// namespace: the record that holds it can be in any (see records).
+	others, _, err := r.ctrl.Objects().List(ctx, "*")
+	if err != nil {
+		return "", fmt.Errorf("listing the DNS records: %w", err)
+	}
+	for _, other := range others {
+		if other.Key == obj.Key || other.Deleting() {
+			continue
+		}
+		var st Status
+		if other.DecodeStatus(&st) == nil && st.Owned && st.Zone == status.Zone && st.Name == status.Name && st.Type == status.Type {
+			r.logger.Info("a record set stays: another record holds it", "record", obj.Key.String(),
+				"holder", other.Key.String(), "zone", status.Zone, "name", status.Name, "type", status.Type)
+			return otherRecord(obj.Key, other.Key) + " holds it", nil
+		}
+	}
+
+	// A set with other values than the operator wrote is not the
+	// operator's any more (changed by hand, or written by a record that
+	// took it over): it stays.
+	if !wrote(status, zone.Name, *have) {
+		r.logger.Info("a record set stays: the zone holds other values than norca-dns wrote", "record", obj.Key.String(),
+			"zone", status.Zone, "name", status.Name, "type", status.Type, "values", have.Values, "ttl", have.TTL)
+		return fmt.Sprintf("the zone holds other values than norca-dns wrote (%s, TTL %d)", strings.Join(have.Values, ", "), have.TTL), nil
+	}
+
+	err = client.DeleteRecords(ctx, status.Name, status.Type)
+	if disabled(err) {
 		return switchedOff, nil
 	}
 	return "", err
+}
+
+// wrote reports whether a record set of the zone is the one a status says
+// the operator wrote: the same TTL and values.
+func wrote(status *Status, zone string, have dns.RecordSet) bool {
+	if set, err := dns.CheckRecordSet(zone, have); err == nil {
+		have = set
+	} else {
+		have.Values = slices.Sorted(slices.Values(have.Values))
+	}
+	return have.TTL == status.TTL && slices.Equal(have.Values, status.Values)
 }
 
 // finishDeletion removes the record set of a deleted object and lets the
