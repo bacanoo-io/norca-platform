@@ -239,6 +239,19 @@ func (p *Provider) synthesized(ctx context.Context, set dns.RecordSet) bool {
 
 // SetRecords implements dns.RecordProvider.
 func (p *Provider) SetRecords(ctx context.Context, set dns.RecordSet) error {
+	return p.setRecords(ctx, set, nil)
+}
+
+// SetRecordsIf implements dns.ConditionalRecordProvider: the condition is a
+// prerequisite of the update message that writes the set (RFC 2136 2.4.2,
+// "RRset exists (value dependent)", or 2.4.3, "RRset does not exist"), which
+// the server checks against the records of the zone and applies with the
+// update in one step (3.2).
+func (p *Provider) SetRecordsIf(ctx context.Context, set dns.RecordSet, expect dns.Expect) error {
+	return p.setRecords(ctx, set, &expect)
+}
+
+func (p *Provider) setRecords(ctx context.Context, set dns.RecordSet, expect *dns.Expect) error {
 	rrs := make([]mdns.RR, 0, len(set.Values))
 	for _, v := range set.Values {
 		rr, err := newRR(set, v)
@@ -247,7 +260,12 @@ func (p *Provider) SetRecords(ctx context.Context, set dns.RecordSet) error {
 		}
 		rrs = append(rrs, rr)
 	}
+	prereq, err := prerequisite(set.Name, set.Type, expect)
+	if err != nil {
+		return err
+	}
 	if err := p.send(ctx, set.Name, func(m *mdns.Msg) {
+		prereq(m)
 		m.RemoveRRset([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(set.Name), Rrtype: recordTypeCodes[set.Type], Class: mdns.ClassINET}}})
 		m.Insert(rrs)
 	}); err != nil {
@@ -282,16 +300,64 @@ func (p *Provider) SetRecords(ctx context.Context, set dns.RecordSet) error {
 
 // DeleteRecords implements dns.RecordProvider.
 func (p *Provider) DeleteRecords(ctx context.Context, name, recordType string) error {
+	return p.deleteRecords(ctx, name, recordType, nil)
+}
+
+// DeleteRecordsIf implements dns.ConditionalRecordProvider, with the
+// prerequisite "RRset exists (value dependent)" (RFC 2136 2.4.2).
+func (p *Provider) DeleteRecordsIf(ctx context.Context, name, recordType string, expect dns.Expect) error {
+	if expect.Absent {
+		return dns.Invalid("a deletion can expect values, not an absent record set")
+	}
+	return p.deleteRecords(ctx, name, recordType, &expect)
+}
+
+func (p *Provider) deleteRecords(ctx context.Context, name, recordType string, expect *dns.Expect) error {
 	code, ok := recordTypeCodes[recordType]
 	if !ok {
 		return dns.Invalid("unknown record type %q", recordType)
 	}
+	prereq, err := prerequisite(name, recordType, expect)
+	if err != nil {
+		return err
+	}
 	return p.send(ctx, name, func(m *mdns.Msg) {
+		prereq(m)
 		m.RemoveRRset([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(name), Rrtype: code, Class: mdns.ClassINET}}})
 	})
 }
 
-// newRR returns the resource record of one value of a set.
+// prerequisite returns what puts the condition of a write into the
+// prerequisite section of its update message (nothing for a nil expect):
+// "RRset does not exist" (RFC 2136 2.4.3) for an absent set, "RRset exists
+// (value dependent)" (2.4.2) for expected values, which the server compares
+// with the whole RRset of the name and type, without the TTL (3.2.3,
+// 3.2.5).
+func prerequisite(name, recordType string, expect *dns.Expect) (func(*mdns.Msg), error) {
+	switch {
+	case expect == nil:
+		return func(*mdns.Msg) {}, nil
+	case expect.Absent:
+		return func(m *mdns.Msg) {
+			m.RRsetNotUsed([]mdns.RR{&mdns.ANY{Hdr: mdns.RR_Header{Name: mdns.Fqdn(name), Rrtype: recordTypeCodes[recordType], Class: mdns.ClassINET}}})
+		}, nil
+	}
+	rrs := make([]mdns.RR, 0, len(expect.Values))
+	for _, v := range expect.Values {
+		rr, err := newRR(dns.RecordSet{Name: name, Type: recordType}, v)
+		if err != nil {
+			return nil, dns.Invalid("expect: %v", err)
+		}
+		rrs = append(rrs, rr)
+	}
+	// Used sets the class of the zone and a TTL of 0, as 2.4.2 asks.
+	return func(m *mdns.Msg) { m.Used(rrs) }, nil
+}
+
+// newRR returns the resource record of one value of a set. A TXT value
+// longer than one character string (an expected value read from the
+// server, which joins the strings of a record) is split into strings of
+// 255 characters.
 func newRR(set dns.RecordSet, value string) (mdns.RR, error) {
 	hdr := mdns.RR_Header{Name: mdns.Fqdn(set.Name), Rrtype: recordTypeCodes[set.Type], Class: mdns.ClassINET, Ttl: uint32(set.TTL)} //nolint:gosec // the TTL is 1 to 86400
 	switch set.Type {
@@ -310,7 +376,11 @@ func newRR(set dns.RecordSet, value string) (mdns.RR, error) {
 	case dns.TypeCNAME:
 		return &mdns.CNAME{Hdr: hdr, Target: mdns.Fqdn(value)}, nil
 	case dns.TypeTXT:
-		return &mdns.TXT{Hdr: hdr, Txt: []string{value}}, nil
+		var txt []string
+		for len(value) > 255 {
+			txt, value = append(txt, value[:255]), value[255:]
+		}
+		return &mdns.TXT{Hdr: hdr, Txt: append(txt, value)}, nil
 	}
 	return nil, fmt.Errorf("unknown record type %q", set.Type)
 }
@@ -321,6 +391,12 @@ func (p *Provider) send(ctx context.Context, name string, change func(*mdns.Msg)
 	reply, err := p.exchange(ctx, change)
 	if err != nil {
 		return fmt.Errorf("update of %s on %s: %w", name, p.server, err)
+	}
+	// The answers of a prerequisite about an RRset that does not hold
+	// (RFC 2136 3.2.1-3.2.3); the updates without one never get them. The
+	// error goes to the writer of the record: it does not name the server.
+	if reply.Rcode == mdns.RcodeNXRrset || reply.Rcode == mdns.RcodeYXRrset {
+		return dns.PreconditionFailed("the name server holds other records of %s than expected (%s)", name, mdns.RcodeToString[reply.Rcode])
 	}
 	if reply.Rcode != mdns.RcodeSuccess {
 		return fmt.Errorf("update of %s on %s: the server answered %s", name, p.server, mdns.RcodeToString[reply.Rcode])

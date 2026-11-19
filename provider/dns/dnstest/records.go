@@ -71,6 +71,24 @@ func (c *countedProvider) Close() error {
 	return nil
 }
 
+// countedConditional is a countedProvider of a provider that can make a
+// write depend on the record set: the wrapper keeps that ability, and only
+// that of the provider.
+type countedConditional struct {
+	*countedProvider
+	cond dns.ConditionalRecordProvider
+}
+
+func (c *countedConditional) SetRecordsIf(ctx context.Context, set dns.RecordSet, expect dns.Expect) error {
+	c.calls.Add(1)
+	return c.cond.SetRecordsIf(ctx, set, expect)
+}
+
+func (c *countedConditional) DeleteRecordsIf(ctx context.Context, name, recordType string, expect dns.Expect) error {
+	c.calls.Add(1)
+	return c.cond.DeleteRecordsIf(ctx, name, recordType, expect)
+}
+
 // RunRecords checks the records contract the way norca-dns relies on it:
 //
 //   - a record set is set, read back and set again without a change;
@@ -80,14 +98,22 @@ func (c *countedProvider) Close() error {
 //   - names outside the zone, challenge names and invalid values are
 //     refused before the provider is called;
 //   - the token is required;
-//   - a zone without records = true refuses the contract.
+//   - a zone without records = true refuses the contract;
+//   - a conditional write (a dns.ConditionalRecordProvider) creates only a
+//     set that is not there, replaces and deletes only a set with the
+//     expected values, and answers 412 otherwise; a provider that can't
+//     check a condition refuses it (501) and writes nothing.
 func RunRecords(t *testing.T, cfg RecordsConfig) {
 	t.Helper()
 	if !dns.ValidZone(cfg.Zone) {
 		t.Fatalf("dnstest: invalid zone %q", cfg.Zone)
 	}
-	// calls counts the calls that reached the provider of the last client.
-	var calls *atomic.Int64
+	// calls counts the calls that reached the provider of the last client;
+	// conditional says whether it is a dns.ConditionalRecordProvider.
+	var (
+		calls       *atomic.Int64
+		conditional bool
+	)
 	newClient := func(t *testing.T, token string, records bool) *dns.Client {
 		t.Helper()
 		p := cfg.New(t)
@@ -97,7 +123,12 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 		}
 		counted := &countedProvider{Provider: p, records: rp}
 		calls = &counted.calls
-		z := &dns.Zone{Name: cfg.Zone, Type: "test", Provider: counted, Records: records}
+		var served dns.Provider = counted
+		var cp dns.ConditionalRecordProvider
+		if cp, conditional = p.(dns.ConditionalRecordProvider); conditional {
+			served = &countedConditional{countedProvider: counted, cond: cp}
+		}
+		z := &dns.Zone{Name: cfg.Zone, Type: "test", Provider: served, Records: records}
 		srv := httptest.NewServer(dns.NewHandler(z, token, nil))
 		t.Cleanup(srv.Close)
 		t.Cleanup(func() { _ = z.Close() })
@@ -215,6 +246,73 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 		}
 	})
 
+	t.Run("conditional writes", func(t *testing.T) {
+		c := newClient(t, "", true)
+		t.Cleanup(func() { _ = c.DeleteRecords(context.Background(), name, dns.TypeA) })
+		failed := func(t *testing.T, what string, err error) {
+			t.Helper()
+			var re *dns.ResponseError
+			if !errors.As(err, &re) || !re.PreconditionFailed() {
+				t.Fatalf("%s: %v, want a 412 with the reason %s", what, err, dns.ReasonPreconditionFailed)
+			}
+		}
+		set := dns.RecordSet{Name: name, Type: dns.TypeA, TTL: 120, Values: []string{"192.0.2.30", "192.0.2.31"}}
+		absent := dns.Expect{Absent: true}
+
+		if !conditional {
+			// A provider that can't check a condition refuses it and
+			// writes nothing.
+			err := c.SetRecordsIf(ctx(t), set, absent)
+			var re *dns.ResponseError
+			if !errors.As(err, &re) || !re.ConditionsUnsupported() {
+				t.Fatalf("a conditional write to a provider that can't check it: %v, want a 501 with the reason %s",
+					err, dns.ReasonConditionsUnsupported)
+			}
+			if got := read(t, c, name, dns.TypeA); got != nil {
+				t.Fatalf("the refused write was done: %+v", got)
+			}
+			return
+		}
+
+		// Created only where there is no set.
+		if err := c.SetRecordsIf(ctx(t), set, absent); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		held(t, name, dns.TypeA, set.Values...)
+		other := set
+		other.Values = []string{"192.0.2.39"}
+		failed(t, "creating a set that is there", c.SetRecordsIf(ctx(t), other, absent))
+		held(t, name, dns.TypeA, set.Values...)
+
+		// Replaced only over the expected values, in any order.
+		failed(t, "replacing other values", c.SetRecordsIf(ctx(t), other, dns.Expect{Values: []string{"192.0.2.30"}}))
+		failed(t, "replacing more values", c.SetRecordsIf(ctx(t), other,
+			dns.Expect{Values: []string{"192.0.2.30", "192.0.2.31", "192.0.2.32"}}))
+		held(t, name, dns.TypeA, set.Values...)
+		if err := c.SetRecordsIf(ctx(t), other, dns.Expect{Values: []string{"192.0.2.31", "192.0.2.30"}}); err != nil {
+			t.Fatalf("replace: %v", err)
+		}
+		got := read(t, c, name, dns.TypeA)
+		if got == nil || !slices.Equal(got.Values, other.Values) {
+			t.Fatalf("after the replacement %+v, want %+v", got, other)
+		}
+		held(t, name, dns.TypeA, other.Values...)
+
+		// Deleted only with the expected values.
+		failed(t, "deleting other values", c.DeleteRecordsIf(ctx(t), name, dns.TypeA, dns.Expect{Values: set.Values}))
+		held(t, name, dns.TypeA, other.Values...)
+		if err := c.DeleteRecordsIf(ctx(t), name, dns.TypeA, dns.Expect{Values: other.Values}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if got := read(t, c, name, dns.TypeA); got != nil {
+			t.Fatalf("after the deletion: %+v", got)
+		}
+		held(t, name, dns.TypeA)
+		failed(t, "deleting a set that is not there", c.DeleteRecordsIf(ctx(t), name, dns.TypeA, dns.Expect{Values: other.Values}))
+		failed(t, "replacing a set that is not there", c.SetRecordsIf(ctx(t), other, dns.Expect{Values: other.Values}))
+		held(t, name, dns.TypeA)
+	})
+
 	t.Run("refused before the provider", func(t *testing.T) {
 		c := newClient(t, "", true)
 		invalid(t, "a name of another zone",
@@ -236,6 +334,12 @@ func RunRecords(t *testing.T, cfg RecordsConfig) {
 		invalid(t, "deleting a name of another zone", c.DeleteRecords(ctx(t), "www.other-zone.example", dns.TypeA))
 		invalid(t, "deleting a challenge name", c.DeleteRecords(ctx(t), dns.ChallengeName("www."+cfg.Zone), dns.TypeTXT))
 		invalid(t, "deleting an unknown type", c.DeleteRecords(ctx(t), name, "MX"))
+		a := dns.RecordSet{Name: name, Type: dns.TypeA, Values: []string{"192.0.2.1"}}
+		invalid(t, "expecting an absent set and values",
+			c.SetRecordsIf(ctx(t), a, dns.Expect{Absent: true, Values: []string{"192.0.2.1"}}))
+		invalid(t, "expecting nothing", c.SetRecordsIf(ctx(t), a, dns.Expect{}))
+		invalid(t, "expecting an IPv6 address in an A record", c.SetRecordsIf(ctx(t), a, dns.Expect{Values: []string{"2001:db8::1"}}))
+		invalid(t, "a deletion expecting an absent set", c.DeleteRecordsIf(ctx(t), name, dns.TypeA, dns.Expect{Absent: true}))
 		if n := calls.Load(); n != 0 {
 			t.Fatalf("%d of the refused requests reached the provider", n)
 		}

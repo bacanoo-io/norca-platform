@@ -60,6 +60,19 @@ func (e *ResponseError) RecordsDisabled() bool {
 	return e.Status == http.StatusForbidden && e.Reason == ReasonRecordsDisabled
 }
 
+// PreconditionFailed reports whether the provider did not do a conditional
+// write of the records contract because the record set was not as
+// expected.
+func (e *ResponseError) PreconditionFailed() bool {
+	return e.Status == http.StatusPreconditionFailed && e.Reason == ReasonPreconditionFailed
+}
+
+// ConditionsUnsupported reports whether the provider refused a conditional
+// write of the records contract because it can't check the condition.
+func (e *ResponseError) ConditionsUnsupported() bool {
+	return e.Status == http.StatusNotImplemented && e.Reason == ReasonConditionsUnsupported
+}
+
 // Present adds the value to the TXT records of the name. A TTL of 0 leaves
 // the time to live to the provider.
 func (c *Client) Present(ctx context.Context, rec Record) error {

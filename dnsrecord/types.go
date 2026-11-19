@@ -10,7 +10,8 @@
 // norca.io/dns-suffixes (written by a Tenant or by a management token). The
 // operator writes only zones whose DNSZone object says records = true, and
 // changes only the record sets it wrote: a name that has records of the type
-// it did not write is left alone (Conflict) unless the object says adopt.
+// it did not write is left alone (Conflict) unless the object says adopt,
+// also when they have the values the object asks for.
 // One cluster writes a zone; the zone carries no marker of what is whose.
 package dnsrecord
 
@@ -113,6 +114,13 @@ type Status struct {
 	// wrote or adopted it. Only an owned set is changed or removed.
 	Owned bool `json:"owned,omitempty"`
 
+	// Pending is the record set the operator is about to write, recorded
+	// before the write: a set found in the zone exactly as it says is the
+	// record's, also when the status write after the zone write was lost.
+	// It is cleared when the status records the set as owned, or when the
+	// write was not done.
+	Pending *PendingSet `json:"pending,omitempty"`
+
 	// WrittenAt is when the operator last wrote the set (RFC 3339).
 	WrittenAt string `json:"writtenAt,omitempty"`
 
@@ -120,6 +128,15 @@ type Status struct {
 	// back; LastDrift is the time of the last one.
 	Drifts    int    `json:"drifts,omitempty"`
 	LastDrift string `json:"lastDrift,omitempty"`
+}
+
+// PendingSet is a record set the operator is about to write, or holds.
+type PendingSet struct {
+	Zone   string   `json:"zone"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type"`
+	TTL    int      `json:"ttl"`
+	Values []string `json:"values"`
 }
 
 // normalize checks the spec and writes its name and type as the contract

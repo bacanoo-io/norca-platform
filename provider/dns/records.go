@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -31,11 +32,36 @@ import (
 //
 // A zone that does not serve them answers every request of the records
 // contract with 403 and the reason ReasonRecordsDisabled.
+//
+// A PUT and a DELETE can be conditional: the field "expect" of the body
+// (RecordSetRequest, RecordDeleteRequest) is the state the record set of
+// the name and type must be in, and the provider checks it and writes in
+// one step, so that a set someone else wrote or changed after the caller
+// read it is not written over or removed:
+//
+//	"expect": {"absent": true}          the name has no record set of the type (a PUT only)
+//	"expect": {"values": ["192.0.2.1"]}  the set holds exactly these values, in any order (the TTL is not compared)
+//
+// A set that is not as expected is answered with 412 and the reason
+// ReasonPreconditionFailed, and nothing is written. A zone whose provider
+// can't check a condition answers it with 501 and the reason
+// ReasonConditionsUnsupported: it never writes without the check. A
+// request without "expect" (a DELETE without a body) writes in any case.
 
 // ReasonRecordsDisabled is the reason of the answer of a zone that does not
 // write records. Only this answer says so: a 403 without it (from a proxy
 // in front of the provider, for example) says nothing of the zone.
 const ReasonRecordsDisabled = "records_disabled"
+
+// The reasons of the answers to a conditional write that was not done.
+const (
+	// ReasonPreconditionFailed: the record set was not as expected (412).
+	ReasonPreconditionFailed = "precondition_failed"
+
+	// ReasonConditionsUnsupported: the provider of the zone can't make a
+	// write depend on the record set (501).
+	ReasonConditionsUnsupported = "conditions_unsupported"
+)
 
 // The record types of the contract.
 const (
@@ -89,6 +115,81 @@ type RecordProvider interface {
 	// DeleteRecords removes every value of the name and type. Removing what
 	// is not there is not an error.
 	DeleteRecords(ctx context.Context, name, recordType string) error
+}
+
+// ConditionalRecordProvider is implemented by the record providers that can
+// make a write depend on the record set as the platform holds it at that
+// moment, checked and written in one step (not read first and written
+// after). The handler serves the conditional requests of the contract only
+// for them.
+type ConditionalRecordProvider interface {
+	RecordProvider
+
+	// SetRecordsIf is SetRecords when the record set of the name and type
+	// is as expected; otherwise it writes nothing and returns an error
+	// wrapping ErrPrecondition.
+	SetRecordsIf(ctx context.Context, set RecordSet, expect Expect) error
+
+	// DeleteRecordsIf is DeleteRecords when the record set of the name and
+	// type holds exactly expect.Values; otherwise it removes nothing and
+	// returns an error wrapping ErrPrecondition.
+	DeleteRecordsIf(ctx context.Context, name, recordType string, expect Expect) error
+}
+
+// Expect is the state of a record set that a conditional write requires:
+// Absent, or Values.
+type Expect struct {
+	// Absent requires that the name has no record set of the type.
+	Absent bool `json:"absent,omitempty"`
+
+	// Values requires that the record set holds exactly these values, in
+	// any order. The TTL is not compared.
+	Values []string `json:"values,omitempty"`
+}
+
+// ErrPrecondition marks a conditional write that was not done: the record
+// set was not as expected.
+var ErrPrecondition = errors.New("the record set is not as expected")
+
+// PreconditionFailed returns an error wrapping ErrPrecondition.
+func PreconditionFailed(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrPrecondition, fmt.Sprintf(format, args...))
+}
+
+// CheckExpect checks the condition of a write of a record type and returns
+// it with its values normalized and sorted. A deletion can only expect
+// values. The values are those a provider read from its platform, which
+// need not be values the contract would write (a TXT value with a quote,
+// say): a TXT value is taken as it is.
+func CheckExpect(recordType string, expect Expect, deletion bool) (Expect, error) {
+	switch {
+	case expect.Absent && len(expect.Values) > 0:
+		return expect, errors.New("expect is absent or values, not both")
+	case expect.Absent && deletion:
+		return expect, errors.New("a deletion can expect values, not an absent record set")
+	case expect.Absent:
+		return expect, nil
+	case len(expect.Values) == 0:
+		return expect, errors.New("expect is absent or values")
+	}
+	values := make([]string, 0, len(expect.Values))
+	for _, v := range expect.Values {
+		nv := v
+		if recordType != TypeTXT {
+			var err error
+			if nv, err = normalizeValue(recordType, v); err != nil {
+				return expect, fmt.Errorf("expect: %w", err)
+			}
+		} else if v == "" {
+			return expect, errors.New("expect: an empty TXT value")
+		}
+		if !slices.Contains(values, nv) {
+			values = append(values, nv)
+		}
+	}
+	slices.Sort(values)
+	expect.Values = values
+	return expect, nil
 }
 
 // CheckRecordName checks the name of a record set against the zone: a name
@@ -195,7 +296,20 @@ func SameRecords(a, b RecordSet) bool {
 type RecordSetRequest struct {
 	Values []string `json:"values"`
 	TTL    int      `json:"ttl,omitempty"`
+
+	// Expect makes the write conditional; nil writes in any case.
+	Expect *Expect `json:"expect,omitempty"`
 }
+
+// RecordDeleteRequest is the body of a conditional DELETE of a record set;
+// a DELETE without a body removes the set in any case.
+type RecordDeleteRequest struct {
+	Expect *Expect `json:"expect,omitempty"`
+}
+
+// The client is the operator's side of the records contract, conditional
+// writes included.
+var _ ConditionalRecordProvider = (*Client)(nil)
 
 // Records returns the record sets of a name.
 func (c *Client) Records(ctx context.Context, name string) ([]RecordSet, error) {
@@ -207,12 +321,31 @@ func (c *Client) Records(ctx context.Context, name string) ([]RecordSet, error) 
 // SetRecords sets the values of a name and type.
 func (c *Client) SetRecords(ctx context.Context, set RecordSet) error {
 	body := RecordSetRequest{Values: set.Values, TTL: set.TTL}
-	return c.call(ctx, http.MethodPut, "/v1/records/"+url.PathEscape(set.Name)+"/"+url.PathEscape(set.Type), body, nil)
+	return c.call(ctx, http.MethodPut, recordSetPath(set.Name, set.Type), body, nil)
+}
+
+// SetRecordsIf sets the values of a name and type if its record set is as
+// expected. The answer of a set that is not is a ResponseError whose
+// PreconditionFailed is true; that of a provider that can't check it is one
+// whose ConditionsUnsupported is true.
+func (c *Client) SetRecordsIf(ctx context.Context, set RecordSet, expect Expect) error {
+	body := RecordSetRequest{Values: set.Values, TTL: set.TTL, Expect: &expect}
+	return c.call(ctx, http.MethodPut, recordSetPath(set.Name, set.Type), body, nil)
 }
 
 // DeleteRecords removes the record set of a name and type.
 func (c *Client) DeleteRecords(ctx context.Context, name, recordType string) error {
-	return c.call(ctx, http.MethodDelete, "/v1/records/"+url.PathEscape(name)+"/"+url.PathEscape(recordType), nil, nil)
+	return c.call(ctx, http.MethodDelete, recordSetPath(name, recordType), nil, nil)
+}
+
+// DeleteRecordsIf removes the record set of a name and type if it holds
+// exactly the expected values; the answers are those of SetRecordsIf.
+func (c *Client) DeleteRecordsIf(ctx context.Context, name, recordType string, expect Expect) error {
+	return c.call(ctx, http.MethodDelete, recordSetPath(name, recordType), RecordDeleteRequest{Expect: &expect}, nil)
+}
+
+func recordSetPath(name, recordType string) string {
+	return "/v1/records/" + url.PathEscape(name) + "/" + url.PathEscape(recordType)
 }
 
 // call sends one request of the records contract.

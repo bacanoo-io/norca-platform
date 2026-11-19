@@ -27,9 +27,10 @@ import (
 //     name that does not exist is answered from the wildcard of its closest
 //     encloser, with the name asked as the owner (RFC 4592 3.3.1), and with
 //     NXDOMAIN without one; an empty non-terminal exists;
-//   - prerequisites (RFC 2136 3.2): RRset exists (value independent), RRset
-//     does not exist, name is in use, name is not in use, checked against
-//     the records the zone holds, never against a wildcard;
+//   - prerequisites (RFC 2136 3.2): RRset exists (value independent and
+//     value dependent), RRset does not exist, name is in use, name is not
+//     in use, checked against the records the zone holds, never against a
+//     wildcard, with a TTL of 0 (else FORMERR);
 //   - updates (RFC 2136 2.5, 3.4.2): a deletion of an RRset (class ANY), of
 //     one record (class NONE), and additions (class IN), where a CNAME
 //     added to a name with other data, and other data added to a name with
@@ -182,11 +183,16 @@ func (rs *recordServer) answer(name string, qtype uint16) ([]mdns.RR, int) {
 // prerequisites checks the prerequisite section of an update against the
 // records of the zone. The caller holds the lock.
 func (rs *recordServer) prerequisites(prereqs []mdns.RR) int {
+	// The records of the value dependent prerequisites, by name and type:
+	// together they are the whole RRset the zone must hold (3.2.3).
+	valued := map[string]map[uint16][]mdns.RR{}
 	for _, rr := range prereqs {
 		h := rr.Header()
 		name := strings.ToLower(h.Name)
 		inUse, hasSet := len(rs.rrs[name]) > 0, len(rs.rrs[name][h.Rrtype]) > 0
 		switch {
+		case h.Ttl != 0:
+			return mdns.RcodeFormatError
 		case h.Class == mdns.ClassANY && h.Rrtype == mdns.TypeANY && !inUse:
 			return mdns.RcodeNameError
 		case h.Class == mdns.ClassANY && h.Rrtype != mdns.TypeANY && !hasSet:
@@ -195,6 +201,24 @@ func (rs *recordServer) prerequisites(prereqs []mdns.RR) int {
 			return mdns.RcodeYXDomain
 		case h.Class == mdns.ClassNONE && h.Rrtype != mdns.TypeANY && hasSet:
 			return mdns.RcodeYXRrset
+		case h.Class == mdns.ClassINET:
+			if valued[name] == nil {
+				valued[name] = map[uint16][]mdns.RR{}
+			}
+			valued[name][h.Rrtype] = append(valued[name][h.Rrtype], rr)
+		}
+	}
+	for name, types := range valued {
+		for rrtype, want := range types {
+			have := rs.rrs[name][rrtype]
+			if len(have) != len(want) {
+				return mdns.RcodeNXRrset
+			}
+			for _, w := range want {
+				if !slices.ContainsFunc(have, func(h mdns.RR) bool { return sameData(h, w) }) {
+					return mdns.RcodeNXRrset
+				}
+			}
 		}
 	}
 	return mdns.RcodeSuccess

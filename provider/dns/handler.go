@@ -179,15 +179,25 @@ func (h *handler) putRecords(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, err.Error())
 		return
 	}
+	cond, ok := h.condition(w, set.Type, body.Expect, false)
+	if !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 	unlock := h.lock(set.Name)
 	defer unlock()
-	if err := h.records.SetRecords(ctx, set); err != nil {
+	if cond != nil {
+		err = h.records.(ConditionalRecordProvider).SetRecordsIf(ctx, set, *cond)
+	} else {
+		err = h.records.SetRecords(ctx, set)
+	}
+	if err != nil {
 		h.failRecords(w, "set", set.Name, err)
 		return
 	}
-	h.log.Info("records set", "zone", h.z.Name, "name", set.Name, "type", set.Type, "values", len(set.Values), "ttl", set.TTL)
+	h.log.Info("records set", "zone", h.z.Name, "name", set.Name, "type", set.Type, "values", len(set.Values), "ttl", set.TTL,
+		"conditional", cond != nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -202,24 +212,65 @@ func (h *handler) deleteRecords(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, "unknown record type "+recordType)
 		return
 	}
+	// The body is optional: without one the set is removed in any case.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	var body RecordDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		wire.WriteError(w, http.StatusBadRequest, wire.ReasonInvalid, "invalid body: "+err.Error())
+		return
+	}
+	cond, ok := h.condition(w, recordType, body.Expect, true)
+	if !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
 	defer cancel()
 	unlock := h.lock(name)
 	defer unlock()
-	if err := h.records.DeleteRecords(ctx, name, recordType); err != nil {
+	var err error
+	if cond != nil {
+		err = h.records.(ConditionalRecordProvider).DeleteRecordsIf(ctx, name, recordType, *cond)
+	} else {
+		err = h.records.DeleteRecords(ctx, name, recordType)
+	}
+	if err != nil {
 		h.failRecords(w, "delete", name, err)
 		return
 	}
-	h.log.Info("records deleted", "zone", h.z.Name, "name", name, "type", recordType)
+	h.log.Info("records deleted", "zone", h.z.Name, "name", name, "type", recordType, "conditional", cond != nil)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// condition checks the condition of a write of the records contract
+// (nil: none) and returns it normalized. A condition the provider can't
+// check is refused, never ignored. ok is false when the request was
+// answered.
+func (h *handler) condition(w http.ResponseWriter, recordType string, expect *Expect, deletion bool) (cond *Expect, ok bool) {
+	if expect == nil {
+		return nil, true
+	}
+	checked, err := CheckExpect(recordType, *expect, deletion)
+	if err != nil {
+		wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, err.Error())
+		return nil, false
+	}
+	if _, conditional := h.records.(ConditionalRecordProvider); !conditional {
+		wire.WriteError(w, http.StatusNotImplemented, ReasonConditionsUnsupported,
+			"the provider of the zone "+h.z.Name+" can't make a write depend on the record set")
+		return nil, false
+	}
+	return &checked, true
 }
 
 // failRecords answers the failure of a provider for the records contract.
 func (h *handler) failRecords(w http.ResponseWriter, what, name string, err error) {
 	h.log.Warn("records "+what+" failed", "zone", h.z.Name, "name", name, "error", err)
-	if errors.Is(err, ErrInvalid) {
+	switch {
+	case errors.Is(err, ErrPrecondition):
+		wire.WriteError(w, http.StatusPreconditionFailed, ReasonPreconditionFailed, err.Error())
+	case errors.Is(err, ErrInvalid):
 		wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, err.Error())
-		return
+	default:
+		wire.WriteError(w, http.StatusBadGateway, wire.ReasonError, err.Error())
 	}
-	wire.WriteError(w, http.StatusBadGateway, wire.ReasonError, err.Error())
 }
