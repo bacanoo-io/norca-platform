@@ -125,6 +125,55 @@ func (p *DNS) SetRecords(ctx context.Context, set dns.RecordSet) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.setLocked(set)
+}
+
+// SetRecordsIf implements dns.ConditionalRecordProvider.
+func (p *DNS) SetRecordsIf(ctx context.Context, set dns.RecordSet, expect dns.Expect) error {
+	if err := p.call(ctx); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.expected(set.Name, set.Type, expect); err != nil {
+		return err
+	}
+	return p.setLocked(set)
+}
+
+// DeleteRecordsIf implements dns.ConditionalRecordProvider.
+func (p *DNS) DeleteRecordsIf(ctx context.Context, name, recordType string, expect dns.Expect) error {
+	if err := p.call(ctx); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.expected(name, recordType, expect); err != nil {
+		return err
+	}
+	p.deleteLocked(name, recordType)
+	return nil
+}
+
+// expected checks the condition of a write against the record set of the
+// name and type. The caller holds the lock.
+func (p *DNS) expected(name, recordType string, expect dns.Expect) error {
+	set, ok := p.sets[name][recordType]
+	if expect.Absent {
+		if ok {
+			return dns.PreconditionFailed("%s has %s records", name, recordType)
+		}
+		return nil
+	}
+	have, want := slices.Sorted(slices.Values(set.Values)), slices.Sorted(slices.Values(expect.Values))
+	if !ok || !slices.Equal(have, want) {
+		return dns.PreconditionFailed("the %s records of %s are not the expected ones", recordType, name)
+	}
+	return nil
+}
+
+// setLocked sets a record set; the caller holds the lock.
+func (p *DNS) setLocked(set dns.RecordSet) error {
 	types := p.sets[set.Name]
 	// A CNAME stands alone at its name, as DNS asks.
 	switch {
@@ -149,11 +198,16 @@ func (p *DNS) DeleteRecords(ctx context.Context, name, recordType string) error 
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.deleteLocked(name, recordType)
+	return nil
+}
+
+// deleteLocked removes a record set; the caller holds the lock.
+func (p *DNS) deleteLocked(name, recordType string) {
 	delete(p.sets[name], recordType)
 	if len(p.sets[name]) == 0 {
 		delete(p.sets, name)
 	}
-	return nil
 }
 
 // RecordValues returns the values of a record set of the records contract.

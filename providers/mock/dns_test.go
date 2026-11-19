@@ -59,6 +59,31 @@ func TestRecordsContract_MockDNS(t *testing.T) {
 	})
 }
 
+// plainRecords is a provider of the records contract that can't make a write
+// depend on the record set: it hides the conditional writes of the mock.
+type plainRecords struct {
+	dns.Provider
+	dns.RecordProvider
+}
+
+// The handler refuses a conditional write to a provider that can't check
+// the condition, and writes nothing.
+func TestRecordsContract_WithoutConditions(t *testing.T) {
+	var current *mock.DNS
+	dnstest.RunRecords(t, dnstest.RecordsConfig{
+		Zone: "example.com",
+		New: func(t *testing.T) dns.Provider {
+			z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current = z.Provider.(*mock.DNS)
+			return plainRecords{Provider: current, RecordProvider: current}
+		},
+		Lookup: func(_ *testing.T, name, recordType string) []string { return current.RecordValues(name, recordType) },
+	})
+}
+
 // A CNAME stands alone at its name.
 func TestMockDNS_CNAMEAlone(t *testing.T) {
 	z, err := provider.Default.NewZone("example.com", mock.TypeID, nil, nil)
