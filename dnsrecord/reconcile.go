@@ -273,14 +273,25 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	})
 
 	switch {
-	case have != nil && !owned && !takeOver && !spec.Adopt && !dns.SameRecords(*have, want):
-		msg := fmt.Sprintf("the zone %s has %s records of %s that norca-dns did not write (%s); set adopt = true to take them over",
-			zone.Name, want.Type, want.Name, strings.Join(have.Values, ", "))
+	case have != nil && !owned && !takeOver && !spec.Adopt:
+		// A set norca-dns did not write is not the record's, also when it
+		// has the values the record asks for: the zone carries no marker,
+		// and a record that took it would remove it with itself.
+		with := ""
+		if dns.SameRecords(*have, want) {
+			with = ", with the values this record asks for"
+		}
+		msg := fmt.Sprintf("the zone %s has %s records of %s that norca-dns did not write (%s)%s; set adopt = true to take them over",
+			zone.Name, want.Type, want.Name, strings.Join(have.Values, ", "), with)
 		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
 
 	case have != nil && dns.SameRecords(*have, want):
-		// As it should be; a set that was there already as wanted is the
-		// operator's from now on.
+		// As it should be. A set the record did not hold is taken over
+		// without a write (adopt, or the set of a record whose namespace
+		// may no longer write the name).
+		if !owned {
+			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "Adopted", adoptedText(want, takeOver))
+		}
 
 	default:
 		if err := r.setRecords(ctx, client, zone.Name, want, read); err != nil {

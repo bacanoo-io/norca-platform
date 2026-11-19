@@ -10,7 +10,8 @@
 // norca.io/dns-suffixes (written by a Tenant or by a management token). The
 // operator writes only zones whose DNSZone object says records = true, and
 // changes only the record sets it wrote: a name that has records of the type
-// it did not write is left alone (Conflict) unless the object says adopt.
+// it did not write is left alone (Conflict) unless the object says adopt,
+// also when they have the values the object asks for.
 // One cluster writes a zone; the zone carries no marker of what is whose.
 package dnsrecord
 

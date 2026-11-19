@@ -94,6 +94,9 @@ func TestDNSRecord_OneNamespaceConflictRequeue(t *testing.T) {
 		return readyReason(st) == ConditionConflict
 	})
 
+	// The operator of the other namespace removes the set with the record
+	// (a set nobody holds is taken over only with adopt).
+	must.NoError(t, e.zone.DeleteRecords(context.Background(), "www.shop.example.com", "A"))
 	e.b.RemoveObject(Kind, "other", "www")
 	e.waitFor("the record takes the name over after the conflict requeue", func() bool {
 		_, st := e.status("shop", "www")

@@ -351,8 +351,8 @@ func TestDNSRecord_ConflictsAndAdopt(t *testing.T) {
 
 	// A second record of the same name and type, in another namespace:
 	// the first one keeps it. The second one asks for the values the zone
-	// has, so it is the other record that stands in its way, not the zone
-	// (a set found as wanted would be taken over).
+	// has: it is the other record that stands in its way, not the zone
+	// (the conflict message names the record).
 	e.put("other", "mail", map[string]any{"name": "mail.shop.example.com", "type": "A", "values": []any{"192.0.2.25"}})
 	e.waitFor("conflict with another record", func() bool {
 		_, st := e.status("other", "mail")
@@ -597,6 +597,65 @@ func TestRemove_LeavesASetWithOtherValues(t *testing.T) {
 	must.NoError(t, err)
 	must.StrContains(t, kept, "other values than norca-dns wrote")
 	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
+// A record set in the zone that norca-dns did not write is not the record's
+// because it has the values the record asks for: it is taken over only with
+// adopt = true, as a set with other values is (ATM-9 addition). The set of a
+// record whose namespace lost the name is norca-dns's, and the record that
+// may write the name takes it over without adopt.
+func TestKeep_SameValuesAreAdoptedOnlyOnRequest(t *testing.T) {
+	spec := map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}}
+	setup := func(t *testing.T) *env {
+		e, _ := newOperator(t, true)
+		e.cluster.allow("shop", "shop.example.com")
+		must.NoError(t, e.zone.SetRecords(context.Background(),
+			dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+		return e
+	}
+
+	t.Run("without adopt", func(t *testing.T) {
+		e := setup(t)
+		e.put("shop", "web", spec)
+		obj, st := e.get("shop", "web")
+		out, _, err := e.r.keep(context.Background(), obj, st)
+		must.NoError(t, err)
+		must.Eq(t, ConditionConflict, out.reason)
+		must.StrContains(t, out.conflict, "set adopt = true to take them over")
+		must.False(t, st.Owned)
+	})
+
+	t.Run("with adopt", func(t *testing.T) {
+		e := setup(t)
+		adopt := maps.Clone(spec)
+		adopt["adopt"] = true
+		e.put("shop", "web", adopt)
+		obj, st := e.get("shop", "web")
+		out, _, err := e.r.keep(context.Background(), obj, st)
+		must.NoError(t, err)
+		must.True(t, out.ready)
+		must.True(t, st.Owned)
+		must.SliceContains(t, e.events("shop", "web"), "Adopted")
+	})
+
+	t.Run("from a record that lost the name", func(t *testing.T) {
+		// An operator of one namespace reads the holders from the servers
+		// (the informer of a test operator that does not run is empty).
+		e, _ := newOperatorIn(t, "shop", true)
+		e.cluster.allow("shop", "shop.example.com")
+		must.NoError(t, e.zone.SetRecords(context.Background(),
+			dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+		e.put("old", "web", spec)
+		e.hold("old", "web")
+		e.put("shop", "web", spec)
+		obj, st := e.get("shop", "web")
+		out, _, err := e.r.keep(context.Background(), obj, st)
+		must.NoError(t, err)
+		must.True(t, out.ready, must.Sprint(out.message))
+		must.True(t, st.Owned)
+		must.SliceContains(t, e.events("shop", "web"), "Adopted")
+		must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+	})
 }
 
 // A record set someone writes or changes in the zone after the operator read
