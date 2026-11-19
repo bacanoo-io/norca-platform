@@ -784,8 +784,20 @@ func (o *Operator) rootOf(is *issuer, certs []*x509.Certificate) (*x509.Certific
 	return chain[len(chain)-1], nil
 }
 
+// revocationReasons are the reasons a revocation order may give, by the
+// names of the CRLReason codes of RFC 5280 (section 5.3.1) that a subscriber
+// gives (RFC 8555, section 7.6); none is unspecified.
+var revocationReasons = map[string]xacme.CRLReasonCode{
+	"":                     xacme.CRLReasonUnspecified,
+	"unspecified":          xacme.CRLReasonUnspecified,
+	"keyCompromise":        xacme.CRLReasonKeyCompromise,
+	"affiliationChanged":   xacme.CRLReasonAffiliationChanged,
+	"superseded":           xacme.CRLReasonSuperseded,
+	"cessationOfOperation": xacme.CRLReasonCessationOfOperation,
+}
+
 // revoke revokes the certificate with the serial number of a revocation
-// order. The operator kept the certificates it issued.
+// order, for its reason. The operator kept the certificates it issued.
 func (o *Operator) revoke(ctx context.Context, is *issuer, spec *OrderSpec) error {
 	path := o.secretPrefix + secretIssued + is.obj.Name + "/" + strings.ToLower(spec.Revoke)
 	items, _, err := o.secrets.Read(ctx, path)
@@ -796,7 +808,13 @@ func (o *Operator) revoke(ctx context.Context, is *issuer, spec *OrderSpec) erro
 	if block == nil {
 		return permanent("the certificate with the serial %s is not one this controller issued for the issuer %s", spec.Revoke, is.obj.Name)
 	}
-	if err := is.account.authority.Revoke(ctx, block.Bytes); err != nil {
+	reason, ok := revocationReasons[spec.Reason]
+	if !ok {
+		o.log().Warn("revocation reason not known, revoking without one", "issuer", is.obj.Name,
+			"serial", spec.Revoke, "reason", spec.Reason)
+		reason = xacme.CRLReasonUnspecified
+	}
+	if err := is.account.authority.Revoke(ctx, block.Bytes, reason); err != nil {
 		text, perm := problemOf(err)
 		if strings.Contains(text, "alreadyRevoked") {
 			return nil

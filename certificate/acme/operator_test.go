@@ -484,11 +484,49 @@ func TestOrder_Revoke(t *testing.T) {
 	if len(e.ca.revoked) != 1 || !slices.Equal(e.ca.revoked[0], leaf.Raw) {
 		t.Fatal("the certificate authority was not asked to revoke the certificate")
 	}
+	if e.ca.reasons[0] != xacme.CRLReasonUnspecified {
+		t.Fatalf("a revocation without a reason: reason %d", e.ca.reasons[0])
+	}
 
 	e.cluster.put(OrderKind, "default.web.revoke-2", map[string]any{"issuer": "ca", "certificate": "default/web", "revoke": "0badc0de"}, nil)
 	e.pass()
 	if got := e.orderStatus("default.web.revoke-2"); got.State != StateFailed || !strings.Contains(got.Problem, "is not one this controller issued") {
 		t.Fatalf("a revocation of an unknown serial: %+v", got)
+	}
+}
+
+// The reason the servers give a revocation goes to the certificate authority
+// (RFC 8555, section 7.6): cessationOfOperation when a namespace may no
+// longer ask for the names of its certificate (review finding ATM-21). A
+// reason this controller does not know revokes without one.
+func TestOrder_RevokeReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   xacme.CRLReasonCode
+	}{
+		{name: "cessation of operation", reason: "cessationOfOperation", want: xacme.CRLReasonCessationOfOperation},
+		{name: "superseded", reason: "superseded", want: xacme.CRLReasonSuperseded},
+		{name: "unknown", reason: "somethingElse", want: xacme.CRLReasonUnspecified},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.issuer("ca", nil)
+			leaf := leafOf(t, e.passes(e.order("default.web.1", "ca", "www.example.org"), 6))
+			serial := hex.EncodeToString(leaf.SerialNumber.Bytes())
+
+			e.cluster.put(OrderKind, "default.web.revoke-1", map[string]any{
+				"issuer": "ca", "certificate": "default/web", "revoke": serial, "reason": tt.reason,
+			}, map[string]any{"state": StatePending})
+			e.pass()
+			if got := e.orderStatus("default.web.revoke-1"); got.State != StateValid {
+				t.Fatalf("the revocation: %+v", got)
+			}
+			if len(e.ca.reasons) != 1 || e.ca.reasons[0] != tt.want {
+				t.Fatalf("revoked with the reasons %v, want %d", e.ca.reasons, tt.want)
+			}
+		})
 	}
 }
 

@@ -175,6 +175,10 @@ type OrderSpec struct {
 	CSR         string   `json:"csr,omitempty"`
 	DNSNames    []string `json:"dns_names,omitempty"`
 	Revoke      string   `json:"revoke,omitempty"`
+
+	// Reason is the reason of a revocation, the name of an RFC 5280
+	// CRLReason (e.g. cessationOfOperation); empty for none.
+	Reason string `json:"reason,omitempty"`
 }
 
 // OrderStatus is the status of a CertificateOrder, written by this
