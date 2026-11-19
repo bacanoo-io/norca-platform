@@ -4,8 +4,14 @@
 # ACL policy of norca-dns. Bind it to the job of the operator, so the operator
 # runs with its workload identity and needs no static token:
 #
-#   norca acl policy apply -namespace default -job norca-dns \
+#   norca acl policy apply -namespace norca-system -job norca-dns \
 #     norca-dns norca-dns-policy.hcl
+#
+# The job runs in the operations namespace norca-system, which also holds the
+# tokens of the DNS zones and the lease (-zone-token-namespace and
+# -lease-namespace). The namespace must exist:
+#
+#   norca namespace apply -description "Norca operators" norca-system
 #
 # The records are namespaced: the rules below are for every namespace ("*").
 # An operator for one namespace (-namespace) needs write-status, write-events
@@ -34,7 +40,8 @@ namespace "*" {
   }
 }
 
-namespace "default" {
+# The namespace of the operator's own Variables.
+namespace "norca-system" {
   # A block of a namespace by name takes the place of the "*" block above for
   # that namespace: without a capability of its own here the operator could
   # not read the metadata of this namespace, and no record of it would be

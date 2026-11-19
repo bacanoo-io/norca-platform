@@ -19,6 +19,11 @@ import (
 	"github.com/bacanoo-io/norca/norca/controller"
 )
 
+// systemNamespace is the operations namespace of the Norca operators, the
+// default namespace of the operator's own Variables: its lease and the
+// tokens of the DNS zones. The records it watches are in any namespace.
+const systemNamespace = "norca-system"
+
 // Settings are the flags of norca-dns.
 type Settings struct {
 	Namespace      string
@@ -43,9 +48,9 @@ func (s *Settings) register(fs *flag.FlagSet) {
 	fs.DurationVar(&s.Resync, "resync", 10*time.Minute, "time between two full looks at every record")
 	fs.DurationVar(&s.Requeue, "requeue", 5*time.Minute, "time after which a record is compared with its zone again (finds changes made in the zone by hand)")
 	fs.BoolVar(&s.LeaderElection, "leader-election", false, "run several instances, one of them active")
-	fs.StringVar(&s.LeaseNamespace, "lease-namespace", "default", "namespace of the leader election lease")
+	fs.StringVar(&s.LeaseNamespace, "lease-namespace", systemNamespace, "namespace of the leader election lease")
 	fs.StringVar(&s.MetricsAddr, "metrics-addr", "", "address of the Prometheus metrics endpoint (empty: off)")
-	fs.StringVar(&s.ZoneTokenNamespace, "zone-token-namespace", "default", "namespace of the Variables holding the tokens of the DNS zones")
+	fs.StringVar(&s.ZoneTokenNamespace, "zone-token-namespace", systemNamespace, "namespace of the Variables holding the tokens of the DNS zones")
 	fs.DurationVar(&s.ZoneTTL, "zone-ttl", 3*time.Minute, "how old the heartbeat of a DNS zone may be")
 	fs.BoolVar(&s.ZoneAllowHTTP, "zone-allow-http", false, "accept http endpoints of DNS zones (development only)")
 	fs.StringVar(&s.ZoneCAFile, "zone-ca-file", "", "PEM file with the CA that signed the https certificates of the DNS providers, in addition to the system roots")
