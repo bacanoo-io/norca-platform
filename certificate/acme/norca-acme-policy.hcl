@@ -4,8 +4,14 @@
 # ACL policy of norca-acme. Bind it to the job of the operator, so the
 # operator runs with its workload identity and needs no static token:
 #
-#   norca acl policy apply -namespace default -job norca-acme \
+#   norca acl policy apply -namespace norca-system -job norca-acme \
 #     norca-acme norca-acme-policy.hcl
+#
+# The job runs in the operations namespace norca-system, which also holds the
+# secrets of the operator and the tokens of the DNS zones (-secret-namespace
+# and -zone-token-namespace). The namespace must exist:
+#
+#   norca namespace apply -description "Norca operators" norca-system
 #
 # The operator never reads a secret of a namespace: the keys of the
 # certificates stay with the servers.
@@ -35,7 +41,7 @@ namespace "*" {
 # certificates it issued until they expire (issued/<issuer>/<serial>, for a
 # revocation), and the external account bindings an administrator puts
 # there (eab/..., read only by the operator).
-namespace "default" {
+namespace "norca-system" {
   secret "norca-acme/*" {
     capabilities = ["read-secret", "write-secret"]
   }

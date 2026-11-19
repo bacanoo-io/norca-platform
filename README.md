@@ -573,7 +573,7 @@ certificate and reads no secret of a namespace.**
 
 | What | How |
 | --- | --- |
-| Account | One per issuer; the key is a secret of the operator (`norca-acme/accounts/<issuer>`). `eab_secret` names a secret with `kid` and `hmac_key` for an external account binding. Writing the issuer object accepts the terms of the certificate authority. |
+| Account | One per issuer; the key is a secret of the operator (`norca-acme/accounts/<issuer>` in the namespace `norca-system`, `-secret-namespace`). `eab_secret` names a secret with `kid` and `hmac_key` for an external account binding. Writing the issuer object accepts the terms of the certificate authority. |
 | Status of the issuer | `heartbeat` (every 30 seconds once the account of the issuer is open), `roots`, `account`, `directory`, `problem`. Without a heartbeat the servers order nothing. |
 | Roots | The chains are verified against `roots` of the configuration, or against the roots of the system the operator runs on; the root a chain ends in is declared in the status before the chain is handed on. |
 | DNS-01 | For a name in a `norca.io/DNSZone` of norca-provider (always for a wildcard). The record is added through the DNS contract; the certificate authority is told to look when every name server of the zone answers it (`-dns-propagation-check`, `-dns-resolver`). A zone whose provider has no heartbeat is waited for. |

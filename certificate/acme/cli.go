@@ -20,6 +20,11 @@ import (
 	"github.com/bacanoo-io/norca/norca/controller"
 )
 
+// systemNamespace is the operations namespace of the Norca operators, the
+// default namespace of the operator's own data: its secrets (the account
+// keys, the certificates it issued) and the tokens of the DNS zones.
+const systemNamespace = "norca-system"
+
 // Settings are the flags of norca-acme.
 type Settings struct {
 	Controller      string
@@ -50,9 +55,9 @@ func (s *Settings) register(fs *flag.FlagSet) {
 	fs.StringVar(&s.Controller, "controller", DefaultController, "name issuers name this operator by (spec.external.controller)")
 	fs.DurationVar(&s.Interval, "interval", 5*time.Second, "time between two passes over the issuers and the orders")
 	fs.StringVar(&s.HTTP01Listen, "http01-listen", ":8089", "address the HTTP-01 challenges are answered on (empty: not served)")
-	fs.StringVar(&s.SecretNamespace, "secret-namespace", "default", "namespace of the secrets of the operator")
+	fs.StringVar(&s.SecretNamespace, "secret-namespace", systemNamespace, "namespace of the secrets of the operator")
 	fs.StringVar(&s.SecretPrefix, "secret-prefix", "norca-acme/", "path prefix of the secrets of the operator (accounts/, issued/)")
-	fs.StringVar(&s.ZoneTokenNamespace, "zone-token-namespace", "default", "namespace of the Variables holding the tokens of the DNS zones")
+	fs.StringVar(&s.ZoneTokenNamespace, "zone-token-namespace", systemNamespace, "namespace of the Variables holding the tokens of the DNS zones")
 	fs.DurationVar(&s.ZoneTTL, "zone-ttl", 3*time.Minute, "how old the heartbeat of a DNS zone may be")
 	fs.BoolVar(&s.ZoneAllowHTTP, "zone-allow-http", false, "accept http endpoints of DNS zones (development only)")
 	fs.StringVar(&s.ZoneCAFile, "zone-ca-file", "", "PEM file with the CA that signed the https certificates of the DNS providers, in addition to the system roots")
