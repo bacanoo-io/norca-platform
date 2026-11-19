@@ -53,6 +53,10 @@ type reconciler struct {
 	// record give the name up (MUK-12). A record of its own informer that
 	// gives it up enqueues the waiting records at once (watchHandovers).
 	requeueConflict time.Duration
+
+	// unconditionalZones are the zones whose provider refused a
+	// conditional write, as the log said once.
+	unconditionalZones sync.Map
 }
 
 // outcome is what a reconcile found, for the status.
@@ -245,9 +249,12 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", out.message)
 		return out, 0, err
 	}
-	var have *dns.RecordSet
+	// have is the set as the contract checks it; read is the set as the
+	// provider answered it, which a conditional write expects.
+	var have, read *dns.RecordSet
 	for i := range sets {
 		if strings.EqualFold(sets[i].Type, want.Type) {
+			read = &sets[i]
 			set, err := dns.CheckRecordSet(zone.Name, sets[i])
 			if err == nil {
 				have = &set
@@ -276,7 +283,14 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		// operator's from now on.
 
 	default:
-		if err := client.SetRecords(ctx, want); err != nil {
+		if err := r.setRecords(ctx, client, zone.Name, want, read); err != nil {
+			if re, ok := errors.AsType[*dns.ResponseError](err); ok && re.PreconditionFailed() {
+				// Someone wrote the set after it was read: nothing was
+				// written, and the next reconcile reads it again.
+				msg := fmt.Sprintf("the %s records of %s in the zone %s changed while norca-dns wrote them; nothing was written",
+					want.Type, want.Name, zone.Name)
+				return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
+			}
 			out := failed("writing the record set", err)
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", out.message)
 			var re *dns.ResponseError
@@ -601,11 +615,53 @@ func (r *reconciler) remove(ctx context.Context, obj *controller.Object, status 
 		return fmt.Sprintf("the zone holds other values than norca-dns wrote (%s, TTL %d)", strings.Join(have.Values, ", "), have.TTL), nil
 	}
 
-	err = client.DeleteRecords(ctx, status.Name, status.Type)
+	// Removed only if the set still holds what was read (review finding
+	// ATM-9): a set changed after the read stays.
+	err = client.DeleteRecordsIf(ctx, status.Name, status.Type, dns.Expect{Values: have.Values})
+	if r.unconditional(zone.Name, err) {
+		err = client.DeleteRecords(ctx, status.Name, status.Type)
+	}
 	if disabled(err) {
 		return switchedOff, nil
 	}
+	if re, ok := errors.AsType[*dns.ResponseError](err); ok && re.PreconditionFailed() {
+		r.logger.Info("a record set stays: it changed while norca-dns removed it", "record", obj.Key.String(),
+			"zone", status.Zone, "name", status.Name, "type", status.Type)
+		return "it changed in the zone while norca-dns removed it", nil
+	}
 	return "", err
+}
+
+// setRecords writes a record set only over the set the zone held when it
+// was read (have; nil: none of the name and type), checked by the provider
+// in the same step (review finding ATM-9): a set written or changed after
+// the read is not written over. A provider that can't check it gets the
+// write without the check; the set was read right before.
+func (r *reconciler) setRecords(ctx context.Context, client *dns.Client, zone string, want dns.RecordSet, have *dns.RecordSet) error {
+	expect := dns.Expect{Absent: have == nil}
+	if have != nil {
+		expect.Values = have.Values
+	}
+	err := client.SetRecordsIf(ctx, want, expect)
+	if r.unconditional(zone, err) {
+		return client.SetRecords(ctx, want)
+	}
+	return err
+}
+
+// unconditional reports whether the provider of a zone refused a
+// conditional write because it can't check the condition. The log says so
+// once for every zone.
+func (r *reconciler) unconditional(zone string, err error) bool {
+	re, ok := errors.AsType[*dns.ResponseError](err)
+	if !ok || !re.ConditionsUnsupported() {
+		return false
+	}
+	if _, logged := r.unconditionalZones.LoadOrStore(zone, true); !logged {
+		r.logger.Warn("the provider of a DNS zone can't make a write depend on the record set: norca-dns writes and removes "+
+			"record sets of the zone right after it read them, without the check at the provider", "zone", zone)
+	}
+	return true
 }
 
 // wrote reports whether a record set of the zone is the one a status says

@@ -71,6 +71,11 @@ type env struct {
 
 	// zoneURL is the endpoint of the zone.
 	zoneURL string
+
+	// beforeWrite, when set, runs once before the provider gets the next
+	// PUT or DELETE of a record set: someone else writes the zone between
+	// the operator's read and its write.
+	beforeWrite *atomic.Pointer[func()]
 }
 
 // zoneRecords writes the records switch of the DNSZone object.
@@ -130,8 +135,14 @@ func newOperatorIn(t *testing.T, namespace string, records bool, zoneParams ...m
 	must.NoError(t, err)
 	z.Records = records
 	failDeletes, recordsOff, forbidDeletes := &atomic.Bool{}, &atomic.Bool{}, &atomic.Bool{}
+	beforeWrite := &atomic.Pointer[func()]{}
 	handler := dns.NewHandler(z, "zone-token", nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPut || req.Method == http.MethodDelete {
+			if f := beforeWrite.Swap(nil); f != nil {
+				(*f)()
+			}
+		}
 		if req.Method == http.MethodDelete && failDeletes.Load() {
 			wire.WriteError(w, http.StatusBadGateway, wire.ReasonError, "update of www on ns1.internal.example:53: the name server is away")
 			return
@@ -179,7 +190,7 @@ func newOperatorIn(t *testing.T, namespace string, records bool, zoneParams ...m
 	r.ctrl = c
 	r.watchHandovers()
 	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r, failDeletes: failDeletes,
-		recordsOff: recordsOff, forbidDeletes: forbidDeletes, zoneURL: srv.URL}, c
+		recordsOff: recordsOff, forbidDeletes: forbidDeletes, zoneURL: srv.URL, beforeWrite: beforeWrite}, c
 }
 
 func (e *env) put(ns, name string, spec map[string]any) {
@@ -586,6 +597,118 @@ func TestRemove_LeavesASetWithOtherValues(t *testing.T) {
 	must.NoError(t, err)
 	must.StrContains(t, kept, "other values than norca-dns wrote")
 	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
+// A record set someone writes or changes in the zone after the operator read
+// it and before its write is not written over: the write depends on the set
+// as it was read, the provider checks that, and the record is in Conflict
+// (review finding ATM-9).
+func TestKeep_SetWrittenMeanwhileIsNotOverwritten(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hold bool // the record holds 192.0.2.2 when the write begins
+	}{
+		{"created while the record writes a new set", false},
+		{"changed while the record updates its set", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newOperator(t, true)
+			ctx := context.Background()
+			e.cluster.allow("shop", "shop.example.com")
+			e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.3"}})
+			if tc.hold {
+				must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+				e.hold("shop", "web")
+			}
+			meanwhile := func() {
+				_ = e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"198.51.100.1"}})
+			}
+			e.beforeWrite.Store(&meanwhile)
+
+			obj, st := e.get("shop", "web")
+			out, _, err := e.r.keep(ctx, obj, st)
+			must.NoError(t, err)
+			must.Eq(t, ConditionConflict, out.reason)
+			must.StrContains(t, out.message, "changed while norca-dns wrote them")
+			must.Eq(t, []string{"198.51.100.1"}, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the set written meanwhile"))
+			must.Eq(t, tc.hold, st.Owned)
+		})
+	}
+}
+
+// A record set someone changes in the zone after the operator read it for a
+// removal stays: the deletion depends on the values that were read (review
+// finding ATM-9).
+func TestRemove_SetChangedMeanwhileStays(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+	e.hold("shop", "web")
+	meanwhile := func() {
+		_ = e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"198.51.100.1"}})
+	}
+	e.beforeWrite.Store(&meanwhile)
+
+	obj, st := e.get("shop", "web")
+	kept, err := e.r.remove(ctx, obj, st)
+	must.NoError(t, err)
+	must.StrContains(t, kept, "changed in the zone while norca-dns removed it")
+	must.Eq(t, []string{"198.51.100.1"}, e.zone.RecordValues("www.shop.example.com", "A"))
+}
+
+// A record set of a zone whose provider can't make a write depend on the
+// set is written and removed without the check, as before: the operator
+// read it right before.
+func TestKeep_ProviderWithoutConditions(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	// The zone is served by a provider in front of the mock that refuses
+	// every conditional request, as one that can't check them does.
+	conditional := &atomic.Int64{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		raw, _ := io.ReadAll(req.Body)
+		var body struct {
+			Expect *dns.Expect `json:"expect"`
+		}
+		if json.Unmarshal(raw, &body) == nil && body.Expect != nil {
+			conditional.Add(1)
+			wire.WriteError(w, http.StatusNotImplemented, dns.ReasonConditionsUnsupported, "no conditions here")
+			return
+		}
+		proxy, err := http.NewRequestWithContext(req.Context(), req.Method, e.zoneURL+req.URL.Path, strings.NewReader(string(raw)))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		proxy.Header = req.Header
+		resp, err := http.DefaultClient.Do(proxy)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(srv.Close)
+	e.b.PutObject(&api.CustomObject{Group: ZoneKind.Group, Kind: ZoneKind.Kind, Name: "example.com", Spec: map[string]any{
+		"zone": "example.com", "provider": "dns-lab", "endpoint": srv.URL, "tokenVariable": "providers/dns-lab", "records": true,
+	}})
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.3"}})
+
+	obj, st := e.get("shop", "web")
+	out, _, err := e.r.keep(ctx, obj, st)
+	must.NoError(t, err)
+	must.True(t, out.ready, must.Sprint(out.message))
+	must.Eq(t, []string{"192.0.2.3"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+	kept, err := e.r.remove(ctx, obj, st)
+	must.NoError(t, err)
+	must.Eq(t, "", kept)
+	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"))
+	must.Eq(t, 2, conditional.Load(), must.Sprint("the write and the removal are tried with their condition first"))
 }
 
 // A record of a zone that no longer lets norca-dns write can be deleted: its
