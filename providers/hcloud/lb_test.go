@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +26,10 @@ type fakeHCloudServer struct {
 	lbs    map[int64]*hcLoadBalancer
 	auth   string
 }
+
+// validLabelValue is the rule of Hetzner Cloud for a label value: at most
+// 63 characters, alphanumeric at both ends, "-", "_" and "." inside.
+var validLabelValue = regexp.MustCompile(`^(([a-zA-Z0-9][-a-zA-Z0-9_.]{0,61})?[a-zA-Z0-9])?$`)
 
 func newFakeHCloud(t *testing.T, token string) (*fakeHCloudServer, *httptest.Server) {
 	t.Helper()
@@ -77,6 +82,15 @@ func (f *fakeHCloudServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
+		}
+		for k, v := range body.Labels {
+			if !validLabelValue.MatchString(v) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{"code": "invalid_input", "message": "invalid label " + k},
+				})
+				return
+			}
 		}
 		id := f.nextID
 		f.nextID++
@@ -420,15 +434,28 @@ func TestHCloudCollidingRefs(t *testing.T) {
 // ref without its owner labels is neither updated nor deleted (review
 // finding ATM-19).
 func TestHCloudForeignLoadBalancer(t *testing.T) {
-	for name, labels := range map[string]map[string]string{
-		"no owner labels": nil,
-		"another owner":   {"norca.io/namespace": "intruder", "norca.io/name": "web", "norca.io/class": "hetzner"},
-		"another class":   {"norca.io/namespace": "prod", "norca.io/name": "web", "norca.io/class": "other"},
+	readable := map[string]string{"norca.io/namespace": "prod", "norca.io/name": "web", "norca.io/class": "hetzner"}
+	for name, labelsOf := range map[string]func(t *testing.T, p *Provider) map[string]string{
+		"no owner labels": func(*testing.T, *Provider) map[string]string { return nil },
+		"another owner": func(_ *testing.T, p *Provider) map[string]string {
+			return p.ownerLabels(lb.Ref{Namespace: "intruder", Name: "web"})
+		},
+		"another class": func(t *testing.T, _ *Provider) map[string]string {
+			other, err := provider.Default.Instantiate("other", TypeID, map[string]any{"token": "t", "location": "fsn1"})
+			if err != nil {
+				t.Fatalf("Instantiate: %v", err)
+			}
+			return other.Provider.(*Provider).ownerLabels(lb.Ref{Namespace: "prod", Name: "web"})
+		},
+		// The readable labels are cut to 63 characters, so they do not mark
+		// the owner; only the hash label does.
+		"readable labels only": func(*testing.T, *Provider) map[string]string { return readable },
 	} {
 		t.Run(name, func(t *testing.T) {
 			fake, srv := newFakeHCloud(t, "secret-token")
 			inst, p := newTestClass(t, srv.URL)
 			ref := lb.Ref{Namespace: "prod", Name: "web"}
+			labels := labelsOf(t, p)
 			fake.mu.Lock()
 			fake.lbs[7] = &hcLoadBalancer{
 				ID: 7, Name: p.resourceName(ref), Labels: labels,
@@ -459,5 +486,43 @@ func TestHCloudForeignLoadBalancer(t *testing.T) {
 				t.Fatalf("Delete removed the foreign load balancer")
 			}
 		})
+	}
+}
+
+// TestHCloudLongNames: a namespace and a name of up to 128 characters made
+// owner label values that Hetzner Cloud rejects (over 63 characters), so the
+// load balancer could not be created (review finding ATM-19).
+func TestHCloudLongNames(t *testing.T) {
+	fake, srv := newFakeHCloud(t, "secret-token")
+	inst, p := newTestClass(t, srv.URL)
+	ref := lb.Ref{Namespace: strings.Repeat("n", 100) + "-x", Name: strings.Repeat("w", 99) + ".-y"}
+
+	if err := ensureTarget(t, inst, ref, "10.0.1.1"); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if err := ensureTarget(t, inst, ref, "10.0.1.2"); err != nil {
+		t.Fatalf("second Ensure: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.lbs) != 1 {
+		t.Errorf("want one load balancer, got %d", len(fake.lbs))
+	}
+	for _, curLB := range fake.lbs {
+		if got := targetIPs(curLB); !slices.Equal(got, []string{"10.0.1.2"}) {
+			t.Errorf("targets: %v", got)
+		}
+		if !p.owned(curLB, ref) {
+			t.Errorf("the load balancer is not marked as the ref's own: %v", curLB.Labels)
+		}
+	}
+	fake.mu.Unlock()
+
+	if err := inst.Provider.Delete(context.Background(), ref); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.lbs) != 0 {
+		t.Fatalf("Delete left the load balancer")
 	}
 }

@@ -6,12 +6,12 @@
 //
 // Each LoadBalancer object maps to one Hetzner Cloud Load Balancer named
 // "<name_prefix><namespace>-<name>-<hash>" (see resourceName) and labelled
-// with its Norca reference and class: the owner labels. A load balancer of
-// the name without them is not touched (lb.ErrConflict). Both public and
-// private (VPC network) load balancers are supported, and the load balancer
-// type ("lb11", "lb21", "lb31") and balancing algorithm ("round_robin",
-// "least_connections") can be changed dynamically via the LoadBalancerClass
-// object.
+// with its Norca reference and class (see ownerLabels); the owner label
+// holds a hash of both. A load balancer of the name without it is not
+// touched (lb.ErrConflict). Both public and private (VPC network) load
+// balancers are supported, and the load balancer type ("lb11", "lb21",
+// "lb31") and balancing algorithm ("round_robin", "least_connections") can
+// be changed dynamically via the LoadBalancerClass object.
 //
 // Type ID: "hcloud".
 package hcloud
@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -154,7 +155,7 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 		p.log.Warn("a load balancer under the name of the object is not its own, left alone",
 			"loadbalancer", req.Ref.String(), "name", lbName, "id", curLB.ID, "labels", curLB.Labels)
 		return lb.State{}, lb.Conflict("the Hetzner Cloud load balancer %q was not created for this load balancer "+
-			"(it lacks its owner labels); it is left alone", lbName)
+			"(it lacks its owner label); it is left alone", lbName)
 	}
 
 	if curLB == nil {
@@ -272,24 +273,44 @@ func (p *Provider) resourceName(ref lb.Ref) string {
 	return s + "-" + hex.EncodeToString(sum[:])[:nameHashLen]
 }
 
-// ownerLabels are the labels that mark a load balancer as the one of ref.
+// ownerLabel is the label that marks a load balancer as the one of a ref:
+// its value is ownerHash of the class and the ref.
+const ownerLabel = "norca.io/owner"
+
+// ownerHash is the SHA-256 of the class and ref, in unpadded lowercase
+// base32: 52 characters, so the whole hash fits a label value (at most 63).
+func (p *Provider) ownerHash(ref lb.Ref) string {
+	sum := sha256.Sum256([]byte(p.class + "/" + ref.String()))
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:]))
+}
+
+// ownerLabels are the labels of the load balancer of ref: the owner label,
+// and the namespace, name and class for people, cut to fit a label value
+// (namespaces and names have up to 128 characters).
 func (p *Provider) ownerLabels(ref lb.Ref) map[string]string {
 	return map[string]string{
-		"norca.io/namespace": ref.Namespace,
-		"norca.io/name":      ref.Name,
-		"norca.io/class":     p.class,
+		ownerLabel:           p.ownerHash(ref),
+		"norca.io/namespace": labelValue(ref.Namespace),
+		"norca.io/name":      labelValue(ref.Name),
+		"norca.io/class":     labelValue(p.class),
 	}
 }
 
-// owned reports whether curLB carries the owner labels of ref: only such a
-// load balancer is updated or deleted for ref.
-func (p *Provider) owned(curLB *hcLoadBalancer, ref lb.Ref) bool {
-	for k, v := range p.ownerLabels(ref) {
-		if curLB.Labels[k] != v {
-			return false
-		}
+// labelValue cuts s to a valid label value: at most 63 characters, ending
+// in a letter or digit. s starts with one (the names of objects and classes
+// do) and holds only letters, digits, "-", "_" and ".".
+func labelValue(s string) string {
+	if len(s) > 63 {
+		s = s[:63]
 	}
-	return true
+	return strings.TrimRight(s, "-_.")
+}
+
+// owned reports whether curLB carries the owner label of ref, the hash of
+// the whole class and ref: only such a load balancer is updated or deleted
+// for ref. The readable labels are cut and do not count.
+func (p *Provider) owned(curLB *hcLoadBalancer, ref lb.Ref) bool {
+	return curLB.Labels[ownerLabel] == p.ownerHash(ref)
 }
 
 func (p *Provider) extractAddresses(curLB *hcLoadBalancer, port int, internal bool) []string {
