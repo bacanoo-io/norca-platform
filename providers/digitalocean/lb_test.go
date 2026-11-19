@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 type fakeDOServer struct {
 	mu       sync.Mutex
+	created  int
 	token    string
 	lbs      map[string]*doLoadBalancer
 	droplets []doDroplet
@@ -78,7 +80,8 @@ func (f *fakeDOServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/load_balancers":
 		var curLB doLoadBalancer
 		_ = json.NewDecoder(r.Body).Decode(&curLB)
-		curLB.ID = "do-lb-1"
+		f.created++
+		curLB.ID = "do-lb-" + strconv.Itoa(f.created)
 		curLB.Status = "active"
 		if curLB.Type == "REGIONAL_NETWORK" {
 			curLB.IP = "10.10.0.100"
@@ -201,5 +204,57 @@ func TestDigitalOceanLifecycle(t *testing.T) {
 	}
 	if err := inst.Provider.Delete(ctx, ref); err != nil {
 		t.Fatalf("second Delete: %v", err)
+	}
+}
+
+// TestDigitalOceanCollidingRefs: namespace team-a with load balancer web and
+// namespace team with load balancer a-web got one cloud load balancer
+// (review finding ATM-19): the Ensure of the second rewrote the droplets of
+// the first, and its Delete removed it.
+func TestDigitalOceanCollidingRefs(t *testing.T) {
+	fake, srv := newFakeDO(t, "do-secret-token")
+	inst, err := provider.Default.Instantiate("do-eu", TypeID, map[string]any{
+		"token":    "do-secret-token",
+		"region":   "fra1",
+		"endpoint": srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	params, err := inst.Effective(nil)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	ensure := func(ref lb.Ref, ip string) {
+		t.Helper()
+		if _, err := inst.Provider.Ensure(context.Background(), lb.Request{
+			Ref: ref, Service: "web", Port: 443,
+			Targets: []lb.Target{{Address: ip, Port: 8443}},
+			Params:  params,
+		}); err != nil {
+			t.Fatalf("Ensure %s: %v", ref, err)
+		}
+	}
+	refA := lb.Ref{Namespace: "team-a", Name: "web"}
+	refB := lb.Ref{Namespace: "team", Name: "a-web"}
+	ensure(refA, "10.10.0.1")
+	ensure(refB, "10.10.0.2")
+
+	fake.mu.Lock()
+	if len(fake.lbs) != 2 {
+		t.Errorf("want a cloud load balancer for each ref, got %d", len(fake.lbs))
+	}
+	if curLB := fake.lbs["do-lb-1"]; curLB == nil || !slices.Equal(curLB.DropletIDs, []int{1001}) {
+		t.Errorf("droplets of the load balancer of team-a/web: %+v", curLB)
+	}
+	fake.mu.Unlock()
+
+	if err := inst.Provider.Delete(context.Background(), refB); err != nil {
+		t.Fatalf("Delete B: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.lbs["do-lb-1"] == nil {
+		t.Fatalf("the Delete of team/a-web removed the load balancer of team-a/web")
 	}
 }

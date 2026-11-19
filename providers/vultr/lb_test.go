@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 type fakeVultrServer struct {
 	mu        sync.Mutex
+	created   int
 	apiKey    string
 	lbs       map[string]*vultrLoadBalancer
 	instances []vultrInstance
@@ -66,7 +68,8 @@ func (f *fakeVultrServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/load-balancers":
 		var curLB vultrLoadBalancer
 		_ = json.NewDecoder(r.Body).Decode(&curLB)
-		curLB.ID = "vultr-lb-1"
+		f.created++
+		curLB.ID = "vultr-lb-" + strconv.Itoa(f.created)
 		curLB.Status = "active"
 		curLB.IP = "45.76.0.10"
 		f.lbs[curLB.ID] = &curLB
@@ -187,5 +190,57 @@ func TestVultrLifecycle(t *testing.T) {
 	}
 	if err := inst.Provider.Delete(ctx, ref); err != nil {
 		t.Fatalf("second Delete: %v", err)
+	}
+}
+
+// TestVultrCollidingRefs: namespace team-a with load balancer web and
+// namespace team with load balancer a-web got one cloud load balancer
+// (review finding ATM-19): the Ensure of the second rewrote the instances of
+// the first, and its Delete removed it.
+func TestVultrCollidingRefs(t *testing.T) {
+	fake, srv := newFakeVultr(t, "vultr-api-key")
+	inst, err := provider.Default.Instantiate("vultr-eu", TypeID, map[string]any{
+		"api_key":  "vultr-api-key",
+		"region":   "fra",
+		"endpoint": srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	params, err := inst.Effective(nil)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	ensure := func(ref lb.Ref, ip string) {
+		t.Helper()
+		if _, err := inst.Provider.Ensure(context.Background(), lb.Request{
+			Ref: ref, Service: "web", Port: 443,
+			Targets: []lb.Target{{Address: ip, Port: 8443}},
+			Params:  params,
+		}); err != nil {
+			t.Fatalf("Ensure %s: %v", ref, err)
+		}
+	}
+	refA := lb.Ref{Namespace: "team-a", Name: "web"}
+	refB := lb.Ref{Namespace: "team", Name: "a-web"}
+	ensure(refA, "10.20.0.1")
+	ensure(refB, "10.20.0.2")
+
+	fake.mu.Lock()
+	if len(fake.lbs) != 2 {
+		t.Errorf("want a cloud load balancer for each ref, got %d", len(fake.lbs))
+	}
+	if curLB := fake.lbs["vultr-lb-1"]; curLB == nil || !slices.Equal(curLB.Instances, []string{"inst-1"}) {
+		t.Errorf("instances of the load balancer of team-a/web: %+v", curLB)
+	}
+	fake.mu.Unlock()
+
+	if err := inst.Provider.Delete(context.Background(), refB); err != nil {
+		t.Fatalf("Delete B: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.lbs["vultr-lb-1"] == nil {
+		t.Fatalf("the Delete of team/a-web removed the load balancer of team-a/web")
 	}
 }

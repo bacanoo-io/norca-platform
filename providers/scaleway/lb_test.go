@@ -6,9 +6,11 @@ package scaleway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,11 @@ type fakeScalewayServer struct {
 	frontends   map[string]*scwFrontend
 	privNets    map[string][]scwPrivateNetwork
 	initialStat string
+
+	// lbOf is the load balancer of each backend and frontend; created
+	// counts the objects created, for their IDs.
+	lbOf    map[string]string
+	created map[string]int
 }
 
 func newFakeScaleway(t *testing.T, secretKey string) (*fakeScalewayServer, *httptest.Server) {
@@ -36,10 +43,18 @@ func newFakeScaleway(t *testing.T, secretKey string) (*fakeScalewayServer, *http
 		frontends:   map[string]*scwFrontend{},
 		privNets:    map[string][]scwPrivateNetwork{},
 		initialStat: "ready",
+		lbOf:        map[string]string{},
+		created:     map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(srv.Close)
 	return f, srv
+}
+
+// newID returns the ID of a new object of the kind: "lb-1", "lb-2", ...
+func (f *fakeScalewayServer) newID(kind string) string {
+	f.created[kind]++
+	return kind + "-" + strconv.Itoa(f.created[kind])
 }
 
 func (f *fakeScalewayServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +95,7 @@ func (f *fakeScalewayServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		curLB := &scwLB{
-			ID:     "lb-1",
+			ID:     f.newID("lb"),
 			Name:   body.Name,
 			Status: f.initialStat,
 			Type:   body.Type,
@@ -134,7 +149,9 @@ func (f *fakeScalewayServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
 				var list []scwBackend
 				for _, be := range f.backends {
-					list = append(list, *be)
+					if f.lbOf[be.ID] == lbID {
+						list = append(list, *be)
+					}
 				}
 				_ = json.NewEncoder(w).Encode(scwListBackendsResponse{Backends: list})
 				return
@@ -149,7 +166,7 @@ func (f *fakeScalewayServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&b)
 			be := &scwBackend{
-				ID:                   "be-1",
+				ID:                   f.newID("be"),
 				Name:                 b.Name,
 				ForwardProtocol:      b.ForwardProtocol,
 				ForwardPort:          b.ForwardPort,
@@ -158,12 +175,15 @@ func (f *fakeScalewayServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				HealthCheck:          b.HealthCheck,
 			}
 			f.backends[be.ID] = be
+			f.lbOf[be.ID] = lbID
 			_ = json.NewEncoder(w).Encode(be)
 		case "frontends":
 			if r.Method == http.MethodGet {
 				var list []scwFrontend
 				for _, fe := range f.frontends {
-					list = append(list, *fe)
+					if f.lbOf[fe.ID] == lbID {
+						list = append(list, *fe)
+					}
 				}
 				_ = json.NewEncoder(w).Encode(scwListFrontendsResponse{Frontends: list})
 				return
@@ -175,12 +195,13 @@ func (f *fakeScalewayServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&b)
 			fe := &scwFrontend{
-				ID:          "fe-1",
+				ID:          f.newID("fe"),
 				Name:        b.Name,
 				InboundPort: b.InboundPort,
 				Backend:     &scwBackend{ID: b.BackendID},
 			}
 			f.frontends[fe.ID] = fe
+			f.lbOf[fe.ID] = lbID
 			_ = json.NewEncoder(w).Encode(fe)
 		}
 
@@ -349,5 +370,115 @@ func TestScalewayLifecycle(t *testing.T) {
 	}
 	if err := inst.Provider.Delete(ctx, ref); err != nil {
 		t.Fatalf("second Delete: %v", err)
+	}
+}
+
+func newTestClass(t *testing.T, srvURL string) (*lb.Class, *Provider) {
+	t.Helper()
+	inst, err := provider.Default.Instantiate("scw", TypeID, map[string]any{
+		"secret_key": "scw-secret",
+		"project_id": "proj-123",
+		"zone":       "fr-par-1",
+		"endpoint":   srvURL,
+	})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	return inst, inst.Provider.(*Provider)
+}
+
+func ensureTarget(t *testing.T, inst *lb.Class, ref lb.Ref, ip string) error {
+	t.Helper()
+	params, err := inst.Effective(nil)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	_, err = inst.Provider.Ensure(context.Background(), lb.Request{
+		Ref: ref, Service: "web", Port: 443,
+		Targets: []lb.Target{{Address: ip, Port: 8443}},
+		Params:  params,
+	})
+	return err
+}
+
+// TestScalewayCollidingRefs: namespace team-a with load balancer web and
+// namespace team with load balancer a-web got one cloud load balancer
+// (review finding ATM-19): the Ensure of the second rewrote the backend
+// servers of the first, and its Delete removed it.
+func TestScalewayCollidingRefs(t *testing.T) {
+	fake, srv := newFakeScaleway(t, "scw-secret")
+	inst, _ := newTestClass(t, srv.URL)
+	refA := lb.Ref{Namespace: "team-a", Name: "web"}
+	refB := lb.Ref{Namespace: "team", Name: "a-web"}
+
+	if err := ensureTarget(t, inst, refA, "10.0.1.1"); err != nil {
+		t.Fatalf("Ensure A: %v", err)
+	}
+	if err := ensureTarget(t, inst, refB, "10.0.1.2"); err != nil {
+		t.Fatalf("Ensure B: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.lbs) != 2 {
+		t.Errorf("want a cloud load balancer for each ref, got %d", len(fake.lbs))
+	}
+	if be := fake.backends["be-1"]; be == nil || !slices.Equal(be.Pool, []string{"10.0.1.1"}) {
+		t.Errorf("backend servers of the load balancer of team-a/web: %+v", be)
+	}
+	fake.mu.Unlock()
+
+	if err := inst.Provider.Delete(context.Background(), refB); err != nil {
+		t.Fatalf("Delete B: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.lbs["lb-1"] == nil {
+		t.Fatalf("the Delete of team/a-web removed the load balancer of team-a/web")
+	}
+}
+
+// TestScalewayForeignLoadBalancer: a cloud load balancer under the name of
+// the ref without its owner tags is neither updated nor deleted (review
+// finding ATM-19).
+func TestScalewayForeignLoadBalancer(t *testing.T) {
+	for name, tags := range map[string][]string{
+		"no owner tags": nil,
+		"another owner": {"norca-namespace=intruder", "norca-name=web", "norca-class=scw"},
+		"another class": {"norca-namespace=prod", "norca-name=web", "norca-class=other"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake, srv := newFakeScaleway(t, "scw-secret")
+			inst, p := newTestClass(t, srv.URL)
+			ref := lb.Ref{Namespace: "prod", Name: "web"}
+			fake.mu.Lock()
+			fake.lbs["lb-9"] = &scwLB{ID: "lb-9", Name: p.resourceName(ref), Status: "ready", Type: "LB-S", Tags: tags}
+			fake.backends["be-9"] = &scwBackend{ID: "be-9", Name: p.resourceName(ref), ForwardProtocol: "tcp",
+				ForwardPort: 8443, ForwardPortAlgorithm: "roundrobin", Pool: []string{"192.0.2.9"}}
+			fake.lbOf["be-9"] = "lb-9"
+			fake.mu.Unlock()
+
+			err := ensureTarget(t, inst, ref, "10.0.1.1")
+			if !errors.Is(err, lb.ErrConflict) {
+				t.Fatalf("Ensure: want a conflict, got %v", err)
+			}
+			if strings.Contains(err.Error(), "intruder") {
+				t.Errorf("the conflict names the other owner: %v", err)
+			}
+			fake.mu.Lock()
+			if len(fake.lbs) != 1 || len(fake.backends) != 1 || len(fake.frontends) != 0 ||
+				!slices.Equal(fake.backends["be-9"].Pool, []string{"192.0.2.9"}) {
+				t.Errorf("the foreign load balancer was changed: %d load balancers, %d backends, %d frontends, pool %v",
+					len(fake.lbs), len(fake.backends), len(fake.frontends), fake.backends["be-9"].Pool)
+			}
+			fake.mu.Unlock()
+
+			if err := inst.Provider.Delete(context.Background(), ref); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			if fake.lbs["lb-9"] == nil {
+				t.Fatalf("Delete removed the foreign load balancer")
+			}
+		})
 	}
 }

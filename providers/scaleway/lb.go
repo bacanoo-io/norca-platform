@@ -6,10 +6,13 @@
 //
 // Each LoadBalancer object maps to one Scaleway Load Balancer, one TCP Backend
 // with a TCP health check, and one Frontend in the configured availability
-// zone. Both flexible public IPs and Private Network attachments are
-// supported, and the offer type (e.g. "LB-S", "LB-GP-M") and load balancing
-// algorithm ("roundrobin", "leastconn", "first") can be updated dynamically via
-// the LoadBalancerClass object.
+// zone, named "<name_prefix><namespace>-<name>-<hash>" (see resourceName).
+// The load balancer is tagged with its Norca reference and class: the owner
+// tags. A load balancer of the name without them is not touched
+// (lb.ErrConflict). Both flexible public IPs and Private Network attachments
+// are supported, and the offer type (e.g. "LB-S", "LB-GP-M") and load
+// balancing algorithm ("roundrobin", "leastconn", "first") can be updated
+// dynamically via the LoadBalancerClass object.
 //
 // Type ID: "scaleway".
 package scaleway
@@ -134,9 +137,15 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 	}
 
 	name := p.resourceName(req.Ref)
-	curLB, err := p.findLB(ctx, name)
+	curLB, foreign, err := p.findLB(ctx, req.Ref, name)
 	if err != nil {
 		return lb.State{}, err
+	}
+	if curLB == nil && foreign != nil {
+		p.log.Warn("a load balancer under the name of the object is not its own, left alone",
+			"loadbalancer", req.Ref.String(), "name", name, "id", foreign.ID, "tags", foreign.Tags)
+		return lb.State{}, lb.Conflict("the Scaleway load balancer %q was not created for this load balancer "+
+			"(it lacks its owner tags); it is left alone", name)
 	}
 
 	if curLB == nil {
@@ -196,11 +205,15 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 // Delete implements lb.Provider.
 func (p *Provider) Delete(ctx context.Context, ref lb.Ref) error {
 	name := p.resourceName(ref)
-	curLB, err := p.findLB(ctx, name)
+	curLB, foreign, err := p.findLB(ctx, ref, name)
 	if err != nil {
 		return err
 	}
 	if curLB == nil {
+		if foreign != nil {
+			p.log.Warn("a load balancer under the name of the object is not its own, not deleted",
+				"loadbalancer", ref.String(), "name", name, "id", foreign.ID, "tags", foreign.Tags)
+		}
 		return nil
 	}
 	path := fmt.Sprintf("/lb/v1/zones/%s/lbs/%s?release_ip=true", url.PathEscape(p.zone), url.PathEscape(curLB.ID))
@@ -233,6 +246,14 @@ func extractTargets(frontendPort int, targets []lb.Target) (int, []string, error
 	return dstPort, ips, nil
 }
 
+// nameHashLen is the number of hex digits of the hash in a name.
+const nameHashLen = 12
+
+// resourceName returns the name of the load balancer of ref (and of its
+// backend and frontend): the prefix, namespace and name in lowercase
+// letters, digits and hyphens, shortened to fit, and a hash of the class and
+// the ref. Without the hash, team-a/web and team/a-web shared a load
+// balancer (review finding ATM-19). At most 63 characters.
 func (p *Provider) resourceName(ref lb.Ref) string {
 	raw := strings.ToLower(p.namePrefix + ref.Namespace + "-" + ref.Name)
 	var b strings.Builder
@@ -253,12 +274,11 @@ func (p *Provider) resourceName(ref lb.Ref) string {
 	if s == "" {
 		s = "lb"
 	}
-	if len(s) > 63 {
-		sum := sha256.Sum256([]byte(ref.String()))
-		suffix := hex.EncodeToString(sum[:])[:6]
-		s = strings.TrimRight(s[:56], "-") + "-" + suffix
+	if limit := 63 - 1 - nameHashLen; len(s) > limit {
+		s = strings.TrimRight(s[:limit], "-")
 	}
-	return s
+	sum := sha256.Sum256([]byte(p.class + "/" + ref.String()))
+	return s + "-" + hex.EncodeToString(sum[:])[:nameHashLen]
 }
 
 func (p *Provider) zoneBase() string {
@@ -339,20 +359,50 @@ type scwErrorResponse struct {
 	Type    string `json:"type"`
 }
 
-func (p *Provider) findLB(ctx context.Context, name string) (*scwLB, error) {
+// ownerTags are the tags that mark a load balancer as the one of ref.
+func (p *Provider) ownerTags(ref lb.Ref) []string {
+	return []string{
+		"norca-namespace=" + ref.Namespace,
+		"norca-name=" + ref.Name,
+		"norca-class=" + p.class,
+	}
+}
+
+// findLB returns the load balancer of the name that carries the owner tags
+// of ref, and else one of the name without them (foreign): Scaleway names
+// are not unique, and only an owned load balancer is updated or deleted.
+func (p *Provider) findLB(ctx context.Context, ref lb.Ref, name string) (owned, foreign *scwLB, err error) {
 	q := url.Values{}
 	q.Set("name", name)
 	q.Set("project_id", p.projectID)
 	var resp scwListLBsResponse
 	if err := p.doJSON(ctx, http.MethodGet, p.zoneBase()+"/lbs?"+q.Encode(), nil, &resp, false); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	want := p.ownerTags(ref)
 	for i := range resp.LBs {
-		if resp.LBs[i].Name == name {
-			return &resp.LBs[i], nil
+		curLB := &resp.LBs[i]
+		if curLB.Name != name {
+			continue
+		}
+		if hasTags(curLB.Tags, want) {
+			return curLB, nil, nil
+		}
+		if foreign == nil {
+			foreign = curLB
 		}
 	}
-	return nil, nil
+	return nil, foreign, nil
+}
+
+// hasTags reports whether tags holds every tag of want.
+func hasTags(tags, want []string) bool {
+	for _, tag := range want {
+		if !slices.Contains(tags, tag) {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Provider) getLB(ctx context.Context, lbID string) (*scwLB, error) {
@@ -370,11 +420,7 @@ func (p *Provider) createLB(ctx context.Context, req lb.Request, name, lbType st
 		"name":               name,
 		"type":               lbType,
 		"assign_flexible_ip": assignFlexIP,
-		"tags": []string{
-			"norca-namespace=" + req.Namespace,
-			"norca-name=" + req.Name,
-			"norca-class=" + p.class,
-		},
+		"tags":               p.ownerTags(req.Ref),
 	}
 	var curLB scwLB
 	if err := p.doJSON(ctx, http.MethodPost, p.zoneBase()+"/lbs", body, &curLB, false); err != nil {

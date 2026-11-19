@@ -5,11 +5,12 @@
 // API v2 (/v2/load-balancers and /v2/instances).
 //
 // Each LoadBalancer object maps to one Vultr Load Balancer labelled
-// "<name_prefix><namespace>-<name>" in the configured region (and optional
-// VPC). Target IP addresses are resolved to Vultr Instance IDs via
-// GET /v2/instances, and the load balancer's forwarding rules, TCP health
-// check, instances list, balancing algorithm, and PROXY protocol flag are
-// reconciled idempotently via PATCH /v2/load-balancers/{id}.
+// "<name_prefix><namespace>-<name>-<hash>" (see resourceName) in the
+// configured region (and optional VPC). Target IP addresses are resolved to
+// Vultr Instance IDs via GET /v2/instances, and the load balancer's
+// forwarding rules, TCP health check, instances list, balancing algorithm,
+// and PROXY protocol flag are reconciled idempotently via
+// PATCH /v2/load-balancers/{id}.
 //
 // Type ID: "vultr".
 package vultr
@@ -218,6 +219,15 @@ func extractTargets(frontendPort int, targets []lb.Target) (int, []string, error
 	return dstPort, ips, nil
 }
 
+// nameHashLen is the number of hex digits of the hash in a name.
+const nameHashLen = 12
+
+// resourceName returns the label of the load balancer of ref: the prefix,
+// namespace and name in lowercase letters, digits and hyphens, shortened to
+// fit, and a hash of the class and the ref. Without the hash, team-a/web and
+// team/a-web shared a load balancer (review finding ATM-19). Vultr load
+// balancers take no tags, so the label is their only mark of the owner. At
+// most 63 characters.
 func (p *Provider) resourceName(ref lb.Ref) string {
 	raw := strings.ToLower(p.namePrefix + ref.Namespace + "-" + ref.Name)
 	var b strings.Builder
@@ -238,12 +248,11 @@ func (p *Provider) resourceName(ref lb.Ref) string {
 	if s == "" {
 		s = "lb"
 	}
-	if len(s) > 63 {
-		sum := sha256.Sum256([]byte(ref.String()))
-		suffix := hex.EncodeToString(sum[:])[:6]
-		s = strings.TrimRight(s[:56], "-") + "-" + suffix
+	if limit := 63 - 1 - nameHashLen; len(s) > limit {
+		s = strings.TrimRight(s[:limit], "-")
 	}
-	return s
+	sum := sha256.Sum256([]byte(p.class + "/" + ref.String()))
+	return s + "-" + hex.EncodeToString(sum[:])[:nameHashLen]
 }
 
 // Vultr API v2 wire types (matching github.com/vultr/govultr/v3).

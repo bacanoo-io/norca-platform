@@ -342,3 +342,122 @@ func TestHCloudValidationErrors(t *testing.T) {
 		t.Fatalf("expected ErrInvalid on mismatched target ports, got %v", err)
 	}
 }
+
+// newTestClass instantiates the class "hetzner" against the fake.
+func newTestClass(t *testing.T, srvURL string) (*lb.Class, *Provider) {
+	t.Helper()
+	inst, err := provider.Default.Instantiate("hetzner", TypeID, map[string]any{
+		"token":    "secret-token",
+		"location": "fsn1",
+		"endpoint": srvURL,
+	})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	return inst, inst.Provider.(*Provider)
+}
+
+func ensureTarget(t *testing.T, inst *lb.Class, ref lb.Ref, ip string) error {
+	t.Helper()
+	params, err := inst.Effective(nil)
+	if err != nil {
+		t.Fatalf("Effective: %v", err)
+	}
+	_, err = inst.Provider.Ensure(context.Background(), lb.Request{
+		Ref: ref, Service: "web", Port: 443,
+		Targets: []lb.Target{{Address: ip, Port: 8443}},
+		Params:  params,
+	})
+	return err
+}
+
+func targetIPs(curLB *hcLoadBalancer) []string {
+	var ips []string
+	for _, tgt := range curLB.Targets {
+		if tgt.IP != nil {
+			ips = append(ips, tgt.IP.IP)
+		}
+	}
+	return ips
+}
+
+// TestHCloudCollidingRefs: namespace team-a with load balancer web and
+// namespace team with load balancer a-web got one cloud load balancer
+// (review finding ATM-19): the Ensure of the second rewrote the targets of
+// the first, and its Delete removed it.
+func TestHCloudCollidingRefs(t *testing.T) {
+	fake, srv := newFakeHCloud(t, "secret-token")
+	inst, _ := newTestClass(t, srv.URL)
+	refA := lb.Ref{Namespace: "team-a", Name: "web"}
+	refB := lb.Ref{Namespace: "team", Name: "a-web"}
+
+	if err := ensureTarget(t, inst, refA, "10.0.1.1"); err != nil {
+		t.Fatalf("Ensure A: %v", err)
+	}
+	if err := ensureTarget(t, inst, refB, "10.0.1.2"); err != nil {
+		t.Fatalf("Ensure B: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.lbs) != 2 {
+		t.Errorf("want a cloud load balancer for each ref, got %d", len(fake.lbs))
+	}
+	if got := targetIPs(fake.lbs[42]); !slices.Equal(got, []string{"10.0.1.1"}) {
+		t.Errorf("targets of the load balancer of team-a/web: %v", got)
+	}
+	fake.mu.Unlock()
+
+	if err := inst.Provider.Delete(context.Background(), refB); err != nil {
+		t.Fatalf("Delete B: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.lbs[42] == nil {
+		t.Fatalf("the Delete of team/a-web removed the load balancer of team-a/web")
+	}
+}
+
+// TestHCloudForeignLoadBalancer: a cloud load balancer under the name of the
+// ref without its owner labels is neither updated nor deleted (review
+// finding ATM-19).
+func TestHCloudForeignLoadBalancer(t *testing.T) {
+	for name, labels := range map[string]map[string]string{
+		"no owner labels": nil,
+		"another owner":   {"norca.io/namespace": "intruder", "norca.io/name": "web", "norca.io/class": "hetzner"},
+		"another class":   {"norca.io/namespace": "prod", "norca.io/name": "web", "norca.io/class": "other"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake, srv := newFakeHCloud(t, "secret-token")
+			inst, p := newTestClass(t, srv.URL)
+			ref := lb.Ref{Namespace: "prod", Name: "web"}
+			fake.mu.Lock()
+			fake.lbs[7] = &hcLoadBalancer{
+				ID: 7, Name: p.resourceName(ref), Labels: labels,
+				Services: []hcService{desiredService(443, 8443)},
+				Targets:  []hcTarget{{Type: "ip", IP: &hcTargetIP{IP: "192.0.2.9"}}},
+			}
+			fake.mu.Unlock()
+
+			err := ensureTarget(t, inst, ref, "10.0.1.1")
+			if !errors.Is(err, lb.ErrConflict) {
+				t.Fatalf("Ensure: want a conflict, got %v", err)
+			}
+			if strings.Contains(err.Error(), "intruder") {
+				t.Errorf("the conflict names the other owner: %v", err)
+			}
+			fake.mu.Lock()
+			if got := targetIPs(fake.lbs[7]); len(fake.lbs) != 1 || !slices.Equal(got, []string{"192.0.2.9"}) {
+				t.Errorf("the foreign load balancer was changed: %d load balancers, targets %v", len(fake.lbs), got)
+			}
+			fake.mu.Unlock()
+
+			if err := inst.Provider.Delete(context.Background(), ref); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			if fake.lbs[7] == nil {
+				t.Fatalf("Delete removed the foreign load balancer")
+			}
+		})
+	}
+}

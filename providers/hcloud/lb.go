@@ -5,11 +5,13 @@
 // Cloud Load Balancers REST API v1.
 //
 // Each LoadBalancer object maps to one Hetzner Cloud Load Balancer named
-// "<name_prefix><namespace>-<name>" and labelled with its Norca reference and
-// class. Both public and private (VPC network) load balancers are supported,
-// and the load balancer type ("lb11", "lb21", "lb31") and balancing algorithm
-// ("round_robin", "least_connections") can be changed dynamically via the
-// LoadBalancerClass object.
+// "<name_prefix><namespace>-<name>-<hash>" (see resourceName) and labelled
+// with its Norca reference and class: the owner labels. A load balancer of
+// the name without them is not touched (lb.ErrConflict). Both public and
+// private (VPC network) load balancers are supported, and the load balancer
+// type ("lb11", "lb21", "lb31") and balancing algorithm ("round_robin",
+// "least_connections") can be changed dynamically via the LoadBalancerClass
+// object.
 //
 // Type ID: "hcloud".
 package hcloud
@@ -148,6 +150,12 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 	if err != nil {
 		return lb.State{}, err
 	}
+	if curLB != nil && !p.owned(curLB, req.Ref) {
+		p.log.Warn("a load balancer under the name of the object is not its own, left alone",
+			"loadbalancer", req.Ref.String(), "name", lbName, "id", curLB.ID, "labels", curLB.Labels)
+		return lb.State{}, lb.Conflict("the Hetzner Cloud load balancer %q was not created for this load balancer "+
+			"(it lacks its owner labels); it is left alone", lbName)
+	}
 
 	if curLB == nil {
 		curLB, err = p.createLoadBalancer(ctx, req, lbName, lbType, alg, dstPort, targetIPs)
@@ -194,6 +202,11 @@ func (p *Provider) Delete(ctx context.Context, ref lb.Ref) error {
 	if curLB == nil {
 		return nil
 	}
+	if !p.owned(curLB, ref) {
+		p.log.Warn("a load balancer under the name of the object is not its own, not deleted",
+			"loadbalancer", ref.String(), "name", lbName, "id", curLB.ID, "labels", curLB.Labels)
+		return nil
+	}
 	path := fmt.Sprintf("/load_balancers/%d", curLB.ID)
 	return p.doJSON(ctx, http.MethodDelete, path, nil, nil, true)
 }
@@ -224,6 +237,14 @@ func extractTargets(frontendPort int, targets []lb.Target) (int, []string, error
 	return dstPort, ips, nil
 }
 
+// nameHashLen is the number of hex digits of the hash in a name.
+const nameHashLen = 12
+
+// resourceName returns the name of the load balancer of ref: the prefix,
+// namespace and name in lowercase letters, digits and hyphens, shortened to
+// fit, and a hash of the class and the ref. Without the hash, team-a/web and
+// team/a-web shared a load balancer (review finding ATM-19). At most 63
+// characters.
 func (p *Provider) resourceName(ref lb.Ref) string {
 	raw := strings.ToLower(p.namePrefix + ref.Namespace + "-" + ref.Name)
 	var b strings.Builder
@@ -244,12 +265,31 @@ func (p *Provider) resourceName(ref lb.Ref) string {
 	if s == "" {
 		s = "lb"
 	}
-	if len(s) > 63 {
-		sum := sha256.Sum256([]byte(ref.String()))
-		suffix := hex.EncodeToString(sum[:])[:6]
-		s = strings.TrimRight(s[:56], "-") + "-" + suffix
+	if limit := 63 - 1 - nameHashLen; len(s) > limit {
+		s = strings.TrimRight(s[:limit], "-")
 	}
-	return s
+	sum := sha256.Sum256([]byte(p.class + "/" + ref.String()))
+	return s + "-" + hex.EncodeToString(sum[:])[:nameHashLen]
+}
+
+// ownerLabels are the labels that mark a load balancer as the one of ref.
+func (p *Provider) ownerLabels(ref lb.Ref) map[string]string {
+	return map[string]string{
+		"norca.io/namespace": ref.Namespace,
+		"norca.io/name":      ref.Name,
+		"norca.io/class":     p.class,
+	}
+}
+
+// owned reports whether curLB carries the owner labels of ref: only such a
+// load balancer is updated or deleted for ref.
+func (p *Provider) owned(curLB *hcLoadBalancer, ref lb.Ref) bool {
+	for k, v := range p.ownerLabels(ref) {
+		if curLB.Labels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *Provider) extractAddresses(curLB *hcLoadBalancer, port int, internal bool) []string {
@@ -412,11 +452,7 @@ func (p *Provider) createLoadBalancer(
 		"public_interface":   publicIface,
 		"services":           []hcService{desiredService(req.Port, dstPort)},
 		"targets":            targets,
-		"labels": map[string]string{
-			"norca.io/namespace": req.Namespace,
-			"norca.io/name":      req.Name,
-			"norca.io/class":     p.class,
-		},
+		"labels":             p.ownerLabels(req.Ref),
 	}
 	if p.networkZone != "" {
 		body["network_zone"] = p.networkZone
