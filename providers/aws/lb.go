@@ -9,6 +9,12 @@
 // configured VPC and subnets. Requests are signed with AWS Signature Version 4
 // (`elasticloadbalancing` service) using the standard library.
 //
+// The load balancer and the target group are named
+// "<name_prefix><namespace>-<name>" cut to 25 characters plus "-<hash>"
+// (see resourceName) and tagged with the Norca reference and class: the
+// owner tags. A resource of the name without them is not touched
+// (lb.ErrConflict).
+//
 // Type ID: "aws".
 package aws
 
@@ -162,16 +168,26 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 		scheme = "internal"
 	}
 
-	curLB, err := p.describeLoadBalancer(ctx, name)
+	curLB, tg, err := p.lookup(ctx, name)
 	if err != nil {
 		return lb.State{}, err
 	}
+	foreign, err := p.foreign(ctx, req.Ref, curLB, tg)
+	if err != nil {
+		return lb.State{}, err
+	}
+	if foreign != "" {
+		p.log.Warn("a resource under the name of the object is not its own, left alone",
+			"loadbalancer", req.Ref.String(), "name", name, "resource", foreign)
+		return lb.State{}, lb.Conflict("the AWS %s %q was not created for this load balancer "+
+			"(it lacks its owner tags); it is left alone", foreign, name)
+	}
 	if curLB != nil && curLB.Scheme != "" && curLB.Scheme != scheme {
 		// AWS NLB scheme is immutable; recreate if Internal changed.
-		if err := p.deleteAll(ctx, name, curLB.ARN); err != nil {
+		if err := p.deleteAll(ctx, curLB.ARN, tgARNOf(tg)); err != nil {
 			return lb.State{}, err
 		}
-		curLB = nil
+		curLB, tg = nil, nil
 	}
 	if curLB == nil {
 		curLB, err = p.createLoadBalancer(ctx, req, name, scheme)
@@ -184,7 +200,7 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 		return lb.State{}, err
 	}
 
-	tgARN, err := p.ensureTargetGroup(ctx, req, name, dstPort)
+	tgARN, err := p.ensureTargetGroup(ctx, req, name, dstPort, tg)
 	if err != nil {
 		return lb.State{}, err
 	}
@@ -219,18 +235,125 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 // Delete implements lb.Provider.
 func (p *Provider) Delete(ctx context.Context, ref lb.Ref) error {
 	name := p.resourceName(ref)
-	curLB, err := p.describeLoadBalancer(ctx, name)
+	curLB, tg, err := p.lookup(ctx, name)
 	if err != nil {
 		return err
 	}
-	lbARN := ""
-	if curLB != nil {
-		lbARN = curLB.ARN
+	lbARN, tgARN := lbARNOf(curLB), tgARNOf(tg)
+	tags, err := p.tagsOf(ctx, lbARN, tgARN)
+	if err != nil {
+		return err
 	}
-	return p.deleteAll(ctx, name, lbARN)
+	if lbARN != "" && !p.owned(tags[lbARN], ref) {
+		p.log.Warn("a resource under the name of the object is not its own, not deleted",
+			"loadbalancer", ref.String(), "name", name, "resource", "load balancer")
+		lbARN = ""
+	}
+	if tgARN != "" && !p.owned(tags[tgARN], ref) {
+		p.log.Warn("a resource under the name of the object is not its own, not deleted",
+			"loadbalancer", ref.String(), "name", name, "resource", "target group")
+		tgARN = ""
+	}
+	return p.deleteAll(ctx, lbARN, tgARN)
 }
 
-func (p *Provider) deleteAll(ctx context.Context, name, lbARN string) error {
+// lookup returns the load balancer and the target group of the name; nil
+// for one that does not exist.
+func (p *Provider) lookup(ctx context.Context, name string) (*xmlLoadBalancer, *xmlTargetGroup, error) {
+	curLB, err := p.describeLoadBalancer(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	tg, err := p.describeTargetGroup(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	return curLB, tg, nil
+}
+
+func lbARNOf(curLB *xmlLoadBalancer) string {
+	if curLB == nil {
+		return ""
+	}
+	return curLB.ARN
+}
+
+func tgARNOf(tg *xmlTargetGroup) string {
+	if tg == nil {
+		return ""
+	}
+	return tg.ARN
+}
+
+// ownerTags are the tags that mark a load balancer and a target group as
+// the ones of ref.
+func (p *Provider) ownerTags(ref lb.Ref) [][2]string {
+	return [][2]string{
+		{"norca.io/namespace", ref.Namespace},
+		{"norca.io/name", ref.Name},
+		{"norca.io/class", p.class},
+	}
+}
+
+// owned reports whether tags hold the owner tags of ref exactly: only such
+// a resource is updated or deleted for ref.
+func (p *Provider) owned(tags map[string]string, ref lb.Ref) bool {
+	for _, kv := range p.ownerTags(ref) {
+		if v, ok := tags[kv[0]]; !ok || v != kv[1] {
+			return false
+		}
+	}
+	return true
+}
+
+// foreign returns which of the existing load balancer and target group
+// lacks the owner tags of ref, or "" if both carry them.
+func (p *Provider) foreign(ctx context.Context, ref lb.Ref, curLB *xmlLoadBalancer, tg *xmlTargetGroup) (string, error) {
+	tags, err := p.tagsOf(ctx, lbARNOf(curLB), tgARNOf(tg))
+	if err != nil {
+		return "", err
+	}
+	if curLB != nil && !p.owned(tags[curLB.ARN], ref) {
+		return "load balancer", nil
+	}
+	if tg != nil && !p.owned(tags[tg.ARN], ref) {
+		return "target group", nil
+	}
+	return "", nil
+}
+
+// tagsOf returns the tags of the resources by ARN (DescribeTags); empty
+// ARNs are skipped.
+func (p *Provider) tagsOf(ctx context.Context, arns ...string) (map[string]map[string]string, error) {
+	q := url.Values{}
+	n := 0
+	for _, arn := range arns {
+		if arn != "" {
+			n++
+			q.Set(fmt.Sprintf("ResourceArns.member.%d", n), arn)
+		}
+	}
+	out := map[string]map[string]string{}
+	if n == 0 {
+		return out, nil
+	}
+	var resp xmlDescribeTagsResponse
+	if err := p.call(ctx, "DescribeTags", q, &resp); err != nil {
+		return nil, err
+	}
+	for _, d := range resp.TagDescriptions {
+		tags := map[string]string{}
+		for _, t := range d.Tags {
+			tags[t.Key] = t.Value
+		}
+		out[d.ARN] = tags
+	}
+	return out, nil
+}
+
+// deleteAll deletes the load balancer of lbARN with its listeners and the
+// target group of tgARN; an empty ARN is skipped.
+func (p *Provider) deleteAll(ctx context.Context, lbARN, tgARN string) error {
 	if lbARN != "" {
 		listeners, err := p.describeListeners(ctx, lbARN)
 		if err != nil {
@@ -247,12 +370,8 @@ func (p *Provider) deleteAll(ctx context.Context, name, lbARN string) error {
 			return err
 		}
 	}
-	tg, err := p.describeTargetGroup(ctx, name)
-	if err != nil {
-		return err
-	}
-	if tg != nil {
-		q := url.Values{"TargetGroupArn": {tg.ARN}}
+	if tgARN != "" {
+		q := url.Values{"TargetGroupArn": {tgARN}}
 		if err := p.call(ctx, "DeleteTargetGroup", q, nil); err != nil && !isAWSError(err, "TargetGroupNotFound") {
 			return err
 		}
@@ -296,7 +415,10 @@ func normalizeTargets(frontendPort int, raw []lb.Target) (int, []targetEndpoint,
 }
 
 // resourceName returns a deterministic AWS-valid ELBv2 name (<= 32 chars,
-// alphanumeric + hyphens, not starting with "internal-" or a hyphen).
+// alphanumeric + hyphens, not starting with "internal-" or a hyphen). The 6
+// hex digits of the hash keep refs that read alike apart; the owner tags,
+// not the name, decide what is the ref's own, so two refs whose names still
+// collide get a conflict, never each other's resources.
 func (p *Provider) resourceName(ref lb.Ref) string {
 	raw := strings.ToLower(p.namePrefix + ref.Namespace + "-" + ref.Name)
 	var b strings.Builder
@@ -381,6 +503,20 @@ type xmlDescribeListenersResponse struct {
 	Listeners []xmlListener `xml:"DescribeListenersResult>Listeners>member"`
 }
 
+type xmlTag struct {
+	Key   string `xml:"Key"`
+	Value string `xml:"Value"`
+}
+
+type xmlTagDescription struct {
+	ARN  string   `xml:"ResourceArn"`
+	Tags []xmlTag `xml:"Tags>member"`
+}
+
+type xmlDescribeTagsResponse struct {
+	TagDescriptions []xmlTagDescription `xml:"DescribeTagsResult>TagDescriptions>member"`
+}
+
 type xmlErrorResponse struct {
 	Code    string `xml:"Error>Code"`
 	Message string `xml:"Error>Message"`
@@ -432,12 +568,7 @@ func (p *Provider) createLoadBalancer(ctx context.Context, req lb.Request, name,
 	for i, sg := range p.securityGroups {
 		q.Set(fmt.Sprintf("SecurityGroups.member.%d", i+1), sg)
 	}
-	tags := [][2]string{
-		{"norca.io/namespace", req.Namespace},
-		{"norca.io/name", req.Name},
-		{"norca.io/class", p.class},
-	}
-	for i, kv := range tags {
+	for i, kv := range p.ownerTags(req.Ref) {
 		q.Set(fmt.Sprintf("Tags.member.%d.Key", i+1), kv[0])
 		q.Set(fmt.Sprintf("Tags.member.%d.Value", i+1), kv[1])
 	}
@@ -477,11 +608,9 @@ func (p *Provider) describeTargetGroup(ctx context.Context, name string) (*xmlTa
 	return &resp.TargetGroups[0], nil
 }
 
-func (p *Provider) ensureTargetGroup(ctx context.Context, req lb.Request, name string, dstPort int) (string, error) {
-	tg, err := p.describeTargetGroup(ctx, name)
-	if err != nil {
-		return "", err
-	}
+// ensureTargetGroup returns the ARN of the target group of the name, tg as
+// it is (nil if it does not exist), creating it if needed.
+func (p *Provider) ensureTargetGroup(ctx context.Context, req lb.Request, name string, dstPort int, tg *xmlTargetGroup) (string, error) {
 	if tg != nil {
 		return tg.ARN, nil
 	}
@@ -492,12 +621,10 @@ func (p *Provider) ensureTargetGroup(ctx context.Context, req lb.Request, name s
 		"VpcId":               {p.vpcID},
 		"TargetType":          {"ip"},
 		"HealthCheckProtocol": {"TCP"},
-		"Tags.member.1.Key":   {"norca.io/namespace"},
-		"Tags.member.1.Value": {req.Namespace},
-		"Tags.member.2.Key":   {"norca.io/name"},
-		"Tags.member.2.Value": {req.Name},
-		"Tags.member.3.Key":   {"norca.io/class"},
-		"Tags.member.3.Value": {p.class},
+	}
+	for i, kv := range p.ownerTags(req.Ref) {
+		q.Set(fmt.Sprintf("Tags.member.%d.Key", i+1), kv[0])
+		q.Set(fmt.Sprintf("Tags.member.%d.Value", i+1), kv[1])
 	}
 	var resp xmlCreateTargetGroupResponse
 	if err := p.call(ctx, "CreateTargetGroup", q, &resp); err != nil {

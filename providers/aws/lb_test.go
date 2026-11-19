@@ -5,6 +5,7 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,7 @@ type fakeELBv2Server struct {
 	targets     map[string][]targetEndpoint
 	listeners   map[string][]xmlListener
 	crossZone   map[string]string
+	tags        map[string]map[string]string // by ARN
 	lastAuthHdr string
 }
 
@@ -38,10 +40,25 @@ func newFakeELBv2(t *testing.T) (*fakeELBv2Server, *httptest.Server) {
 		targets:   map[string][]targetEndpoint{},
 		listeners: map[string][]xmlListener{},
 		crossZone: map[string]string{},
+		tags:      map[string]map[string]string{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serveHTTP))
 	t.Cleanup(srv.Close)
 	return f, srv
+}
+
+// recordTags keeps the Tags.member.N of a create call for the resource.
+func (f *fakeELBv2Server) recordTags(arn string, vals url.Values) {
+	for i := 1; ; i++ {
+		key := vals.Get(fmt.Sprintf("Tags.member.%d.Key", i))
+		if key == "" {
+			return
+		}
+		if f.tags[arn] == nil {
+			f.tags[arn] = map[string]string{}
+		}
+		f.tags[arn][key] = vals.Get(fmt.Sprintf("Tags.member.%d.Value", i))
+	}
 }
 
 func (f *fakeELBv2Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +102,7 @@ func (f *fakeELBv2Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			State:   "active",
 		}
 		f.lbs[name] = curLB
+		f.recordTags(curLB.ARN, vals)
 		_, _ = fmt.Fprintf(w, `<CreateLoadBalancerResponse><CreateLoadBalancerResult><LoadBalancers><member><LoadBalancerArn>%s</LoadBalancerArn><DNSName>%s</DNSName><LoadBalancerName>%s</LoadBalancerName><Scheme>%s</Scheme><State><Code>%s</Code></State></member></LoadBalancers></CreateLoadBalancerResult></CreateLoadBalancerResponse>`,
 			curLB.ARN, curLB.DNSName, curLB.Name, curLB.Scheme, curLB.State)
 
@@ -101,6 +119,7 @@ func (f *fakeELBv2Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		delete(f.listeners, arn)
+		delete(f.tags, arn)
 		_, _ = fmt.Fprint(w, `<DeleteLoadBalancerResponse/>`)
 
 	case "DescribeTargetGroups":
@@ -124,6 +143,7 @@ func (f *fakeELBv2Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			Protocol: vals.Get("Protocol"),
 		}
 		f.tgs[name] = tg
+		f.recordTags(tg.ARN, vals)
 		_, _ = fmt.Fprintf(w, `<CreateTargetGroupResponse><CreateTargetGroupResult><TargetGroups><member><TargetGroupArn>%s</TargetGroupArn><TargetGroupName>%s</TargetGroupName><Port>%d</Port><Protocol>%s</Protocol></member></TargetGroups></CreateTargetGroupResult></CreateTargetGroupResponse>`,
 			tg.ARN, tg.Name, tg.Port, tg.Protocol)
 
@@ -135,7 +155,23 @@ func (f *fakeELBv2Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		delete(f.targets, arn)
+		delete(f.tags, arn)
 		_, _ = fmt.Fprint(w, `<DeleteTargetGroupResponse/>`)
+
+	case "DescribeTags":
+		var members strings.Builder
+		for i := 1; ; i++ {
+			arn := vals.Get(fmt.Sprintf("ResourceArns.member.%d", i))
+			if arn == "" {
+				break
+			}
+			var tags strings.Builder
+			for k, v := range f.tags[arn] {
+				_, _ = fmt.Fprintf(&tags, `<member><Key>%s</Key><Value>%s</Value></member>`, k, v)
+			}
+			_, _ = fmt.Fprintf(&members, `<member><ResourceArn>%s</ResourceArn><Tags>%s</Tags></member>`, arn, tags.String())
+		}
+		_, _ = fmt.Fprintf(w, `<DescribeTagsResponse><DescribeTagsResult><TagDescriptions>%s</TagDescriptions></DescribeTagsResult></DescribeTagsResponse>`, members.String())
 
 	case "DescribeTargetHealth":
 		arn := vals.Get("TargetGroupArn")
@@ -288,5 +324,88 @@ func TestAWSLifecycle(t *testing.T) {
 	}
 	if err := inst.Provider.Delete(ctx, ref); err != nil {
 		t.Fatalf("second Delete: %v", err)
+	}
+}
+
+// TestAWSForeignResources: a load balancer or target group under the name
+// of the ref without its owner tags is neither updated nor deleted, and
+// nothing else is created next to it (review finding ATM-19).
+func TestAWSForeignResources(t *testing.T) {
+	ref := lb.Ref{Namespace: "prod", Name: "orders"}
+	lbARN := func(name string) string {
+		return "arn:aws:elasticloadbalancing:eu-central-1:123456789012:loadbalancer/net/" + name + "/9999"
+	}
+	tgARN := func(name string) string {
+		return "arn:aws:elasticloadbalancing:eu-central-1:123456789012:targetgroup/" + name + "/9999"
+	}
+	plantLB := func(tags map[string]string) func(f *fakeELBv2Server, name string) {
+		return func(f *fakeELBv2Server, name string) {
+			f.lbs[name] = &xmlLoadBalancer{ARN: lbARN(name), DNSName: name + ".elb.example", Name: name,
+				Scheme: "internet-facing", State: "active"}
+			if tags != nil {
+				f.tags[lbARN(name)] = tags
+			}
+		}
+	}
+	for name, plant := range map[string]func(f *fakeELBv2Server, name string){
+		"load balancer without owner tags": plantLB(nil),
+		"load balancer of another owner": plantLB(map[string]string{
+			"norca.io/namespace": "intruder", "norca.io/name": "orders", "norca.io/class": "aws-nlb"}),
+		"load balancer of another class": plantLB(map[string]string{
+			"norca.io/namespace": "prod", "norca.io/name": "orders", "norca.io/class": "other"}),
+		"target group without owner tags": func(f *fakeELBv2Server, name string) {
+			f.tgs[name] = &xmlTargetGroup{ARN: tgARN(name), Name: name, Port: 8080, Protocol: "TCP"}
+			f.targets[tgARN(name)] = []targetEndpoint{{IP: "192.0.2.9", Port: 8080}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake, srv := newFakeELBv2(t)
+			inst, err := provider.Default.Instantiate("aws-nlb", TypeID, map[string]any{
+				"region":            "eu-central-1",
+				"vpc_id":            "vpc-12345",
+				"subnets":           []string{"subnet-a"},
+				"access_key_id":     "AKIAIOSFODNN7EXAMPLE",
+				"secret_access_key": "secret",
+				"endpoint":          srv.URL,
+			})
+			if err != nil {
+				t.Fatalf("Instantiate: %v", err)
+			}
+			resName := inst.Provider.(*Provider).resourceName(ref)
+			fake.mu.Lock()
+			plant(fake, resName)
+			fake.mu.Unlock()
+			count := func() int { return len(fake.lbs) + len(fake.tgs) + len(fake.listeners) + len(fake.crossZone) }
+
+			params, _ := inst.Effective(nil)
+			_, err = inst.Provider.Ensure(context.Background(), lb.Request{
+				Ref: ref, Service: "orders", Port: 80,
+				Targets: []lb.Target{{Address: "10.0.1.10", Port: 8080}},
+				Params:  params,
+			})
+			if !errors.Is(err, lb.ErrConflict) {
+				t.Fatalf("Ensure: want a conflict, got %v", err)
+			}
+			if strings.Contains(err.Error(), "intruder") {
+				t.Errorf("the conflict names the other owner: %v", err)
+			}
+			fake.mu.Lock()
+			if n := count(); n != 1 {
+				t.Errorf("Ensure changed or created resources next to the foreign one: %d", n)
+			}
+			if eps := fake.targets[tgARN(resName)]; fake.tgs[resName] != nil && (len(eps) != 1 || eps[0].IP != "192.0.2.9") {
+				t.Errorf("the targets of the foreign target group were changed: %+v", eps)
+			}
+			fake.mu.Unlock()
+
+			if err := inst.Provider.Delete(context.Background(), ref); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			if len(fake.lbs)+len(fake.tgs) != 1 {
+				t.Fatalf("Delete removed the foreign resource")
+			}
+		})
 	}
 }
