@@ -6,6 +6,7 @@ package dnsrecord
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"maps"
@@ -656,6 +657,88 @@ func TestKeep_SameValuesAreAdoptedOnlyOnRequest(t *testing.T) {
 		must.SliceContains(t, e.events("shop", "web"), "Adopted")
 		must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
 	})
+}
+
+// A record set the operator wrote is the record's also when the status
+// write after it failed (the cluster API away for a moment): the status
+// says before the write which set the record is about to write, and the
+// next reconcile finds that set as its own, without adopt and without a
+// Conflict.
+func TestKeep_StatusLostAfterTheWrite(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+
+	obj, st := e.get("shop", "web")
+	out, _, err := e.r.keep(ctx, obj, st)
+	must.NoError(t, err)
+	must.True(t, out.ready, must.Sprint(out.message))
+	e.b.FailNext("UpdateObjectStatus", errors.New("the cluster API is away"))
+	must.Error(t, e.r.writeStatus(ctx, obj, st, out))
+	must.Eq(t, []string{"192.0.2.2"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+	obj, st = e.get("shop", "web")
+	must.False(t, st.Owned)
+	out, _, err = e.r.keep(ctx, obj, st)
+	must.NoError(t, err)
+	must.True(t, out.ready, must.Sprint(out.message))
+	must.True(t, st.Owned)
+	must.Nil(t, st.Pending)
+	must.SliceNotContains(t, e.events("shop", "web"), "Adopted")
+}
+
+// A set whose writing could not be recorded first is not written: the
+// record would not know it as its own.
+func TestKeep_NoWriteWithoutThePendingStatus(t *testing.T) {
+	e, _ := newOperator(t, true)
+	ctx := context.Background()
+	e.cluster.allow("shop", "shop.example.com")
+	e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.2"}})
+
+	obj, st := e.get("shop", "web")
+	e.b.FailNext("UpdateObjectStatus", errors.New("the cluster API is away"))
+	out, _, err := e.r.keep(ctx, obj, st)
+	must.Error(t, err)
+	must.Eq(t, "Failed", out.reason)
+	must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"))
+	must.Nil(t, st.Pending)
+}
+
+// A set written for a record whose status was lost after the write goes
+// with the record: a new set, and new values of a set it held.
+func TestRelease_TheSetOfALostStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hold bool
+	}{
+		{"a new set", false},
+		{"new values of a set the record held", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newOperator(t, true)
+			ctx := context.Background()
+			e.cluster.allow("shop", "shop.example.com")
+			e.put("shop", "web", map[string]any{"name": "www.shop.example.com", "type": "A", "values": []any{"192.0.2.3"}})
+			if tc.hold {
+				must.NoError(t, e.zone.SetRecords(ctx, dns.RecordSet{Name: "www.shop.example.com", Type: "A", TTL: 300, Values: []string{"192.0.2.2"}}))
+				e.hold("shop", "web")
+			}
+			obj, st := e.get("shop", "web")
+			out, _, err := e.r.keep(ctx, obj, st)
+			must.NoError(t, err)
+			must.True(t, out.ready, must.Sprint(out.message))
+			must.Eq(t, []string{"192.0.2.3"}, e.zone.RecordValues("www.shop.example.com", "A"))
+
+			// The status write after the zone write is lost; the record
+			// is deleted.
+			obj, st = e.get("shop", "web")
+			must.NoError(t, e.r.release(ctx, obj, st, "the record was deleted"))
+			must.Len(t, 0, e.zone.RecordValues("www.shop.example.com", "A"), must.Sprint("the set written for the record"))
+			must.False(t, st.Owned)
+			must.Nil(t, st.Pending)
+		})
+	}
 }
 
 // A record set someone writes or changes in the zone after the operator read

@@ -114,6 +114,13 @@ type Status struct {
 	// wrote or adopted it. Only an owned set is changed or removed.
 	Owned bool `json:"owned,omitempty"`
 
+	// Pending is the record set the operator is about to write, recorded
+	// before the write: a set found in the zone exactly as it says is the
+	// record's, also when the status write after the zone write was lost.
+	// It is cleared when the status records the set as owned, or when the
+	// write was not done.
+	Pending *PendingSet `json:"pending,omitempty"`
+
 	// WrittenAt is when the operator last wrote the set (RFC 3339).
 	WrittenAt string `json:"writtenAt,omitempty"`
 
@@ -121,6 +128,15 @@ type Status struct {
 	// back; LastDrift is the time of the last one.
 	Drifts    int    `json:"drifts,omitempty"`
 	LastDrift string `json:"lastDrift,omitempty"`
+}
+
+// PendingSet is a record set the operator is about to write, or holds.
+type PendingSet struct {
+	Zone   string   `json:"zone"`
+	Name   string   `json:"name"`
+	Type   string   `json:"type"`
+	TTL    int      `json:"ttl"`
+	Values []string `json:"values"`
 }
 
 // normalize checks the spec and writes its name and type as the contract

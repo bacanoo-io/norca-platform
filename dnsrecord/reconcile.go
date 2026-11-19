@@ -134,7 +134,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	// write its name, whatever the spec says: a spec that can't be read, or
 	// one that waits for a zone or for values, keeps no name the namespace
 	// lost (review finding SEC-9).
-	if status.Owned && !allowed(status.Name, meta) {
+	if c := status.claimed(); c != nil && !allowed(c.Name, meta) {
 		if err := r.release(ctx, obj, status, fmt.Sprintf("the namespace %q may no longer write the name", obj.Key.Namespace)); err != nil {
 			return failed("removing the record set", err), 0, err
 		}
@@ -166,7 +166,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 	// anything can keep the record from its new one (a zone that is not
 	// there or can't be written, values that are not there yet): a name
 	// the record no longer asks for is not served on.
-	if status.Owned && (status.Name != spec.Name || status.Type != spec.Type) {
+	if c := status.claimed(); c != nil && (c.Name != spec.Name || c.Type != spec.Type) {
 		if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", spec.Type, spec.Name)); err != nil {
 			return failed("removing the record set", err), 0, err
 		}
@@ -180,7 +180,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		// The record lost the name: it holds no record set from here on.
 		// The set of the contested name and type is the other record's and
 		// stays (a set under a former name went above).
-		status.Owned = false
+		status.Owned, status.Pending = false, nil
 		msg := fmt.Sprintf("%s writes %s %s", otherRecord(obj.Key, other), spec.Type, spec.Name)
 		// The message may not name the other record; the log does, once
 		// for every new conflict, not at every requeue while it lasts.
@@ -229,7 +229,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 
 	// A set the operator wrote under another name, type or zone goes
 	// first: the spec moved it.
-	if status.Owned && (status.Name != want.Name || status.Type != want.Type || status.Zone != zone.Name) {
+	if c := status.claimed(); c != nil && (c.Name != want.Name || c.Type != want.Type || c.Zone != zone.Name) {
 		if err := r.release(ctx, obj, status, fmt.Sprintf("the record moved to %s %s", want.Type, want.Name)); err != nil {
 			return failed("removing the record set", err), 0, err
 		}
@@ -263,7 +263,12 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			}
 		}
 	}
-	owned := status.Owned && status.Name == want.Name && status.Type == want.Type && status.Zone == zone.Name
+	held := status.Owned && status.Name == want.Name && status.Type == want.Type && status.Zone == zone.Name
+	// A set exactly as the status said the operator was about to write it
+	// is the record's own: the status write after the zone write was lost
+	// (the cluster API away for a moment).
+	owned := held || (have != nil && status.Pending != nil && status.Pending.Name == want.Name &&
+		status.Pending.Type == want.Type && status.Pending.is(zone.Name, *have))
 	// A set that a record whose namespace may no longer write the name
 	// holds, as its status says it wrote it, is the operator's: the record
 	// that may write the name takes it over, and the other one gives it up
@@ -294,8 +299,23 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		}
 
 	default:
+		// The status says which set the record is about to write before
+		// the zone is written, and no set is written when it can't.
+		prev := status.Pending
+		status.Pending = &PendingSet{Zone: zone.Name, Name: want.Name, Type: want.Type, TTL: want.TTL, Values: want.Values}
+		if err := r.recordPending(ctx, obj, status); err != nil {
+			status.Pending = prev
+			out := failed("recording the record set before writing it", err)
+			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", out.message)
+			return out, 0, err
+		}
 		if err := r.setRecords(ctx, client, zone.Name, want, read); err != nil {
-			if re, ok := errors.AsType[*dns.ResponseError](err); ok && re.PreconditionFailed() {
+			var re *dns.ResponseError
+			if errors.As(err, &re) && (re.PreconditionFailed() || re.Invalid()) {
+				// Nothing was written.
+				status.Pending = nil
+			}
+			if re != nil && re.PreconditionFailed() {
 				// Someone wrote the set after it was read: nothing was
 				// written, and the next reconcile reads it again.
 				msg := fmt.Sprintf("the %s records of %s in the zone %s changed while norca-dns wrote them; nothing was written",
@@ -304,8 +324,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			}
 			out := failed("writing the record set", err)
 			r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "Failed", out.message)
-			var re *dns.ResponseError
-			if errors.As(err, &re) && re.Invalid() {
+			if re != nil && re.Invalid() {
 				// Not retried before something changes: the error is not
 				// returned, so it is logged here.
 				r.logger.Warn("the provider refused a record set", "zone", zone.Name, "record", obj.Key.String(), "error", err)
@@ -316,7 +335,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 		now := r.now().UTC().Format(time.RFC3339)
 		status.WrittenAt = now
 		switch {
-		case owned && obj.Generation != 0 && status.ObservedGeneration == obj.Generation &&
+		case held && obj.Generation != 0 && status.ObservedGeneration == obj.Generation &&
 			status.TTL == want.TTL && slices.Equal(status.Values, want.Values):
 			// Nothing of the record changed on the operator's side: the
 			// zone was changed (or the set deleted) by hand.
@@ -338,7 +357,7 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 
 	status.Zone, status.Name, status.Type, status.TTL = zone.Name, want.Name, want.Type, want.TTL
 	status.Values = want.Values
-	status.Owned = true
+	status.Owned, status.Pending = true, nil
 	return outcome{ready: true, reason: "RecordWritten",
 		message: fmt.Sprintf("the zone %s holds %s %s", zone.Name, want.Type, want.Name)}, r.requeueReady, nil
 }
@@ -512,13 +531,18 @@ func (r *reconciler) values(ctx context.Context, obj *controller.Object, spec Sp
 	return values, "", false, nil
 }
 
-// release removes the record set the status of a record holds and gives it
-// up; why is for the event. A record that holds none is left as it is.
+// release removes the record set the status of a record holds, or the one
+// it was about to write (Pending: the status write after the zone write may
+// have been lost), and gives it up; why is for the event. A record that
+// holds none is left as it is.
 func (r *reconciler) release(ctx context.Context, obj *controller.Object, status *Status, why string) error {
-	if !status.Owned {
+	c := status.claimed()
+	if c == nil {
 		return nil
 	}
-	kept, err := r.remove(ctx, obj, status)
+	target := *status
+	target.Zone, target.Name, target.Type, target.TTL, target.Values, target.Owned = c.Zone, c.Name, c.Type, c.TTL, c.Values, true
+	kept, err := r.remove(ctx, obj, &target)
 	if err != nil {
 		// The caller returns the error, and the controller logs it.
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "DeleteFailed", failureText("removing the record set", err))
@@ -526,12 +550,12 @@ func (r *reconciler) release(ctx context.Context, obj *controller.Object, status
 	}
 	if kept != "" {
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeWarning, "RecordLeft",
-			fmt.Sprintf("%s %s stays in the zone %s: %s", status.Type, status.Name, status.Zone, kept))
+			fmt.Sprintf("%s %s stays in the zone %s: %s", target.Type, target.Name, target.Zone, kept))
 	} else {
 		r.ctrl.Recorder().Event(ctx, obj.Key, controller.EventTypeNormal, "RecordDeleted",
-			fmt.Sprintf("%s %s removed from the zone %s: %s", status.Type, status.Name, status.Zone, why))
+			fmt.Sprintf("%s %s removed from the zone %s: %s", target.Type, target.Name, target.Zone, why))
 	}
-	status.Owned = false
+	status.Owned, status.Pending = false, nil
 	return nil
 }
 
@@ -676,14 +700,48 @@ func (r *reconciler) unconditional(zone string, err error) bool {
 }
 
 // wrote reports whether a record set of the zone is the one a status says
-// the operator wrote: the same TTL and values.
+// the operator wrote (the same TTL and values as the set it holds), or the
+// one it was about to write (Pending).
 func wrote(status *Status, zone string, have dns.RecordSet) bool {
+	if status.Owned && (&PendingSet{Zone: status.Zone, Name: status.Name, Type: status.Type, TTL: status.TTL, Values: status.Values}).is(zone, have) {
+		return true
+	}
+	return status.Pending != nil && status.Pending.is(zone, have)
+}
+
+// claimed returns the record set the status holds or, when it holds none,
+// the one the operator was about to write when the status was written last
+// (nil: neither).
+func (s *Status) claimed() *PendingSet {
+	if s.Owned {
+		return &PendingSet{Zone: s.Zone, Name: s.Name, Type: s.Type, TTL: s.TTL, Values: s.Values}
+	}
+	return s.Pending
+}
+
+// is reports whether a record set of a zone, as the provider answered it,
+// is this one: the same zone, name, type, TTL and values.
+func (p *PendingSet) is(zone string, have dns.RecordSet) bool {
 	if set, err := dns.CheckRecordSet(zone, have); err == nil {
 		have = set
 	} else {
+		have.Name, have.Type = dns.Normalize(have.Name), strings.ToUpper(have.Type)
 		have.Values = slices.Sorted(slices.Values(have.Values))
 	}
-	return have.TTL == status.TTL && slices.Equal(have.Values, status.Values)
+	return p.Zone == zone && p.Name == have.Name && p.Type == have.Type && p.TTL == have.TTL && slices.Equal(p.Values, have.Values)
+}
+
+// recordPending writes the status with the record set the operator is about
+// to write (status.Pending), with the check-and-set of the object; obj
+// follows the write, so that the status write at the end of the reconcile
+// goes on from it.
+func (r *reconciler) recordPending(ctx context.Context, obj *controller.Object, status *Status) error {
+	next, err := r.ctrl.Objects().UpdateStatus(ctx, obj, status)
+	if err != nil {
+		return fmt.Errorf("recording the record set to write: %w", err)
+	}
+	obj.Status, obj.ModifyIndex = next.Status, next.ModifyIndex
+	return nil
 }
 
 // finishDeletion removes the record set of a deleted object and lets the

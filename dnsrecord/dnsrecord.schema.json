@@ -30,6 +30,7 @@
         "ttl":       {"type": "integer"},
         "values":    {"type": "array", "items": {"type": "string"}},
         "owned":     {"type": "boolean"},
+        "pending":   {"type": "object", "description": "The record set norca-dns is about to write: a set found exactly so is the record's"},
         "writtenAt": {"type": "string"},
         "drifts":    {"type": "integer"},
         "lastDrift": {"type": "string"}
