@@ -814,7 +814,16 @@ func (o *Operator) revoke(ctx context.Context, is *issuer, spec *OrderSpec) erro
 			"serial", spec.Revoke, "reason", spec.Reason)
 		reason = xacme.CRLReasonUnspecified
 	}
-	if err := is.account.authority.Revoke(ctx, block.Bytes, reason); err != nil {
+	err = is.account.authority.Revoke(ctx, block.Bytes, reason)
+	if acmeErr, ok := errors.AsType[*xacme.Error](err); ok && reason != xacme.CRLReasonUnspecified &&
+		strings.HasSuffix(acmeErr.ProblemType, ":badRevocationReason") {
+		// The certificate authority does not take the reason: the
+		// revocation matters more than its reason.
+		o.log().Warn("the certificate authority refused the revocation reason, revoking without one",
+			"issuer", is.obj.Name, "serial", spec.Revoke, "reason", spec.Reason, "problem", acmeErr.Detail)
+		err = is.account.authority.Revoke(ctx, block.Bytes, xacme.CRLReasonUnspecified)
+	}
+	if err != nil {
 		text, perm := problemOf(err)
 		if strings.Contains(text, "alreadyRevoked") {
 			return nil

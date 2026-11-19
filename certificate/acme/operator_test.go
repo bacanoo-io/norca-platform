@@ -530,6 +530,40 @@ func TestOrder_RevokeReason(t *testing.T) {
 	}
 }
 
+// A certificate authority that refuses the reason of a revocation
+// (badRevocationReason, RFC 8555 section 7.6) is asked once more without
+// one: the revocation matters more than its reason.
+func TestOrder_RevokeBadReason(t *testing.T) {
+	e := newEnv(t)
+	e.issuer("ca", nil)
+	leaf := leafOf(t, e.passes(e.order("default.web.1", "ca", "www.example.org"), 6))
+	serial := hex.EncodeToString(leaf.SerialNumber.Bytes())
+
+	e.ca.failNext("revoke", &xacme.Error{StatusCode: http.StatusBadRequest,
+		ProblemType: "urn:ietf:params:acme:error:badRevocationReason", Detail: "reason not allowed"})
+	e.cluster.put(OrderKind, "default.web.revoke-1", map[string]any{
+		"issuer": "ca", "certificate": "default/web", "revoke": serial, "reason": "cessationOfOperation",
+	}, map[string]any{"state": StatePending})
+	e.pass()
+	if got := e.orderStatus("default.web.revoke-1"); got.State != StateValid {
+		t.Fatalf("the revocation: %+v", got)
+	}
+	if len(e.ca.reasons) != 1 || e.ca.reasons[0] != xacme.CRLReasonUnspecified || !slices.Equal(e.ca.revoked[0], leaf.Raw) {
+		t.Fatalf("revoked with the reasons %v, want once without a reason", e.ca.reasons)
+	}
+
+	// Without a reason there is nothing to drop: the refusal fails the order.
+	e.ca.failNext("revoke", &xacme.Error{StatusCode: http.StatusBadRequest,
+		ProblemType: "urn:ietf:params:acme:error:badRevocationReason", Detail: "reason not allowed"})
+	e.cluster.put(OrderKind, "default.web.revoke-2", map[string]any{
+		"issuer": "ca", "certificate": "default/web", "revoke": serial,
+	}, map[string]any{"state": StatePending})
+	e.pass()
+	if got := e.orderStatus("default.web.revoke-2"); got.State != StateFailed || !strings.Contains(got.Problem, "badRevocationReason") {
+		t.Fatalf("a refused revocation without a reason: %+v", got)
+	}
+}
+
 // What is held for an order that the servers deleted is dropped.
 func TestOrder_DeletedWhileOpen(t *testing.T) {
 	e := newEnv(t)
