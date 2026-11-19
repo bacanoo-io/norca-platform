@@ -60,7 +60,9 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		var last Status
 		_ = obj.DecodeStatus(&last)
 		if err := r.cleanup(ctx, key, last.Class, true); err != nil {
-			r.ctrl.Recorder().Event(ctx, key, controller.EventTypeWarning, "CleanupFailed", err.Error())
+			if !errors.Is(err, controller.ErrNotLeader) {
+				r.ctrl.Recorder().Event(ctx, key, controller.EventTypeWarning, "CleanupFailed", err.Error())
+			}
 			return 0, err
 		}
 		_, err := r.ctrl.Objects().RemoveFinalizer(ctx, obj, Finalizer)
@@ -103,6 +105,9 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// A changed class leaves resources of the previous provider behind.
 	for class, p := range r.providers {
 		if class != spec.Class {
+			if err := r.ctrl.Leading(ctx); err != nil {
+				return 0, err
+			}
 			if err := p.Delete(ctx, key); err != nil {
 				return 0, err
 			}
@@ -132,6 +137,11 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		targets = append(targets, t)
 	}
 	slices.Sort(leaving)
+	// Only the leader creates or changes a load balancer (review finding
+	// CON-6b); a refusal changes nothing, and the leader reconciles it.
+	if err := r.ctrl.Leading(ctx); err != nil {
+		return 0, err
+	}
 	res, err := provider.Ensure(ctx, obj, spec, targets)
 	if err != nil {
 		if re, ok := errors.AsType[*lb.ResponseError](err); ok && re.Conflict() {
@@ -203,10 +213,15 @@ func cond(conditionType string, ok bool, reason, message string) controller.Cond
 // cleanup removes what every built-in provider created for the object, and
 // what the registered provider of class created. With strict, a registered
 // provider that cannot be reached (or is gone) is an error, so that the
-// finalizer keeps the object until the load balancer is removed.
+// finalizer keeps the object until the load balancer is removed. Only the
+// leader removes anything (Leading; review finding CON-6b): a refusal is an
+// error wrapping controller.ErrNotLeader.
 func (r *reconciler) cleanup(ctx context.Context, key controller.ObjectKey, class string, strict bool) error {
 	var errs []error
 	for _, p := range r.providers {
+		if err := r.ctrl.Leading(ctx); err != nil {
+			return err
+		}
 		errs = append(errs, p.Delete(ctx, key))
 	}
 	errs = append(errs, r.deleteRemote(ctx, key, class, strict))
@@ -234,6 +249,9 @@ func (r *reconciler) deleteRemote(ctx context.Context, key controller.ObjectKey,
 		r.logger.Warn("the class of a load balancer is not registered, what it created is left behind",
 			"object", key.String(), "class", class)
 		return nil
+	}
+	if err := r.ctrl.Leading(ctx); err != nil {
+		return err
 	}
 	return r.classes.provider(info).Delete(ctx, key)
 }

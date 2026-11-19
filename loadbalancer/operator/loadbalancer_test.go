@@ -424,3 +424,84 @@ func TestLoadBalancer_LeavingNode(t *testing.T) {
 	// status: wait for the status as well.
 	waitFor(t, "leaving node gone", func() bool { return e.status(t, "web").LeavingNodes == nil })
 }
+
+// countingProvider counts the calls of the reconciler.
+type countingProvider struct {
+	mu              sync.Mutex
+	ensures, delete int
+}
+
+func (p *countingProvider) Class() string { return "counting" }
+
+func (p *countingProvider) Ensure(context.Context, *controller.Object, Spec, []Target) (Result, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ensures++
+	return Result{Ready: true, Addresses: []string{"192.0.2.1:80"}}, nil
+}
+
+func (p *countingProvider) Delete(context.Context, controller.ObjectKey) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.delete++
+	return nil
+}
+
+func (p *countingProvider) calls() (int, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ensures, p.delete
+}
+
+// An operator that may no longer lead calls no provider: no load balancer
+// is created, changed or removed (review finding CON-6b: a reconcile that
+// went on after the lease could pass to another instance still did).
+func TestReconcile_NotLeadingCallsNoProvider(t *testing.T) {
+	b := fake.New()
+	b.PutObject(&api.CustomObject{Group: "test.norca.io", Kind: "Seed", Name: "seed"})
+	// Another instance holds the lease.
+	b.PutVariable(&api.Variable{Namespace: "default", Path: controller.LeaseRoot + "/loadbalancer", Items: api.VariableItems{
+		"holder": "the-leader", "leaseDurationSeconds": "3600"}})
+	cluster := newFakeCluster()
+	cluster.setTargets("default", "web", Target{Address: "10.0.0.1", Port: 8001, NodeID: "n1"})
+	counting, other := &countingProvider{}, &countingProvider{}
+	r := &reconciler{
+		cluster: cluster, providers: map[string]Provider{"counting": counting, "other": other},
+		logger: testLogger(), now: time.Now, requeueNotReady: time.Minute, requeueReady: time.Minute,
+	}
+	c, err := controller.New(b, r, controller.Options{
+		Name: "loadbalancer", Storage: controller.StorageVariables, Kind: Kind, Logger: testLogger(),
+		LeaderElection: &controller.LeaderElectionConfig{Namespace: "default", Identity: "follower"},
+	})
+	must.NoError(t, err)
+	r.ctrl = c
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	key := controller.ObjectKey{Namespace: "default", Name: "web"}
+	b.PutVariable(&api.Variable{Path: Kind.Path("web"), Items: api.VariableItems{"spec": `{"service":"web","port":80,"class":"counting"}`}})
+	waitFor(t, "the follower sees the load balancer", func() bool { _, ok := c.Get(key); return ok })
+	_, err = r.Reconcile(ctx, key)
+	ensures, deletes := counting.calls()
+	must.Eq(t, 0, ensures, must.Sprint("load balancer ensured by an operator that does not lead"))
+	must.Eq(t, 0, deletes)
+	_, deletes = other.calls()
+	must.Eq(t, 0, deletes, must.Sprint("the load balancer of another class deleted by an operator that does not lead"))
+	must.ErrorIs(t, err, controller.ErrNotLeader)
+
+	// The object is gone: what the providers created stays for the leader.
+	must.NoError(t, b.DeleteVariable(ctx, "default", Kind.Path("web"), 0))
+	waitFor(t, "the follower sees it go", func() bool { _, ok := c.Get(key); return !ok })
+	_, err = r.Reconcile(ctx, key)
+	_, deletes = counting.calls()
+	must.Eq(t, 0, deletes, must.Sprint("load balancer deleted by an operator that does not lead"))
+	must.ErrorIs(t, err, controller.ErrNotLeader)
+}
