@@ -27,7 +27,7 @@ import (
 //	  "providers": [{
 //	    "name": "hetzner-eu", "type": "hcloud",
 //	    "params": {"token": "${HCLOUD_TOKEN}"},
-//	    "token_file": "/secrets/token", "token_variable": "providers/hetzner-eu",
+//	    "token_file": "/secrets/token", "token_variable": "nodescaler/providers/hetzner-eu",
 //	    "node": {"groups": [{"name": "fsn1", "max": 10, "params": {}}]},
 //	    "loadbalancer": {"classes": [{"class": "hcloud", "params": {"location": "fsn1"}}]},
 //	    "dns": {"zones": [{"zone": "example.com"}]}

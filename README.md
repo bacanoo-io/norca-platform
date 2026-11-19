@@ -286,7 +286,7 @@ a class (and the shared ones) in `spec.parameters` of the
   "providers": [{
     "name": "hetzner-eu", "type": "hcloud",
     "params": { "token": "${HCLOUD_TOKEN}" },
-    "token_file": "/secrets/token", "token_variable": "providers/hetzner-eu",
+    "token_file": "/secrets/token", "token_variable": "nodescaler/providers/hetzner-eu",
     "node": { "groups": [{ "name": "fsn1", "max": 10, "params": {} }] },
     "loadbalancer": { "classes": [{ "class": "hcloud", "params": { "location": "fsn1" } }] }
   }]
@@ -307,7 +307,14 @@ a class (and the shared ones) in `spec.parameters` of the
   resolved, or `token_file`) is required of every call to its node provider
   and its classes, as `Authorization: Bearer`; `token_variable` is the
   Variable in Norca (item `token`, in the namespace `norca-system`) the
-  operators read to send it. Without a
+  operators read to send it. **A provider with a `node` section keeps its
+  token under `nodescaler/`** (`nodescaler/providers/<name>`): the node
+  scaling operator may read only that path. The LoadBalancer, ACME and DNS
+  operators read the tokens of classes and zones under `providers/` by
+  default, so a provider that also serves classes or zones either gets
+  their token path set to `nodescaler/providers/*` (`class_token_path` of
+  the `loadbalancer-operator` pack, `zone_token_path` of `norca-acme` and
+  `norca-dns`), or is split into two entries with a Variable each. Without a
   token the provider needs `no_auth` (a trusted network only).
 - A class may limit itself: `internal: false` offers only public load
   balancers, `internal: true` requires a type that can make internal ones,
@@ -337,7 +344,7 @@ complete job; the `Dockerfile` builds a `FROM scratch` image (the docker
 platform needs the docker CLI and runs on the host).
 
 ```shell
-norca var put -namespace norca-system providers/hetzner-eu token="$PROVIDER_TOKEN"
+norca var put -namespace norca-system nodescaler/providers/hetzner-eu token="$PROVIDER_TOKEN"
 norca-provider -config providers.json
 ```
 
