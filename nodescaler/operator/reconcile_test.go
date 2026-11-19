@@ -533,7 +533,7 @@ func TestReconcile_Token(t *testing.T) {
 	if c := conditionOf(e.status(), CondProviderAvailable); c["reason"] != "InvalidProvider" {
 		t.Fatalf("condition: %+v", c)
 	}
-	e.backend.PutVariable(&api.Variable{Namespace: "default", Path: "nodescaler/mock/token", Items: map[string]string{"token": "s3cret"}})
+	e.backend.PutVariable(&api.Variable{Namespace: "norca-system", Path: "nodescaler/mock/token", Items: map[string]string{"token": "s3cret"}})
 	e.reconcile()
 	if n := len(e.instances()); n != 1 {
 		t.Fatalf("instances: %d, status %+v", n, e.status())

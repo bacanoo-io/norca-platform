@@ -20,6 +20,21 @@ func TestParseFlags(t *testing.T) {
 		!f.joinCheckAddr || f.joinKeyStore != "file" {
 		t.Fatalf("defaults: %+v", f)
 	}
+	// The operator's own Variables are in the operations namespace; the join
+	// service is looked up in the namespace of the job, else there too.
+	t.Setenv("NORCA_NAMESPACE", "")
+	f, err = parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.tokenNamespace != "norca-system" || f.leaseNamespace != "norca-system" ||
+		f.bootstrapNS != "norca-system" || f.joinServiceNS != "norca-system" {
+		t.Fatalf("namespaces: %+v", f)
+	}
+	t.Setenv("NORCA_NAMESPACE", "ops")
+	if f, err := parseFlags(nil); err != nil || f.joinServiceNS != "ops" || f.bootstrapNS != "norca-system" {
+		t.Fatalf("NORCA_NAMESPACE=ops: %+v %v", f, err)
+	}
 	if f, err := parseFlags([]string{"-join-key-store=auto"}); err != nil || f.joinKeyStore != "auto" {
 		t.Fatalf("-join-key-store=auto: %+v %v", f, err)
 	}

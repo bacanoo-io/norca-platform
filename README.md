@@ -89,8 +89,8 @@ ask for another one.
 
 **The bootstrap of a machine.** The deployer writes the static parts of a
 region into the Variable `nodescaler/bootstrap/<region>` (namespace
-`default`; it holds the key of the node CA, so only the operator may read
-it):
+`norca-system`, `-bootstrap-namespace`; it holds the key of the node CA, so
+only the operator may read it):
 
 | Item | Meaning |
 | --- | --- |
@@ -221,7 +221,7 @@ changes only its own fields and writes with the index it read. Scale down
 comes next.
 
 ```shell
-norca-nodescaler -region eu -provider-ttl 3m -token-namespace default
+norca-nodescaler -region eu -provider-ttl 3m -token-namespace norca-system
 ```
 
 ## The provider application

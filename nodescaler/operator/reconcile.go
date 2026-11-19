@@ -49,7 +49,7 @@ type Config struct {
 	ProviderTTL time.Duration
 
 	// TokenNamespace is the namespace of the Variables with the tokens of the
-	// providers (default "default").
+	// providers (default "norca-system").
 	TokenNamespace string
 
 	// AllowHTTP accepts http endpoints of providers (development only).
@@ -119,7 +119,7 @@ func NewReconciler(backend controller.Backend, nodes NodeLister, cfg Config) *Re
 		cfg.ProviderTTL = 3 * time.Minute
 	}
 	if cfg.TokenNamespace == "" {
-		cfg.TokenNamespace = "default"
+		cfg.TokenNamespace = "norca-system"
 	}
 	if cfg.RetryAfter <= 0 {
 		cfg.RetryAfter = 30 * time.Second

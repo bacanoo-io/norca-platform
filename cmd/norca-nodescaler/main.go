@@ -50,6 +50,11 @@ func main() {
 	}
 }
 
+// systemNamespace is the operations namespace of the Norca operators, the
+// default namespace of the operator's own Variables: its lease, the tokens
+// of the providers and the bootstrap with the key of the node CA.
+const systemNamespace = "norca-system"
+
 type flags struct {
 	region         string
 	providerTTL    time.Duration
@@ -90,11 +95,11 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.region, "region", envOr("NORCA_REGION", "global"), "region of the cluster: a label of the instances and part of the request IDs")
 	fs.DurationVar(&f.providerTTL, "provider-ttl", 3*time.Minute, "how old the heartbeat of a NodeProvider may be")
 	fs.BoolVar(&f.allowHTTP, "provider-allow-http", false, "accept http endpoints of providers (development only)")
-	fs.StringVar(&f.tokenNamespace, "token-namespace", "default", "namespace of the Variables with the tokens of the providers")
+	fs.StringVar(&f.tokenNamespace, "token-namespace", systemNamespace, "namespace of the Variables with the tokens of the providers")
 	fs.IntVar(&f.workers, "workers", 2, "concurrent reconciles")
 	fs.DurationVar(&f.resync, "resync", 5*time.Minute, "period of full resynchronization")
 	fs.BoolVar(&f.leaderElection, "leader-election", true, "reconcile only on the elected leader")
-	fs.StringVar(&f.leaseNamespace, "lease-namespace", "default", "namespace of the lease Variable")
+	fs.StringVar(&f.leaseNamespace, "lease-namespace", systemNamespace, "namespace of the lease Variable")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "address of the /metrics endpoint (disabled if empty)")
 	fs.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn or error")
 	fs.BoolVar(&f.showVersion, "version", false, "print the version and exit")
@@ -103,12 +108,12 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.deleteOrphans, "delete-orphans", false, "delete orphaned instances that run a node too (otherwise they are only reported)")
 	fs.BoolVar(&f.bootstrap, "bootstrap", true, "send each instance a bootstrap with the certificate and the configuration of its node")
 	fs.StringVar(&f.bootstrapVar, "bootstrap-variable", "", "Variable with the bootstrap template of the region (default nodescaler/bootstrap/<region>)")
-	fs.StringVar(&f.bootstrapNS, "bootstrap-namespace", "default", "namespace of the bootstrap Variable")
+	fs.StringVar(&f.bootstrapNS, "bootstrap-namespace", systemNamespace, "namespace of the bootstrap Variable")
 	fs.StringVar(&f.networkVar, "network-variable", "", "Variable with the cluster ranges of the region, in the namespace of the bootstrap (default nodescaler/network/<region>)")
 	fs.StringVar(&f.joinListen, "join-listen", "", "address of the join endpoint; set, the new nodes make their own keys and fetch and renew their certificates there (norca-join), and the bootstrap carries a one-time token instead of a key")
 	fs.Var(&f.joinURLs, "join-url", "an https URL of the join endpoint the nodes call (a stable name or a load balancer); repeatable; default: the instances of -join-service")
 	fs.StringVar(&f.joinService, "join-service", "nodescaler-join", "service of the native catalog whose instances are the join endpoints, without -join-url")
-	fs.StringVar(&f.joinServiceNS, "join-service-namespace", envOr("NORCA_NAMESPACE", "default"), "namespace of -join-service")
+	fs.StringVar(&f.joinServiceNS, "join-service-namespace", envOr("NORCA_NAMESPACE", systemNamespace), "namespace of -join-service (default: the namespace of the job, NORCA_NAMESPACE)")
 	fs.DurationVar(&f.joinValidity, "join-validity", 7*24*time.Hour, "validity of the certificate of a node that renews itself (renewed at two thirds)")
 	fs.BoolVar(&f.joinCheckAddr, "join-check-address", true, "the join endpoint accepts a join or a renewal only from an address the provider reports for the instance; turn it off where a proxy, a load balancer or NAT in front of the endpoint changes the source address")
 	fs.StringVar(&f.joinKeyStore, "join-key-store", join.KeyStoreFile, "where the nodes that join keep their keys, unless their group names it (spec.join.key_store): file (a key file), tpm (made in the TPM 2.0 of the machine, which must have one; Linux) or auto (the TPM where the machine has one, else a file)")
