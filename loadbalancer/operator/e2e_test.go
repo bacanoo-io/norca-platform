@@ -85,7 +85,7 @@ func TestE2E_OperatorPack(t *testing.T) {
 	// The controller, as the pack's job would run it.
 	backend := controller.NewBackend(client)
 	cluster := &nomadCluster{client: client}
-	prov, err := newNomadProvider(NomadProviderConfig{Driver: "mock_driver"}, backend, cluster)
+	prov, err := newNomadProvider(NomadProviderConfig{Driver: "mock_driver"}, backend, &apiJobRegistrar{client: client}, cluster)
 	must.NoError(t, err)
 	r := &reconciler{
 		cluster:         cluster,

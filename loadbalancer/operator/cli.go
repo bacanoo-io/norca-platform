@@ -191,7 +191,7 @@ func runController(ctx context.Context, args []string) error {
 	}
 	backend := controller.NewBackend(client)
 	cluster := &nomadCluster{client: client}
-	nomadProv, err := newNomadProvider(f.provider, backend, cluster)
+	nomadProv, err := newNomadProvider(f.provider, backend, &apiJobRegistrar{client: client}, cluster)
 	if err != nil {
 		return err
 	}

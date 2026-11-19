@@ -85,10 +85,40 @@ type NomadProviderConfig struct {
 type nomadProvider struct {
 	cfg     NomadProviderConfig
 	backend controller.Backend
+	jobs    jobRegistrar
 	cluster Cluster
 }
 
-func newNomadProvider(cfg NomadProviderConfig, backend controller.Backend, cluster Cluster) (*nomadProvider, error) {
+// jobRegistrar registers jobs with check-and-set on their job modify
+// index; the Backend of the controller SDK registers them unconditionally.
+type jobRegistrar interface {
+	// EnforceRegisterJob registers job if the stored job has the job
+	// modify index modifyIndex; 0 requires that the job does not exist. A
+	// mismatch fails with an error wrapping controller.ErrConflict.
+	EnforceRegisterJob(ctx context.Context, job *api.Job, modifyIndex uint64) error
+}
+
+// apiJobRegistrar registers jobs with the API client.
+type apiJobRegistrar struct {
+	client *api.Client
+}
+
+func (r *apiJobRegistrar) EnforceRegisterJob(ctx context.Context, job *api.Job, modifyIndex uint64) error {
+	ns := ""
+	if job.Namespace != nil {
+		ns = *job.Namespace
+	}
+	w := (&api.WriteOptions{Namespace: ns}).WithContext(ctx)
+	_, _, err := r.client.Jobs().EnforceRegister(job, modifyIndex, w)
+	// The servers answer a failed check with an error that names it, not
+	// with a status code of its own.
+	if err != nil && strings.Contains(err.Error(), api.RegisterEnforceIndexErrPrefix) {
+		return fmt.Errorf("%w: %w", controller.ErrConflict, err)
+	}
+	return err
+}
+
+func newNomadProvider(cfg NomadProviderConfig, backend controller.Backend, jobs jobRegistrar, cluster Cluster) (*nomadProvider, error) {
 	if cfg.JobPrefix == "" {
 		cfg.JobPrefix = "lb-"
 	}
@@ -115,7 +145,7 @@ func newNomadProvider(cfg NomadProviderConfig, backend controller.Backend, clust
 	if cfg.MemoryMB <= 0 {
 		cfg.MemoryMB = 32
 	}
-	return &nomadProvider{cfg: cfg, backend: backend, cluster: cluster}, nil
+	return &nomadProvider{cfg: cfg, backend: backend, jobs: jobs, cluster: cluster}, nil
 }
 
 func (p *nomadProvider) Class() string { return "nomad" }
@@ -139,6 +169,12 @@ func (p *nomadProvider) Ensure(ctx context.Context, obj *controller.Object, spec
 		res.Message = fmt.Sprintf("job %q exists and is not owned by this load balancer", jobID)
 		return res, nil
 	}
+	// The job is registered only if it is still the one read: absent, or
+	// owned by this load balancer.
+	var jobIndex uint64
+	if existing != nil && existing.JobModifyIndex != nil {
+		jobIndex = *existing.JobModifyIndex
+	}
 
 	if err := p.writeTargets(ctx, obj, jobID, targets); err != nil {
 		return res, err
@@ -147,7 +183,10 @@ func (p *nomadProvider) Ensure(ctx context.Context, obj *controller.Object, spec
 	job := p.desiredJob(obj, spec, jobID)
 	stopped := existing != nil && existing.Stop != nil && *existing.Stop
 	if existing == nil || stopped || existing.Meta[metaSpecHash] != job.Meta[metaSpecHash] {
-		if err := p.backend.RegisterJob(ctx, job); err != nil {
+		// On a conflict somebody else registered or changed the job since
+		// it was read: it is not overwritten, and the next reconcile reads
+		// it again.
+		if err := p.jobs.EnforceRegisterJob(ctx, job, jobIndex); err != nil {
 			return res, fmt.Errorf("registering job %q: %w", jobID, err)
 		}
 	}

@@ -102,7 +102,7 @@ func startOperatorOn(t *testing.T, b *fake.Backend, cluster *fakeCluster, discov
 // reconciler before the controllers start.
 func startOperatorTuned(t *testing.T, b *fake.Backend, cluster *fakeCluster, discover bool, storage controller.Storage, tune func(*reconciler)) *env {
 	t.Helper()
-	prov, err := newNomadProvider(NomadProviderConfig{Command: "/usr/local/bin/loadbalancer"}, b, cluster)
+	prov, err := newNomadProvider(NomadProviderConfig{Command: "/usr/local/bin/loadbalancer"}, b, &fakeJobRegistrar{b: b}, cluster)
 	must.NoError(t, err)
 
 	r := &reconciler{
