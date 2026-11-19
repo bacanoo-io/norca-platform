@@ -205,7 +205,7 @@ func TestLoadBalancer_Lifecycle(t *testing.T) {
 	job := e.b.GetJob("default", "lb-web")
 	must.Eq(t, "default/crd/norca-io/LoadBalancer/web", job.Meta[controller.OwnerMetaKey])
 	must.Eq(t, 8080, job.TaskGroups[0].Networks[0].ReservedPorts[0].Value)
-	must.Eq(t, "raw_exec", job.TaskGroups[0].Tasks[0].Driver)
+	must.Eq(t, "exec", job.TaskGroups[0].Tasks[0].Driver)
 	must.Eq(t, "10.0.0.1:8001\n10.0.0.2:8002", e.targetsVar("lb-web"))
 
 	// Not ready until the proxy runs.

@@ -64,11 +64,11 @@ type NomadProviderConfig struct {
 	// JobPrefix is prepended to the object name to form the job ID.
 	JobPrefix string
 
-	// Driver of the proxy task: raw_exec, exec or docker (mock_driver for
-	// tests on dev agents).
+	// Driver of the proxy task: exec (the default), raw_exec or docker
+	// (mock_driver for tests on dev agents).
 	Driver string
 
-	// Command is the path of this binary on the nodes (raw_exec, exec).
+	// Command is the path of this binary on the nodes (exec, raw_exec).
 	Command string
 
 	// Image is the container image with this binary (docker).
@@ -93,7 +93,7 @@ func newNomadProvider(cfg NomadProviderConfig, backend controller.Backend, clust
 		cfg.JobPrefix = "lb-"
 	}
 	if cfg.Driver == "" {
-		cfg.Driver = "raw_exec"
+		cfg.Driver = "exec"
 	}
 	switch cfg.Driver {
 	case "raw_exec", "exec":

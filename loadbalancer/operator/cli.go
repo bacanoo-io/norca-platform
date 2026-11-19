@@ -167,8 +167,8 @@ func runController(ctx context.Context, args []string) error {
 	fs.BoolVar(&f.classAllowHTTP, "class-allow-http", false, "accept http endpoints of registered providers (development only)")
 	fs.StringVar(&f.classTokenNS, "class-token-namespace", systemNamespace, "namespace of the Variables holding the tokens of registered providers")
 	fs.StringVar(&f.provider.JobPrefix, "job-prefix", "lb-", "prefix of the proxy job IDs")
-	fs.StringVar(&f.provider.Driver, "proxy-driver", "raw_exec", "task driver of the proxy jobs: raw_exec, exec or docker")
-	fs.StringVar(&f.provider.Command, "proxy-command", self, "path of this binary on the nodes (raw_exec, exec)")
+	fs.StringVar(&f.provider.Driver, "proxy-driver", "exec", "task driver of the proxy jobs: exec, raw_exec or docker")
+	fs.StringVar(&f.provider.Command, "proxy-command", self, "path of this binary on the nodes (exec, raw_exec)")
 	fs.StringVar(&f.provider.Image, "proxy-image", "", "container image with this binary (docker)")
 	fs.StringVar(&f.provider.ManagedBy, "managed-by", controller.ManagedByFromEnv(),
 		"identity protecting the proxy jobs from changes by others (default: this task's job, workload:<namespace>/<job>)")
