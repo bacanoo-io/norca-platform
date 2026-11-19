@@ -26,13 +26,14 @@ const systemNamespace = "norca-system"
 
 // Settings are the flags of norca-dns.
 type Settings struct {
-	Namespace      string
-	Workers        int
-	Resync         time.Duration
-	Requeue        time.Duration
-	LeaderElection bool
-	LeaseNamespace string
-	MetricsAddr    string
+	Namespace       string
+	Workers         int
+	Resync          time.Duration
+	Requeue         time.Duration
+	ConflictRequeue time.Duration
+	LeaderElection  bool
+	LeaseNamespace  string
+	MetricsAddr     string
 
 	ZoneTokenNamespace string
 	ZoneTTL            time.Duration
@@ -47,6 +48,7 @@ func (s *Settings) register(fs *flag.FlagSet) {
 	fs.IntVar(&s.Workers, "workers", 2, "records reconciled at once")
 	fs.DurationVar(&s.Resync, "resync", 10*time.Minute, "time between two full looks at every record")
 	fs.DurationVar(&s.Requeue, "requeue", 5*time.Minute, "time after which a record is compared with its zone again (finds changes made in the zone by hand)")
+	fs.DurationVar(&s.ConflictRequeue, "conflict-requeue", 10*time.Second, "with -namespace other than \"*\": how often a record whose name a record of another namespace holds is looked at again")
 	fs.BoolVar(&s.LeaderElection, "leader-election", false, "run several instances, one of them active")
 	fs.StringVar(&s.LeaseNamespace, "lease-namespace", systemNamespace, "namespace of the leader election lease")
 	fs.StringVar(&s.MetricsAddr, "metrics-addr", "", "address of the Prometheus metrics endpoint (empty: off)")
@@ -63,8 +65,8 @@ func (s *Settings) validate() error {
 		return errors.New("-namespace must not be empty")
 	case s.Workers < 1:
 		return errors.New("-workers must be at least 1")
-	case s.Resync <= 0 || s.Requeue <= 0 || s.ZoneTTL <= 0:
-		return errors.New("-resync, -requeue and -zone-ttl must be positive")
+	case s.Resync <= 0 || s.Requeue <= 0 || s.ConflictRequeue <= 0 || s.ZoneTTL <= 0:
+		return errors.New("-resync, -requeue, -conflict-requeue and -zone-ttl must be positive")
 	}
 	return nil
 }
@@ -129,11 +131,12 @@ func Run(ctx context.Context, args []string, version string) error {
 			now:            time.Now,
 			cacheFor:       15 * time.Second,
 		},
-		logger:         logger,
-		now:            time.Now,
-		namespace:      s.Namespace,
-		requeueReady:   s.Requeue,
-		requeueWaiting: time.Minute,
+		logger:          logger,
+		now:             time.Now,
+		namespace:       s.Namespace,
+		requeueReady:    s.Requeue,
+		requeueWaiting:  time.Minute,
+		requeueConflict: s.ConflictRequeue,
 	}
 	opts := controller.Options{
 		Name:         "norca-dns",
@@ -154,6 +157,7 @@ func Run(ctx context.Context, args []string, version string) error {
 		return err
 	}
 	r.ctrl = c
+	r.watchHandovers()
 	logger.Info("norca-dns started", "version", version, "namespace", s.Namespace)
 	return c.Run(ctx)
 }

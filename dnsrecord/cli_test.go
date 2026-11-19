@@ -6,6 +6,7 @@ package dnsrecord
 import (
 	"flag"
 	"testing"
+	"time"
 
 	"github.com/shoenig/test/must"
 )
@@ -22,4 +23,16 @@ func TestSettings_Defaults(t *testing.T) {
 	must.Eq(t, "norca-system", s.LeaseNamespace)
 	must.Eq(t, "norca-system", s.ZoneTokenNamespace)
 	must.NoError(t, s.validate())
+}
+
+// -conflict-requeue (MUK-12) is 10s by default and must be positive.
+func TestSettings_ConflictRequeue(t *testing.T) {
+	var s Settings
+	fs := flag.NewFlagSet("norca-dns", flag.ContinueOnError)
+	s.register(fs)
+	must.NoError(t, fs.Parse(nil))
+	must.Eq(t, 10*time.Second, s.ConflictRequeue)
+
+	must.NoError(t, fs.Parse([]string{"-conflict-requeue", "0s"}))
+	must.ErrorContains(t, s.validate(), "-conflict-requeue")
 }

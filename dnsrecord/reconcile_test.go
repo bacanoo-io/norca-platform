@@ -177,6 +177,7 @@ func newOperatorIn(t *testing.T, namespace string, records bool, zoneParams ...m
 	})
 	must.NoError(t, err)
 	r.ctrl = c
+	r.watchHandovers()
 	return &env{t: t, b: b, cluster: cluster, zone: z.Provider.(*mock.DNS), r: r, failDeletes: failDeletes,
 		recordsOff: recordsOff, forbidDeletes: forbidDeletes, zoneURL: srv.URL}, c
 }

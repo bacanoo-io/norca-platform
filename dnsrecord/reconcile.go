@@ -46,6 +46,13 @@ type reconciler struct {
 	// produces no event (a zone's heartbeat, the namespace's allow list) is
 	// looked at again.
 	requeueWaiting time.Duration
+
+	// requeueConflict is how soon a record that an operator of one namespace
+	// keeps is looked at again while a record of another namespace holds or
+	// claims its name: the informer of this operator does not see that
+	// record give the name up (MUK-12). A record of its own informer that
+	// gives it up enqueues the waiting records at once (watchHandovers).
+	requeueConflict time.Duration
 }
 
 // outcome is what a reconcile found, for the status.
@@ -161,7 +168,11 @@ func (r *reconciler) keep(ctx context.Context, obj *controller.Object, status *S
 			r.logger.Info("another record holds the name and type of a record", "record", obj.Key.String(),
 				"holder", other.String(), "name", spec.Name, "type", spec.Type)
 		}
-		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, r.requeueWaiting, nil
+		requeue := r.requeueWaiting
+		if r.namespace != "*" && other.Namespace != obj.Key.Namespace && r.requeueConflict > 0 {
+			requeue = min(requeue, r.requeueConflict)
+		}
+		return outcome{reason: ConditionConflict, message: msg, conflict: msg}, requeue, nil
 	}
 
 	values, why, gone, err := r.values(ctx, obj, spec)
