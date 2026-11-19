@@ -89,7 +89,8 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if owner, taken := p.ports[req.Port]; taken && owner != req.Ref {
-		return lb.State{}, lb.Invalid("port %d is used by load balancer %s", req.Port, owner)
+		p.logger.Info("a frontend port is taken", "port", req.Port, "loadbalancer", req.Ref.String(), "owner", owner.String())
+		return lb.State{}, lb.Invalid("port %d is used by %s", req.Port, owner.DescribeTo(req.Ref))
 	}
 
 	curLB := p.lbs[req.Ref]

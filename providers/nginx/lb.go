@@ -226,7 +226,7 @@ func (p *Provider) Ensure(ctx context.Context, req lb.Request) (lb.State, error)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if owner, taken := p.listeners[listener]; taken && owner != req.Ref {
-		return lb.State{}, lb.Invalid("port %d on %s is used by load balancer %s", req.Port, listenAddr, owner)
+		return lb.State{}, lb.Invalid("port %d on %s is used by %s", req.Port, listenAddr, owner.DescribeTo(req.Ref))
 	}
 
 	path := p.fileFor(req.Ref)

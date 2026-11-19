@@ -38,6 +38,19 @@ type Ref struct {
 
 func (r Ref) String() string { return r.Namespace + "/" + r.Name }
 
+// DescribeTo names the load balancer r in a message for the owner of the
+// load balancer viewer, for example why a port is taken: by its name when
+// both are in one namespace, and only as a load balancer of another
+// namespace otherwise. The status and the events of a LoadBalancer are read
+// by the team of its namespace, which does not learn the namespaces and
+// load balancers of the others from them (review finding PLD-4).
+func (r Ref) DescribeTo(viewer Ref) string {
+	if r.Namespace == viewer.Namespace {
+		return "load balancer " + r.Name
+	}
+	return "a load balancer of another namespace"
+}
+
 // Target is a healthy instance of the service behind a load balancer.
 type Target struct {
 	Address string

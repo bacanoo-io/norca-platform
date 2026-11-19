@@ -137,8 +137,17 @@ func TestPortConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := p.Ensure(context.Background(), request("b", 443, "10.0.0.1:1"))
-	if !errors.Is(err, lb.ErrInvalid) || !strings.Contains(err.Error(), "default/a") {
+	if !errors.Is(err, lb.ErrInvalid) || !strings.Contains(err.Error(), "used by load balancer a") {
 		t.Fatalf("a second load balancer on the same port: %v", err)
+	}
+	// A load balancer of another namespace is not named (PLD-4): the
+	// message reaches the team of that namespace.
+	other := request("c", 443, "10.0.0.1:1")
+	other.Ref.Namespace = "team-b"
+	_, err = p.Ensure(context.Background(), other)
+	if !errors.Is(err, lb.ErrInvalid) || !strings.Contains(err.Error(), "a load balancer of another namespace") ||
+		strings.Contains(err.Error(), "default") {
+		t.Fatalf("a load balancer of another namespace on the same port: %v", err)
 	}
 
 	// Moving the first one frees the port.

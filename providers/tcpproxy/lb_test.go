@@ -165,8 +165,17 @@ func TestPortChangeDeleteAndConflict(t *testing.T) {
 		Ref: lb.Ref{Namespace: "default", Name: "other"}, Port: first,
 		Params: params.Values{"dial_timeout": time.Second},
 	})
-	if !errors.Is(err, lb.ErrInvalid) {
+	if !errors.Is(err, lb.ErrInvalid) || !strings.Contains(err.Error(), "used by load balancer web") {
 		t.Fatalf("a taken port: %v", err)
+	}
+	// A load balancer of another namespace is not named (PLD-4).
+	_, err = p.Ensure(context.Background(), lb.Request{
+		Ref: lb.Ref{Namespace: "team-b", Name: "other"}, Port: first,
+		Params: params.Values{"dial_timeout": time.Second},
+	})
+	if !errors.Is(err, lb.ErrInvalid) || !strings.Contains(err.Error(), "a load balancer of another namespace") ||
+		strings.Contains(err.Error(), "web") {
+		t.Fatalf("a port taken in another namespace: %v", err)
 	}
 
 	// Moving to another port frees the first one.
