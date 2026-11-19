@@ -52,8 +52,9 @@ type authority interface {
 	// FetchCert returns the chain of an order that is valid.
 	FetchCert(ctx context.Context, certURL string) ([][]byte, error)
 
-	// Revoke revokes a certificate (DER) the account issued.
-	Revoke(ctx context.Context, cert []byte) error
+	// Revoke revokes a certificate (DER) the account issued, for the
+	// reason (RFC 8555, section 7.6).
+	Revoke(ctx context.Context, cert []byte, reason xacme.CRLReasonCode) error
 
 	// RenewalInfo returns when the certificate authority suggests to renew
 	// the certificate (RFC 9773); ok is false if it says nothing.
@@ -176,8 +177,8 @@ func (a *acmeAuthority) FetchCert(ctx context.Context, certURL string) ([][]byte
 	return a.client.FetchCert(ctx, certURL, true)
 }
 
-func (a *acmeAuthority) Revoke(ctx context.Context, cert []byte) error {
-	return a.client.RevokeCert(ctx, nil, cert, xacme.CRLReasonUnspecified)
+func (a *acmeAuthority) Revoke(ctx context.Context, cert []byte, reason xacme.CRLReasonCode) error {
+	return a.client.RevokeCert(ctx, nil, cert, reason)
 }
 
 // RenewalInfo asks the renewalInfo resource of the certificate authority

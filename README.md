@@ -602,7 +602,7 @@ certificate and reads no secret of a namespace.**
 | HTTP-01 | For every other name. The operator answers `/.well-known/acme-challenge/<token>` on `-http01-listen`; the edge must route that path of every host to it, also on the port that redirects to https. |
 | Failures | A request the certificate authority refuses fails the order with its problem, which the certificate shows. Its own failures and rate limits are tried again after `-retry-base`, doubled up to `-retry-max`, `-max-attempts` times. |
 | Renewal | The suggestion of the certificate authority (ACME renewal information, RFC 9773) is passed on as `renew_after` of the order. |
-| Revocation | The operator keeps the certificates it issued until they expire (`norca-acme/issued/<issuer>/<serial>`) and revokes the one a revocation order names. |
+| Revocation | The operator keeps the certificates it issued until they expire (`norca-acme/issued/<issuer>/<serial>`) and revokes the one a revocation order names, for the `reason` of the order (the name of an RFC 5280 CRLReason a subscriber may give: `unspecified`, `keyCompromise`, `affiliationChanged`, `superseded`, `cessationOfOperation`; none, or one it does not know, is unspecified). A reason the certificate authority refuses (`badRevocationReason`) is dropped: the certificate is revoked once more without it. |
 | Restart | The order of the certificate authority is in the status of the object; an open challenge is presented again. **Run one instance**: the HTTP-01 answers are in its memory. |
 
 The ACL policy is `certificate/acme/norca-acme-policy.hcl`. The TLS-ALPN-01

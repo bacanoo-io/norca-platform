@@ -212,6 +212,7 @@ type fakeCA struct {
 	authzs   map[string]*xacme.Authorization
 	placed   int
 	revoked  [][]byte
+	reasons  []xacme.CRLReasonCode
 
 	// lastKey is the key of the account opened last.
 	lastKey crypto.Signer
@@ -434,13 +435,14 @@ func (ca *fakeCA) FetchCert(_ context.Context, certURL string) ([][]byte, error)
 	return o.chain, nil
 }
 
-func (ca *fakeCA) Revoke(_ context.Context, cert []byte) error {
+func (ca *fakeCA) Revoke(_ context.Context, cert []byte, reason xacme.CRLReasonCode) error {
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
 	if err := ca.next("revoke"); err != nil {
 		return err
 	}
 	ca.revoked = append(ca.revoked, cert)
+	ca.reasons = append(ca.reasons, reason)
 	return nil
 }
 
