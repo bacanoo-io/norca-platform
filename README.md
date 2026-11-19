@@ -27,6 +27,17 @@ balancers and DNS challenge records with the same credentials.
   their orders, and proves the names over HTTP or through the provider of a
   **DNS zone**.
 
+**The operators run in the operations namespace `norca-system`.** Their
+jobs, leases and secrets and the token Variables of the providers are there
+by default, the flags of the binaries and the examples here as much as the
+operator packs of the registry; the objects they serve stay in the
+namespaces of the teams. Give rights in `norca-system` to the operators of
+the cluster only. The namespace must exist (norca-deployer creates it):
+
+```shell
+norca namespace apply -description "Norca operators" norca-system
+```
+
 ## Layout
 
 ```
@@ -295,7 +306,8 @@ a class (and the shared ones) in `spec.parameters` of the
 - **The token** of a provider (`token`, `env:NAME` and `file:/path`
   resolved, or `token_file`) is required of every call to its node provider
   and its classes, as `Authorization: Bearer`; `token_variable` is the
-  Variable in Norca (item `token`) the operators read to send it. Without a
+  Variable in Norca (item `token`, in the namespace `norca-system`) the
+  operators read to send it. Without a
   token the provider needs `no_auth` (a trusted network only).
 - A class may limit itself: `internal: false` offers only public load
   balancers, `internal: true` requires a type that can make internal ones,
@@ -325,7 +337,7 @@ complete job; the `Dockerfile` builds a `FROM scratch` image (the docker
 platform needs the docker CLI and runs on the host).
 
 ```shell
-norca var put providers/hetzner-eu token="$PROVIDER_TOKEN"
+norca var put -namespace norca-system providers/hetzner-eu token="$PROVIDER_TOKEN"
 norca-provider -config providers.json
 ```
 
