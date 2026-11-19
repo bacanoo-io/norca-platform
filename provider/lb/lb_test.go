@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -187,8 +188,15 @@ func TestClient_Errors(t *testing.T) {
 	}
 	m.fail = errors.New("the cloud is down")
 	_, err = c.Ensure(context.Background(), ref, lb.EnsureRequest{Port: 80})
-	if !errors.As(err, &re) || re.Invalid() || re.Status != http.StatusBadGateway || err.Error() != "answered 502: the cloud is down" {
+	if !errors.As(err, &re) || re.Invalid() || re.Conflict() || re.Status != http.StatusBadGateway || err.Error() != "answered 502: the cloud is down" {
 		t.Fatalf("failure: %v", err)
+	}
+	// A cloud resource under the name that is not the load balancer's own.
+	m.fail = fmt.Errorf("ensure: %w", lb.Conflict("the cloud load balancer is not ours"))
+	_, err = c.Ensure(context.Background(), ref, lb.EnsureRequest{Port: 80})
+	if !errors.As(err, &re) || !re.Conflict() || re.Invalid() || re.Status != http.StatusConflict ||
+		re.Reason != lb.ReasonConflict || !strings.Contains(re.Message, "is not ours") {
+		t.Fatalf("conflict: %#v", err)
 	}
 
 	// A provider that does not know the load balancer (404) has nothing to

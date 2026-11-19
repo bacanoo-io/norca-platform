@@ -54,6 +54,12 @@ func (e *ResponseError) Invalid() bool {
 	return e.Reason == wire.ReasonInvalid || e.Status == http.StatusUnprocessableEntity
 }
 
+// Conflict reports whether the provider refused the request because the
+// cloud resource of the load balancer belongs to someone else (ErrConflict).
+func (e *ResponseError) Conflict() bool {
+	return e.Reason == ReasonConflict || e.Status == http.StatusConflict
+}
+
 // Ensure creates or updates a load balancer and returns its state.
 func (c *Client) Ensure(ctx context.Context, ref Ref, req EnsureRequest) (*EnsureResponse, error) {
 	if req.Name == "" {

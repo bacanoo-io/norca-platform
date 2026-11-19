@@ -42,6 +42,7 @@ type fakeProvider struct {
 	auth     []string
 	ready    bool
 	failPuts bool
+	conflict bool
 }
 
 func newFakeProvider(t *testing.T) *fakeProvider {
@@ -61,6 +62,14 @@ func (p *fakeProvider) handler() http.HandlerFunc {
 		case http.MethodPut:
 			if p.failPuts {
 				http.Error(w, "cloud API down", http.StatusBadGateway)
+				return
+			}
+			if p.conflict {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"reason": lb.ReasonConflict, "error": "conflict: the cloud load balancer was not created for this load balancer",
+				})
 				return
 			}
 			body, _ := io.ReadAll(r.Body)
@@ -254,6 +263,32 @@ func TestLoadBalancerClass_ProviderFailure(t *testing.T) {
 	must.False(t, e.nativeStatus(t, "web").IsTrue(controller.ConditionReady))
 
 	prov.setFail(false)
+	waitFor(t, "ready", func() bool { return e.nativeStatus(t, "web").IsTrue(controller.ConditionReady) })
+}
+
+// TestLoadBalancerClass_ProviderConflict: a provider that finds a cloud
+// resource under the name of the load balancer that is not its own (review
+// finding ATM-19) answers a conflict, which the status shows; the object is
+// looked at again until the resource is gone.
+func TestLoadBalancerClass_ProviderConflict(t *testing.T) {
+	e := startOperatorWith(t, false, controller.StorageNative)
+	prov := newFakeProvider(t)
+	prov.mu.Lock()
+	prov.conflict = true
+	prov.mu.Unlock()
+	e.putClass("hcloud-lb", map[string]any{"endpoint": prov.srv.URL})
+	e.cluster.setTargets("default", "web", Target{Address: "10.0.0.1", Port: 8001})
+	e.putNativeLB("web", map[string]any{"service": "web", "port": 443, "class": "hcloud-lb"})
+
+	msg := e.waitReason(t, "web", "Conflict")
+	must.StrContains(t, msg, "answered 409")
+	must.StrContains(t, msg, "was not created for this load balancer")
+	st := e.nativeStatus(t, "web")
+	must.True(t, st.IsTrue(controller.ConditionDegraded))
+
+	prov.mu.Lock()
+	prov.conflict = false
+	prov.mu.Unlock()
 	waitFor(t, "ready", func() bool { return e.nativeStatus(t, "web").IsTrue(controller.ConditionReady) })
 }
 

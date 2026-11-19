@@ -121,11 +121,14 @@ type Provider interface {
 	// Ensure creates or updates the load balancer so that it forwards to
 	// the targets. It must be idempotent. An error wrapping ErrInvalid
 	// means the request cannot be satisfied (the operator does not retry it
-	// with the same input); any other error is a failure to try again.
+	// with the same input). An error wrapping ErrConflict means a resource
+	// under the name of the load balancer exists that was not created for
+	// it; it is left alone. Any other error is a failure to try again.
 	Ensure(ctx context.Context, req Request) (State, error)
 
 	// Delete removes everything created for the load balancer. Deleting
-	// what does not exist is not an error.
+	// what does not exist is not an error, and neither is a resource under
+	// its name that was not created for it: that is left alone.
 	Delete(ctx context.Context, ref Ref) error
 }
 
@@ -140,6 +143,22 @@ var ErrInvalid = errors.New("invalid request")
 // Invalid returns an error wrapping ErrInvalid.
 func Invalid(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
+}
+
+// ReasonConflict is the reason of the failure of a request whose resource
+// belongs to someone else (ErrConflict); the handler answers it with 409.
+const ReasonConflict = "conflict"
+
+// ErrConflict marks a load balancer whose cloud resource exists under the
+// name the provider derives for it, but without the owner mark of the load
+// balancer: created by hand or for another load balancer. The provider
+// neither updates nor deletes it.
+var ErrConflict = errors.New("conflict")
+
+// Conflict returns an error wrapping ErrConflict. The message is shown to
+// the owner of the requesting load balancer, so it names no other owner.
+func Conflict(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrConflict, fmt.Sprintf(format, args...))
 }
 
 // Config is the input of the constructor of a type.

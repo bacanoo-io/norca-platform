@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bacanoo-io/norca-platform/provider/lb"
 	"github.com/bacanoo-io/norca/norca/api"
 	"github.com/bacanoo-io/norca/norca/controller"
 )
@@ -133,6 +134,11 @@ func (r *reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	slices.Sort(leaving)
 	res, err := provider.Ensure(ctx, obj, spec, targets)
 	if err != nil {
+		if re, ok := errors.AsType[*lb.ResponseError](err); ok && re.Conflict() {
+			// The cloud resource under the name of the load balancer is not
+			// its own: the provider leaves it alone until it is removed.
+			return r.failRetry(ctx, obj, &status, "Conflict", err.Error(), true)
+		}
 		r.ctrl.Recorder().Event(ctx, key, controller.EventTypeWarning, "ProvisioningFailed", err.Error())
 		return 0, err
 	}

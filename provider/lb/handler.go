@@ -88,9 +88,12 @@ func (h *handler) put(w http.ResponseWriter, r *http.Request) {
 	state, err := h.c.Provider.Ensure(ctx, req)
 	if err != nil {
 		h.log.Warn("ensure failed", "class", h.c.Name, "loadbalancer", ref.String(), "error", err)
-		if errors.Is(err, ErrInvalid) {
+		switch {
+		case errors.Is(err, ErrInvalid):
 			wire.WriteError(w, http.StatusUnprocessableEntity, wire.ReasonInvalid, err.Error())
-		} else {
+		case errors.Is(err, ErrConflict):
+			wire.WriteError(w, http.StatusConflict, ReasonConflict, err.Error())
+		default:
 			wire.WriteError(w, http.StatusBadGateway, wire.ReasonError, err.Error())
 		}
 		return
