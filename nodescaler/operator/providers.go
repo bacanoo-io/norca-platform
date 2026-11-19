@@ -43,6 +43,10 @@ type providers struct {
 	http *http.Client
 	now  func() time.Time
 
+	// leading fences the calls that create and delete instances
+	// (Config.Leading).
+	leading func(ctx context.Context) error
+
 	// cacheFor is how long a listing is reused.
 	cacheFor time.Duration
 	mu       sync.Mutex
@@ -133,7 +137,7 @@ func (p *providers) clientOf(ctx context.Context, reg *registeredProvider) (*pro
 	if err != nil {
 		return nil, err
 	}
-	return &provider.Client{Endpoint: reg.Endpoint, Token: token, HTTP: p.http}, nil
+	return &provider.Client{Endpoint: reg.Endpoint, Token: token, HTTP: p.http, Fence: p.leading}, nil
 }
 
 // token reads the item "token" of the Variable the provider names.

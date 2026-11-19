@@ -91,6 +91,15 @@ type Config struct {
 	// bootstrap. It needs Bootstrap.
 	Join JoinIssuer
 
+	// Leading is the fence of the side effects of a reconcile (review
+	// finding CON-6b): it is called right before every call that creates or
+	// deletes an instance, every write of a node (drain, eligibility, purge,
+	// meta), status write and event, and the removal of the finalizer, and
+	// an error it returns (wrapping controller.ErrNotLeader) stops the
+	// write. Set it to controller.Controller.Leading of the controller that
+	// runs the reconciler; nil writes always (no leader election).
+	Leading func(ctx context.Context) error
+
 	Logger *slog.Logger
 	Now    func() time.Time
 }
@@ -139,17 +148,29 @@ func NewReconciler(backend controller.Backend, nodes NodeLister, cfg Config) *Re
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	return &Reconciler{
+	r := &Reconciler{
 		Objects: backend,
-		Nodes:   nodes,
 		cfg:     cfg,
 		log:     cfg.Logger,
 		now:     cfg.Now,
-		providers: &providers{
-			objs: backend, vars: backend, ttl: cfg.ProviderTTL, tokenNamespace: cfg.TokenNamespace,
-			allowHTTP: cfg.AllowHTTP, http: cfg.HTTP, now: cfg.Now, cacheFor: 3 * time.Second,
-		},
 	}
+	// The fence is read at every call, so a test can set it later.
+	r.Nodes = fencedNodes{NodeLister: nodes, leading: r.leading}
+	r.providers = &providers{
+		objs: backend, vars: backend, ttl: cfg.ProviderTTL, tokenNamespace: cfg.TokenNamespace,
+		allowHTTP: cfg.AllowHTTP, http: cfg.HTTP, now: cfg.Now, cacheFor: 3 * time.Second,
+		leading: r.leading,
+	}
+	return r
+}
+
+// leading is the fence of a side effect (Config.Leading): nil if the
+// operator may make it.
+func (r *Reconciler) leading(ctx context.Context) error {
+	if r.cfg.Leading == nil {
+		return nil
+	}
+	return r.cfg.Leading(ctx)
 }
 
 // observed is what the operator found for a group.
@@ -639,6 +660,11 @@ func reasonName(reason string) string {
 
 // event writes an event to the log of the group; a failure is logged only.
 func (r *Reconciler) event(ctx context.Context, obj *api.CustomObject, typ, reason, message string) {
+	if r.leading(ctx) != nil {
+		// An operator that may no longer lead says nothing: its events
+		// would be about what it did not do.
+		return
+	}
 	err := r.Objects.RecordObjectEvents(ctx, NodeGroupKind, obj.Namespace, obj.Name,
 		[]*api.ObjectEvent{{Type: typ, Reason: reason, Message: message}})
 	if err != nil {

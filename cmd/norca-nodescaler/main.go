@@ -204,6 +204,9 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	// The controller runs the reconciler; its leadership fences what the
+	// reconciler changes (set below, before the controller runs).
+	var ctrl *controller.Controller
 	rec := operator.NewReconciler(backend, &operator.APINodes{Client: client}, operator.Config{
 		Bootstrap:      boot,
 		Join:           joinIssuer,
@@ -216,12 +219,13 @@ func run(ctx context.Context, args []string) error {
 		DeleteOrphans:  f.deleteOrphans,
 		Metrics:        metrics,
 		Logger:         logger,
+		Leading:        func(ctx context.Context) error { return ctrl.Leading(ctx) },
 	})
 	var election *controller.LeaderElectionConfig
 	if f.leaderElection {
 		election = &controller.LeaderElectionConfig{Namespace: f.leaseNamespace, ReleaseOnCancel: true}
 	}
-	ctrl, err := controller.New(backend, rec, controller.Options{
+	ctrl, err = controller.New(backend, rec, controller.Options{
 		Name:    "nodescaler",
 		Kind:    operator.NodeGroupKind,
 		Storage: controller.StorageNative,

@@ -581,6 +581,72 @@ func TestReconcile_LostCreateAnswerCreatesOnce(t *testing.T) {
 	}
 }
 
+// An operator that may no longer lead asks the provider for nothing, drains
+// no node and writes no status (review finding CON-6b: a reconcile that went
+// on after the lease could pass to another instance created and deleted
+// machines).
+func TestReconcile_NotLeadingChangesNothing(t *testing.T) {
+	var refuse atomic.Bool
+	leading := func(context.Context) error {
+		if refuse.Load() {
+			return controller.ErrNotLeader
+		}
+		return nil
+	}
+	key := controller.ObjectKey{Name: "workers-dc1"}
+
+	t.Run("create", func(t *testing.T) {
+		refuse.Store(true)
+		e := newEnv(t, "")
+		e.r.cfg.Leading = leading
+		e.putGroup(2, nil)
+		_, err := e.r.Reconcile(context.Background(), key)
+		if n := len(e.instances()); n != 0 {
+			t.Fatalf("an operator that does not lead created %d instances", n)
+		}
+		if !errors.Is(err, controller.ErrNotLeader) {
+			t.Fatalf("error %v, want ErrNotLeader", err)
+		}
+		if st := e.status(); len(st) != 0 {
+			t.Fatalf("an operator that does not lead wrote the status: %+v", st)
+		}
+		if e.hasEvent("CreateFailed") {
+			t.Fatal("an operator that does not lead wrote an event")
+		}
+		refuse.Store(false)
+		e.reconcile()
+		if n := len(e.instances()); n != 2 {
+			t.Fatalf("instances of the leader: %d", n)
+		}
+	})
+
+	t.Run("scale down", func(t *testing.T) {
+		refuse.Store(false)
+		e, insts := grown(t, 2, nil)
+		e.r.cfg.Leading = leading
+		for _, inst := range insts {
+			e.nodes.setDetail("node-"+inst.Name, NodeDetail{Ready: true, Eligible: true, Allocs: allocs("web", 1)})
+		}
+		e.putGroup(1, nil)
+		refuse.Store(true)
+		_, err := e.r.Reconcile(context.Background(), key)
+		if len(e.nodes.drains) != 0 || len(e.instances()) != 2 {
+			t.Fatalf("an operator that does not lead drained %v, instances %d", e.nodes.drains, len(e.instances()))
+		}
+		if !errors.Is(err, controller.ErrNotLeader) {
+			t.Fatalf("error %v, want ErrNotLeader", err)
+		}
+		if removalOf(e.status()) != nil {
+			t.Fatalf("an operator that does not lead wrote a removal: %+v", e.status())
+		}
+		refuse.Store(false)
+		e.reconcile()
+		if len(e.nodes.drains) != 1 {
+			t.Fatalf("drains of the leader: %v", e.nodes.drains)
+		}
+	})
+}
+
 func TestReconcile_Token(t *testing.T) {
 	e := newEnv(t, "s3cret")
 	e.registerProvider(e.now, "nodescaler/mock/token")

@@ -50,6 +50,12 @@ func (r *Reconciler) writeStatus(ctx context.Context, obj *api.CustomObject, set
 		if reflect.DeepEqual(status, normalize(obj.Status)) {
 			return nil
 		}
+		// A status write after a conflict goes over what another writer
+		// wrote (the read below): only the leader writes (review finding
+		// CON-6b).
+		if err := r.leading(ctx); err != nil {
+			return err
+		}
 		_, err := r.Objects.UpdateObjectStatus(ctx, NodeGroupKind, obj.Namespace, obj.Name, status, obj.ModifyIndex)
 		if err == nil || !errors.Is(err, controller.ErrConflict) || attempt >= maxStatusRetries {
 			if err != nil {

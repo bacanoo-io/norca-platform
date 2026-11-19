@@ -272,6 +272,9 @@ func (r *Reconciler) deletionStatus(ctx context.Context, obj *api.CustomObject, 
 
 // release removes the finalizer: the object goes.
 func (r *Reconciler) release(ctx context.Context, obj *api.CustomObject) error {
+	if err := r.leading(ctx); err != nil {
+		return err
+	}
 	_, err := r.Objects.UpdateObjectFinalizers(ctx, NodeGroupKind, obj.Namespace, obj.Name, nil, []string{Finalizer}, 0)
 	if errors.Is(err, controller.ErrNotFound) {
 		return nil

@@ -70,6 +70,65 @@ type NodeLister interface {
 	AllocServices(ctx context.Context, alloc NodeAlloc) ([]string, time.Duration, error)
 }
 
+// fencedNodes makes the writes of a NodeLister only while the fence lets
+// them (Config.Leading; review finding CON-6b): a drain, an eligibility
+// change, a purge or a meta change of an operator that no longer leads could
+// undo what the leader does. A write method added to NodeLister needs its
+// fence here too.
+type fencedNodes struct {
+	NodeLister
+	leading func(ctx context.Context) error
+}
+
+func (f fencedNodes) SetIneligible(ctx context.Context, nodeID string) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.SetIneligible(ctx, nodeID)
+}
+
+func (f fencedNodes) Drain(ctx context.Context, nodeID string, deadline time.Duration) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.Drain(ctx, nodeID, deadline)
+}
+
+func (f fencedNodes) CancelDrain(ctx context.Context, nodeID string) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.CancelDrain(ctx, nodeID)
+}
+
+func (f fencedNodes) StopDrain(ctx context.Context, nodeID string) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.StopDrain(ctx, nodeID)
+}
+
+func (f fencedNodes) SetEligible(ctx context.Context, nodeID string) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.SetEligible(ctx, nodeID)
+}
+
+func (f fencedNodes) Purge(ctx context.Context, nodeID string) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.Purge(ctx, nodeID)
+}
+
+func (f fencedNodes) SetMeta(ctx context.Context, nodeID string, meta map[string]*string) error {
+	if err := f.leading(ctx); err != nil {
+		return err
+	}
+	return f.NodeLister.SetMeta(ctx, nodeID, meta)
+}
+
 // ErrNodeNotFound is returned for a node that does not exist.
 var ErrNodeNotFound = errors.New("node not found")
 

@@ -27,6 +27,12 @@ type Client struct {
 	// HTTP is the client of the calls; nil uses one with a 30 second
 	// timeout.
 	HTTP *http.Client
+
+	// Fence, if set, is called with the context of a call that changes the
+	// platform (Create, Delete) right before it; an error it returns is
+	// returned and the call is not made. The node scaling operator fences
+	// them with its leadership (controller.Controller.Leading).
+	Fence func(ctx context.Context) error
 }
 
 var defaultHTTP = &http.Client{Timeout: 30 * time.Second}
@@ -51,6 +57,9 @@ func (c *Client) Group(ctx context.Context, group string, params map[string]any)
 
 // Create asks for the instances of a request.
 func (c *Client) Create(ctx context.Context, group string, req CreateRequest) ([]Instance, error) {
+	if err := c.fence(ctx); err != nil {
+		return nil, err
+	}
 	var resp CreateResponse
 	if err := c.do(ctx, http.MethodPost, "/v1/groups/"+url.PathEscape(group)+"/instances", req, &resp); err != nil {
 		return nil, err
@@ -60,7 +69,17 @@ func (c *Client) Create(ctx context.Context, group string, req CreateRequest) ([
 
 // Delete deletes an instance.
 func (c *Client) Delete(ctx context.Context, group, id string) error {
+	if err := c.fence(ctx); err != nil {
+		return err
+	}
 	return c.do(ctx, http.MethodDelete, "/v1/groups/"+url.PathEscape(group)+"/instances/"+url.PathEscape(id), nil, nil)
+}
+
+func (c *Client) fence(ctx context.Context) error {
+	if c.Fence == nil {
+		return nil
+	}
+	return c.Fence(ctx)
 }
 
 // do makes a call. A 404 is ErrUnknownGroup; another failure with a reason
