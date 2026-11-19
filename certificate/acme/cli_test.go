@@ -22,8 +22,8 @@ func TestSettings_Defaults(t *testing.T) {
 	if err := fs.Parse(nil); err != nil {
 		t.Fatal(err)
 	}
-	if s.SecretNamespace != "norca-system" || s.ZoneTokenNamespace != "norca-system" {
-		t.Fatalf("namespaces: secrets %q, zone tokens %q", s.SecretNamespace, s.ZoneTokenNamespace)
+	if s.SecretNamespace != "norca-system" || s.ZoneTokenNamespace != "norca-system" || s.LeaseNamespace != "norca-system" {
+		t.Fatalf("namespaces: secrets %q, zone tokens %q, lease %q", s.SecretNamespace, s.ZoneTokenNamespace, s.LeaseNamespace)
 	}
 	if err := s.validate(); err != nil {
 		t.Fatal(err)

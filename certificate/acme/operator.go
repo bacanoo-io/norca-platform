@@ -105,6 +105,56 @@ type Operator struct {
 	tokens map[string][]string
 	// waiting is since when an order waits for its DNS records.
 	waiting map[string]time.Time
+
+	// leading is the fence of the side effects (fence); nil: the operator
+	// runs without leader election.
+	leading func(ctx context.Context) error
+}
+
+// run makes a pass every interval until ctx ends. With an elector the passes
+// run only while this instance leads, and every side effect is fenced by
+// the leadership (review finding CON-6b: two instances, such as an
+// allocation that was lost but still runs and its replacement, worked on
+// the same orders).
+func (o *Operator) run(ctx context.Context, every time.Duration, elector *controller.LeaderElector) {
+	passes := func(ctx context.Context) {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			err := o.Pass(ctx)
+			switch {
+			case err == nil || ctx.Err() != nil:
+			case errors.Is(err, controller.ErrNotLeader):
+				o.log().Info("pass stopped: this instance may no longer lead", "error", err)
+			default:
+				o.log().Warn("pass failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}
+	if elector == nil {
+		passes(ctx)
+		return
+	}
+	o.leading = elector.Leading
+	elector.Run(ctx, passes, nil)
+}
+
+// fence is called right before a side effect that no check-and-set
+// protects: a call that changes something at the certificate authority, a
+// challenge record, a write of the operator's secrets or of the status of an
+// issuer. It returns an error wrapping controller.ErrNotLeader when another
+// instance may lead (controller.LeaderElector.Leading); the side effect is
+// not made then.
+func (o *Operator) fence(ctx context.Context) error {
+	if o.leading == nil {
+		return nil
+	}
+	return o.leading(ctx)
 }
 
 // account is the account of an issuer at its certificate authority.
@@ -155,6 +205,9 @@ func (o *Operator) Pass(ctx context.Context) error {
 		_ = decode(obj.Status, &is.status)
 		if cfgErr == nil {
 			is.account, cfgErr = o.account(ctx, obj.Name, cfg)
+		}
+		if errors.Is(cfgErr, controller.ErrNotLeader) {
+			return cfgErr
 		}
 		if cfgErr != nil {
 			o.log().Warn("the issuer is not available", "issuer", obj.Name, "error", cfgErr)
@@ -244,6 +297,9 @@ func (o *Operator) account(ctx context.Context, name string, cfg IssuerConfig) (
 		// only over the secret that was read, so a key another instance of
 		// the operator (a rolling update runs two) stored meanwhile is
 		// never lost either: that key is used instead.
+		if err := o.fence(ctx); err != nil {
+			return nil, err
+		}
 		err = o.secrets.CheckedWrite(ctx, path, index, map[string]string{"key": encoded, "directory": cfg.Directory})
 		switch {
 		case errors.Is(err, errSecretConflict):
@@ -272,6 +328,11 @@ func (o *Operator) account(ctx context.Context, name string, cfg IssuerConfig) (
 			return nil, fmt.Errorf("the external account binding %s needs the items kid and hmac_key (base64url)", cfg.EABSecret)
 		}
 		req.EAB = &xacme.ExternalAccountBinding{KID: strings.TrimSpace(eab["kid"]), Key: hmacKey}
+	}
+	// Opening (or finding) the account is a call to the certificate
+	// authority.
+	if err := o.fence(ctx); err != nil {
+		return nil, err
 	}
 	auth, url, err := o.connect(ctx, req)
 	if err != nil {
@@ -346,6 +407,11 @@ func (o *Operator) writeIssuerStatus(ctx context.Context, is *issuer, problem st
 			return true
 		}
 	}
+	// The status of an issuer is written without check-and-set: only by
+	// the leader.
+	if o.fence(ctx) != nil {
+		return false
+	}
 	status, err := encode(want)
 	if err == nil {
 		err = o.cluster.UpdateStatus(ctx, IssuerKind, is.obj.Name, status, 0)
@@ -395,6 +461,12 @@ func (o *Operator) order(ctx context.Context, is *issuer, obj *api.CustomObject,
 	log := o.log().With("order", obj.Name, "issuer", is.obj.Name, "certificate", spec.Certificate)
 	var perm *permanentError
 	switch {
+	case errors.Is(err, controller.ErrNotLeader):
+		// The fence refused a side effect: nothing more was changed, and
+		// the attempt does not count. What the pass did before it (a
+		// presented record) is written with the check-and-set of the order,
+		// so the leader that goes on with the order knows it.
+		log.Info("order left to the leader", "error", err)
 	case err == nil:
 		o.cleanUp(ctx, obj.Name, st.Progress)
 		st.State, st.Problem, st.Progress = StateValid, "", nil
@@ -444,7 +516,11 @@ func (o *Operator) order(ctx context.Context, is *issuer, obj *api.CustomObject,
 func (o *Operator) cleanUp(ctx context.Context, order string, pr *Progress) {
 	if pr != nil {
 		for _, rec := range pr.Presented {
-			if err := o.zones.cleanUp(ctx, rec); err != nil {
+			err := o.fence(ctx)
+			if err == nil {
+				err = o.zones.cleanUp(ctx, rec)
+			}
+			if err != nil {
 				o.log().Warn("removing a challenge record failed", "order", order, "name", rec.Name, "error", err)
 			}
 		}
@@ -475,6 +551,9 @@ func (o *Operator) issue(ctx context.Context, is *issuer, orderName string, spec
 	pr := st.Progress
 
 	if pr.OrderURL == "" {
+		if err := o.fence(ctx); err != nil {
+			return err
+		}
 		order, err := auth.AuthorizeOrder(ctx, spec.DNSNames)
 		if err != nil {
 			return o.caError("placing the order", err)
@@ -499,6 +578,9 @@ func (o *Operator) issue(ctx context.Context, is *issuer, orderName string, spec
 	case xacme.StatusProcessing:
 		return errWait
 	case xacme.StatusReady:
+		if err := o.fence(ctx); err != nil {
+			return err
+		}
 		if der, err = auth.Finalize(ctx, order.FinalizeURL, block.Bytes); err != nil {
 			return o.caError("finalizing the order", err)
 		}
@@ -581,6 +663,9 @@ func (o *Operator) authorize(ctx context.Context, is *issuer, orderName string, 
 			}
 			rec := PresentedRecord{Zone: zone.Name, Name: dns.ChallengeName(name), Value: value}
 			if !slices.Contains(pr.Presented, rec) {
+				if err := o.fence(ctx); err != nil {
+					return err
+				}
 				if err := o.zones.present(ctx, rec); err != nil {
 					return fmt.Errorf("presenting the challenge record of %s: %w", name, err)
 				}
@@ -597,6 +682,9 @@ func (o *Operator) authorize(ctx context.Context, is *issuer, orderName string, 
 			}
 		}
 		if chal.Status == xacme.StatusPending {
+			if err := o.fence(ctx); err != nil {
+				return err
+			}
 			if err := auth.Accept(ctx, chal); err != nil {
 				return o.caError("accepting the challenge of "+name, err)
 			}
@@ -726,6 +814,9 @@ func (o *Operator) complete(ctx context.Context, is *issuer, st *OrderStatus, de
 	o.mu.Unlock()
 	// The servers check the chain against the roots of the issuer: they
 	// must be there before the chain is.
+	if err := o.fence(ctx); err != nil {
+		return err
+	}
 	if !o.writeIssuerStatus(ctx, is, "", true) {
 		return errors.New("the root of the chain could not be declared in the status of the issuer")
 	}
@@ -734,6 +825,9 @@ func (o *Operator) complete(ctx context.Context, is *issuer, st *OrderStatus, de
 	expires := leaf.NotAfter
 	path := o.secretPrefix + secretIssued + is.obj.Name + "/" + serial
 	leafPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}))
+	if err := o.fence(ctx); err != nil {
+		return err
+	}
 	if err := o.secrets.Write(ctx, path, map[string]string{"cert": leafPEM}, &expires); err != nil {
 		return fmt.Errorf("keeping the certificate for a revocation (%s): %w", path, err)
 	}
@@ -814,6 +908,9 @@ func (o *Operator) revoke(ctx context.Context, is *issuer, spec *OrderSpec) erro
 			"serial", spec.Revoke, "reason", spec.Reason)
 		reason = xacme.CRLReasonUnspecified
 	}
+	if err := o.fence(ctx); err != nil {
+		return err
+	}
 	err = is.account.authority.Revoke(ctx, block.Bytes, reason)
 	if acmeErr, ok := errors.AsType[*xacme.Error](err); ok && reason != xacme.CRLReasonUnspecified &&
 		strings.HasSuffix(acmeErr.ProblemType, ":badRevocationReason") {
@@ -821,6 +918,9 @@ func (o *Operator) revoke(ctx context.Context, is *issuer, spec *OrderSpec) erro
 		// revocation matters more than its reason.
 		o.log().Warn("the certificate authority refused the revocation reason, revoking without one",
 			"issuer", is.obj.Name, "serial", spec.Revoke, "reason", spec.Reason, "problem", acmeErr.Detail)
+		if err := o.fence(ctx); err != nil {
+			return err
+		}
 		err = is.account.authority.Revoke(ctx, block.Bytes, xacme.CRLReasonUnspecified)
 	}
 	if err != nil {

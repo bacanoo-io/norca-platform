@@ -4,20 +4,28 @@
 package acme
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	xacme "golang.org/x/crypto/acme"
 
 	"github.com/bacanoo-io/norca-platform/provider/dns"
+	"github.com/bacanoo-io/norca/norca/api"
+	"github.com/bacanoo-io/norca/norca/controller"
+	"github.com/bacanoo-io/norca/norca/controller/fake"
 )
 
 func leafOf(t *testing.T, st OrderStatus) *x509.Certificate {
@@ -580,6 +588,168 @@ func TestOrder_DeletedWhileOpen(t *testing.T) {
 	if e.op.responder.has("tok-1-0") {
 		t.Fatal("the answer of a deleted order is still served")
 	}
+}
+
+// An operator that may no longer lead changes nothing at the certificate
+// authority, in its secrets or in the status, and counts no attempt: the
+// leader goes on with the order (review finding CON-6b).
+func TestOrder_NotLeading(t *testing.T) {
+	e := newEnv(t)
+	refuse := true
+	e.op.leading = func(context.Context) error {
+		if refuse {
+			return fmt.Errorf("lease: %w", controller.ErrNotLeader)
+		}
+		return nil
+	}
+	e.issuer("ca", nil)
+	refused := func() {
+		t.Helper()
+		refuse = true
+		if err := e.op.Pass(t.Context()); !errors.Is(err, controller.ErrNotLeader) && err != nil {
+			t.Fatalf("a pass that does not lead: %v", err)
+		}
+		refuse = false
+	}
+
+	// No account is opened and no key is stored.
+	refused()
+	if e.ca.accounts != 0 || len(e.secrets.items) != 0 || e.cluster.statusWrites["CertificateIssuer/ca"] != 0 {
+		t.Fatalf("an operator that does not lead opened %d accounts, stored %v, wrote the issuer",
+			e.ca.accounts, slices.Collect(maps.Keys(e.secrets.items)))
+	}
+	e.pass()
+
+	// No order is placed.
+	order := e.order("default.web.1", "ca", "www.example.org")
+	refused()
+	if e.ca.placed != 0 || e.cluster.statusWrites["CertificateOrder/"+order] != 0 {
+		t.Fatalf("an operator that does not lead placed %d orders", e.ca.placed)
+	}
+
+	// No challenge is accepted, and no attempt is counted.
+	e.pass()
+	writes := e.cluster.statusWrites["CertificateOrder/"+order]
+	refused()
+	refused()
+	if st := e.orderStatus(order); st.State != StateProcessing || st.Progress.Attempts != 0 ||
+		e.cluster.statusWrites["CertificateOrder/"+order] != writes {
+		t.Fatalf("an operator that does not lead wrote the order: %+v", st)
+	}
+	st := e.passes(order, 6)
+	if st.State != StateValid || e.ca.placed != 1 {
+		t.Fatalf("the order of the leader: %+v, %d placed", st, e.ca.placed)
+	}
+
+	// No certificate is revoked.
+	serial := hex.EncodeToString(leafOf(t, st).SerialNumber.Bytes())
+	e.cluster.put(OrderKind, "default.web.revoke-1", map[string]any{"issuer": "ca", "certificate": "default/web", "revoke": serial}, map[string]any{"state": StatePending})
+	refused()
+	if len(e.ca.revoked) != 0 || e.orderStatus("default.web.revoke-1").State != StatePending {
+		t.Fatalf("an operator that does not lead revoked %d certificates", len(e.ca.revoked))
+	}
+	e.pass()
+	if len(e.ca.revoked) != 1 {
+		t.Fatal("the leader did not revoke the certificate")
+	}
+}
+
+// countingCluster counts the passes of an operator: one listing of the
+// issuers each.
+type countingCluster struct {
+	cluster
+	passes atomic.Int32
+}
+
+func (c *countingCluster) ListObjects(ctx context.Context, kind kindRef) ([]*api.CustomObject, error) {
+	if kind == IssuerKind {
+		c.passes.Add(1)
+	}
+	return c.cluster.ListObjects(ctx, kind)
+}
+
+// Of two instances (a rolling update, or an allocation that is lost but
+// still runs while its replacement starts) only the one that holds the
+// lease works: one order at the certificate authority, not one of each
+// (review finding CON-6b: norca-acme had no leader election).
+func TestRun_OneOfTwoInstancesWorks(t *testing.T) {
+	e := newEnv(t)
+	e.issuer("ca", nil)
+	order := e.order("default.web.1", "ca", "www.example.org")
+	lease := fake.New()
+
+	type instance struct {
+		counting *countingCluster
+		stop     func()
+	}
+	start := func(id string, op *Operator) *instance {
+		in := &instance{counting: &countingCluster{cluster: op.cluster}}
+		op.cluster = in.counting
+		elector, err := controller.NewLeaderElector(lease, controller.LeaderElectionConfig{
+			Path: controller.LeaseRoot + "/" + DefaultController, Identity: id, ReleaseOnCancel: true,
+			LeaseDuration: 600 * time.Millisecond, RenewDeadline: 400 * time.Millisecond, RetryPeriod: 100 * time.Millisecond,
+		}, op.log())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			op.run(ctx, 20*time.Millisecond, elector)
+		}()
+		var once sync.Once
+		in.stop = func() {
+			once.Do(func() {
+				cancel()
+				<-done
+			})
+		}
+		t.Cleanup(in.stop)
+		return in
+	}
+	other := e.newOperator()
+	// The certificate authority finds the answer of a challenge at either
+	// instance, as behind the edge router.
+	e.ca.checkHTTP = func(_, token, want string) bool {
+		for _, op := range []*Operator{e.op, other} {
+			rec := httptest.NewRecorder()
+			op.responder.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, ChallengePath+token, nil))
+			if rec.Code == http.StatusOK && rec.Body.String() == want {
+				return true
+			}
+		}
+		return false
+	}
+	a := start("a", e.op)
+	b := start("b", other)
+
+	waitUntil := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting: %s", what)
+			}
+		}
+	}
+	waitUntil("the order is valid", func() bool { return e.orderStatus(order).State == StateValid })
+	e.ca.mu.Lock()
+	placed := e.ca.placed
+	e.ca.mu.Unlock()
+	if placed != 1 {
+		t.Fatalf("%d orders placed with the certificate authority", placed)
+	}
+	working, idle := a, b
+	if a.counting.passes.Load() == 0 {
+		working, idle = b, a
+	}
+	if idle.counting.passes.Load() != 0 {
+		t.Fatalf("both instances work: %d and %d passes", a.counting.passes.Load(), b.counting.passes.Load())
+	}
+
+	// The instance that works stops: the other one takes over.
+	working.stop()
+	waitUntil("the other instance works", func() bool { return idle.counting.passes.Load() > 0 })
 }
 
 // The responder answers the challenges it was given, as text, and nothing

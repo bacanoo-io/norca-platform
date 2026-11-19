@@ -48,6 +48,9 @@ type Settings struct {
 	RetryMax    time.Duration
 	MaxAttempts int
 
+	LeaderElection bool
+	LeaseNamespace string
+
 	LogLevel string
 }
 
@@ -68,6 +71,8 @@ func (s *Settings) register(fs *flag.FlagSet) {
 	fs.DurationVar(&s.RetryBase, "retry-base", time.Minute, "delay after the first failed attempt of an order; doubled with every further one")
 	fs.DurationVar(&s.RetryMax, "retry-max", 2*time.Hour, "longest delay between two attempts of an order")
 	fs.IntVar(&s.MaxAttempts, "max-attempts", 8, "attempts after which an order is failed; the servers then place a new one later")
+	fs.BoolVar(&s.LeaderElection, "leader-election", false, "run several instances, one of them active (the lease is the Variable controller-lease/<controller>)")
+	fs.StringVar(&s.LeaseNamespace, "lease-namespace", systemNamespace, "namespace of the leader election lease")
 	fs.StringVar(&s.LogLevel, "log-level", "info", "log level: debug, info, warn or error")
 }
 
@@ -122,6 +127,9 @@ func Run(ctx context.Context, args []string, version string) error {
 		return err
 	}
 
+	// A failure of the HTTP-01 server ends the operator.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errc := make(chan error, 1)
 	if s.HTTP01Listen != "" {
 		srv := &http.Server{
@@ -135,6 +143,7 @@ func Run(ctx context.Context, args []string, version string) error {
 			logger.Info("answering HTTP-01 challenges", "address", s.HTTP01Listen)
 			if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				errc <- fmt.Errorf("the HTTP-01 server: %w", err)
+				cancel()
 			}
 		}()
 		defer func() {
@@ -144,20 +153,25 @@ func Run(ctx context.Context, args []string, version string) error {
 		}()
 	}
 
-	logger.Info("norca-acme started", "controller", s.Controller, "version", version, "interval", s.Interval.String())
-	ticker := time.NewTicker(s.Interval)
-	defer ticker.Stop()
-	for {
-		if err := op.Pass(ctx); err != nil && ctx.Err() == nil {
-			logger.Warn("pass failed", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case err := <-errc:
+	// The HTTP-01 server answers on every instance (what it answers is in
+	// the memory of the instance that leads); the passes run on the leader.
+	var elector *controller.LeaderElector
+	if s.LeaderElection {
+		elector, err = controller.NewLeaderElector(controller.NewBackend(client), controller.LeaderElectionConfig{
+			Namespace: s.LeaseNamespace, Path: controller.LeaseRoot + "/" + s.Controller, ReleaseOnCancel: true,
+		}, logger)
+		if err != nil {
 			return err
-		case <-ticker.C:
 		}
+	}
+	logger.Info("norca-acme started", "controller", s.Controller, "version", version, "interval", s.Interval.String(),
+		"leader_election", s.LeaderElection)
+	op.run(ctx, s.Interval, elector)
+	select {
+	case err := <-errc:
+		return err
+	default:
+		return nil
 	}
 }
 

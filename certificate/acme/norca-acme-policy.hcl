@@ -53,5 +53,11 @@ namespace "norca-system" {
     path "providers/*" {
       capabilities = ["read"]
     }
+
+    # With -leader-election: the lease of the instances (-lease-namespace,
+    # controller-lease/<-controller>).
+    path "controller-lease/norca-acme*" {
+      capabilities = ["list", "read", "write"]
+    }
   }
 }
