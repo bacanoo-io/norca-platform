@@ -69,6 +69,7 @@ type flags struct {
 	showVersion    bool
 	orphanSweep    time.Duration
 	orphanAfter    time.Duration
+	listGrace      time.Duration
 	deleteOrphans  bool
 	bootstrap      bool
 	bootstrapVar   string
@@ -105,6 +106,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.showVersion, "version", false, "print the version and exit")
 	fs.DurationVar(&f.orphanSweep, "orphan-sweep", 5*time.Minute, "period of the sweep of orphaned instances")
 	fs.DurationVar(&f.orphanAfter, "orphan-after", 15*time.Minute, "age after which an orphaned instance without a node is deleted")
+	fs.DurationVar(&f.listGrace, "list-grace", 2*time.Minute, "how long the instances of a request count as live while the listing of the provider does not show them yet; after it the request is made again with the same ID")
 	fs.BoolVar(&f.deleteOrphans, "delete-orphans", false, "delete orphaned instances that run a node too (otherwise they are only reported)")
 	fs.BoolVar(&f.bootstrap, "bootstrap", true, "send each instance a bootstrap with the certificate and the configuration of its node")
 	fs.StringVar(&f.bootstrapVar, "bootstrap-variable", "", "Variable with the bootstrap template of the region (default nodescaler/bootstrap/<region>)")
@@ -125,6 +127,9 @@ func parseFlags(args []string) (*flags, error) {
 	}
 	if f.joinListen != "" && !f.bootstrap {
 		return nil, errors.New("-join-listen needs -bootstrap")
+	}
+	if f.listGrace < time.Second {
+		return nil, errors.New("-list-grace must be at least 1s")
 	}
 	if f.joinValidity < time.Minute {
 		return nil, errors.New("-join-validity must be at least 1m")
@@ -216,6 +221,7 @@ func run(ctx context.Context, args []string) error {
 		TokenNamespace: f.tokenNamespace,
 		AllowHTTP:      f.allowHTTP,
 		OrphanAfter:    f.orphanAfter,
+		ListGrace:      f.listGrace,
 		DeleteOrphans:  f.deleteOrphans,
 		Metrics:        metrics,
 		Logger:         logger,

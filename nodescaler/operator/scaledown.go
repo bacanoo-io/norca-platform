@@ -19,7 +19,8 @@ import (
 // operator removes one at a time:
 //
 //   - an instance whose node has not joined goes first, at once: there is
-//     nothing on it;
+//     nothing on it; one that was asked for and is not in the listing of the
+//     provider yet (pending.go) is waited for, and no node is chosen meanwhile;
 //   - otherwise a node is chosen by the selector of spec.policy.scale_down:
 //     least_busy (the fewest allocations, drained with drain_deadline) or empty
 //     (only a node without allocations, made ineligible, checked again after
@@ -218,6 +219,16 @@ func (r *Reconciler) scaleDown(ctx context.Context, obj *api.CustomObject, clien
 		o.drop(inst.ID)
 		r.event(ctx, obj, api.ObjectEventTypeNormal, "InstanceDeleted",
 			fmt.Sprintf("instance %s, whose node had not joined, is deleted for a scale of %d", inst.ID, want))
+		res.requeue = r.cfg.JoinCheck
+		return res
+	}
+
+	if o.pending > 0 {
+		// Instances that were asked for and are not in the listing of the
+		// provider yet are above the scale too, and their nodes have not
+		// joined: they go first, once the listing shows them (or they stop
+		// counting, after the grace time). No node that works is drained
+		// in their place.
 		res.requeue = r.cfg.JoinCheck
 		return res
 	}

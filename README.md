@@ -84,8 +84,9 @@ The operator writes the status of the group:
 | `capacity`, `allocatable` | The size of a machine from the provider, less `spec.node.reserved`. |
 | `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
+| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made) and `listed` (the instances a listing has shown). |
 | `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
-| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`), `JoinFailing` (`TooManyFailures`), `ForeignNode` and `NetworkCovered` (`Covered`, `NotCovered`, `NetworkUnchecked`, `NoNetwork`). |
+| `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`, `NotListed`), `JoinFailing` (`TooManyFailures`), `ForeignNode` and `NetworkCovered` (`Covered`, `NotCovered`, `NetworkUnchecked`, `NoNetwork`). |
 | `strayNodes` | Nodes of the group without an instance: `node`, `name`, `instance`, `kind` (`gone`: down, what is left of a deleted instance; `foreign`: ready). |
 
 **The join of the nodes.** An instance whose node has not joined by
@@ -97,6 +98,21 @@ changes or `join.resume_generation` is raised; a node that joins
 (`NodeJoined`) ends the row. A node still joining after `join.slow_after`
 (5 minutes) no longer counts in `joining` (`JoinSlow`), so the autoscaler may
 ask for another one.
+
+**Listings that lag.** The listing of a platform can show a new instance
+later than the answer of the create. The status keeps each request
+(`pendingRequests`) until a listing has shown all of its instances; those
+not shown yet count as live and in `joining` for `-list-grace` (2 minutes),
+so the next look does not ask for them again, a raised scale asks only for
+the difference, and a lowered one waits for them to be listed before it
+removes anything (they go first, as instances whose nodes have not joined).
+After the grace time, if the group is short of its scale, the request is made
+again with the same ID: a provider that has the instances answers with them
+and creates nothing, the answer says what the request made, and the grace
+time starts again. This is an event (`InstancesNotListed`), and `Provisioned`
+is False (`NotListed`) until the listing shows them. Set `-list-grace` above
+the lag of the listing of the slowest provider; a request that was lost is
+made again that much later.
 
 **The bootstrap of a machine.** The deployer writes the static parts of a
 region into the Variable `nodescaler/bootstrap/<region>` (namespace
@@ -232,7 +248,7 @@ changes only its own fields and writes with the index it read. Scale down
 comes next.
 
 ```shell
-norca-nodescaler -region eu -provider-ttl 3m -token-namespace norca-system
+norca-nodescaler -region eu -provider-ttl 3m -token-namespace norca-system -list-grace 2m
 ```
 
 ## The provider application

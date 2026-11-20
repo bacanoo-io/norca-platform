@@ -12,11 +12,13 @@
 // conditions ProviderAvailable and Provisioned.
 //
 // A request to the provider is idempotent by its ID (region/group/number):
-// a request repeated after a failure or a restart creates nothing more. The
-// join of the nodes is tracked (join.go), the instances of groups that are
-// gone are swept (orphans.go), the instances above the scale are removed one
-// at a time (scaledown.go), and a deleted group keeps its object until its
-// instances are dealt with by spec.deletion (deletion.go).
+// a request repeated after a failure or a restart creates nothing more, and
+// the instances of a request that the provider does not list yet count as
+// live for a grace time (pending.go). The join of the nodes is tracked
+// (join.go), the instances of groups that are gone are swept (orphans.go),
+// the instances above the scale are removed one at a time (scaledown.go), and
+// a deleted group keeps its object until its instances are dealt with by
+// spec.deletion (deletion.go).
 package operator
 
 import (
@@ -68,6 +70,11 @@ type Config struct {
 	// OrphanAfter is the age after which an orphaned instance without a
 	// node is deleted (default 15 minutes, the default join deadline).
 	OrphanAfter time.Duration
+
+	// ListGrace is how long the instances of a request count as live while
+	// the listing of the provider does not show them (default 2 minutes);
+	// after it the request is made again with the same ID (pending.go).
+	ListGrace time.Duration
 
 	// DeleteOrphans deletes orphaned instances that run a node too; without
 	// it they are only reported (orphans.go).
@@ -139,6 +146,9 @@ func NewReconciler(backend controller.Backend, nodes NodeLister, cfg Config) *Re
 	if cfg.OrphanAfter <= 0 {
 		cfg.OrphanAfter = 15 * time.Minute
 	}
+	if cfg.ListGrace <= 0 {
+		cfg.ListGrace = defaultListGrace
+	}
 	if cfg.HTTP == nil {
 		cfg.HTTP = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -182,6 +192,10 @@ type observed struct {
 	// retiring are the old instances of replacements that surge: they no
 	// longer count in the scale (rollout.go).
 	retiring map[string]bool
+	// pending is how many instances the provider was asked for and answered
+	// with that its listing does not show yet (pending.go): they count as
+	// live and as joining, and are not in instances.
+	pending int64
 }
 
 // observe takes the instances of the group from the provider's group.
@@ -197,8 +211,10 @@ func (r *Reconciler) observe(group string, pg *provider.Group) *observed {
 
 // counts returns the ready nodes, the instances whose node has not joined
 // (the slow ones left out: they no longer count as capacity), the failed
-// instances and the live instances (creating or running).
+// instances and the live instances (creating or running). The instances the
+// listing of the provider does not show yet are live and joining.
 func (o *observed) counts() (ready, joining, failed, live int64) {
+	joining, live = o.pending, o.pending
 	for _, inst := range o.instances {
 		if o.retiring[inst.ID] {
 			continue
@@ -281,6 +297,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	}
 
 	o := r.observe(obj.Name, pg)
+	prevStatus := normalize(obj.Status)
+	// The requests whose instances the listing has not all shown: within the
+	// grace time those instances count as live.
+	pend := r.pending(obj.Name, prevStatus, o.instances)
+	o.pending = r.awaited(pend, now)
 	if r.cfg.Join != nil {
 		live := make(map[string]bool, len(o.instances))
 		for _, inst := range o.instances {
@@ -295,7 +316,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
-	prevStatus := normalize(obj.Status)
 	// The node of an instance a scale down or a replacement deleted is not a
 	// stray: it goes down and is purged.
 	removing := map[string]bool{}
@@ -344,8 +364,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	want := spec.replicas()
 	_, _, _, live := o.counts()
 	seq := r.nextRequest(obj, o.instances)
+	count := want - live
+	// A request whose instances the listing still does not show after the
+	// grace time is made again with its own number while the group is short,
+	// so a provider that has them answers with them; when the group is not
+	// short, such a request is forgotten.
+	var again *pendingRequest
+	if want > live {
+		if again = r.overdueRequest(pend, now); again != nil {
+			seq = again.Number
+			if count = again.Count; len(again.Listed) == 0 {
+				// None of it was ever seen: if the provider never had the
+				// request, it makes no more than what is missing now.
+				count = min(again.Count, want-live)
+			}
+		}
+	} else {
+		pend = slices.DeleteFunc(pend, func(p *pendingRequest) bool { return p.overdue(now, r.cfg.ListGrace) })
+	}
 	provisioned := condition{Type: CondProvisioned, Status: "True", Reason: "Requested",
-		Message: fmt.Sprintf("%d instances for a scale of %d", live, want)}
+		Message: provisionedMessage(live, want, o.pending)}
 	requested, createFailed := false, false
 	if failing && want > live {
 		provisioned = condition{Type: CondProvisioned, Status: "False", Reason: CondJoinFailing,
@@ -353,7 +391,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	}
 	if !failing && want > live {
 		reqID := r.requestID(obj.Name, seq)
-		instances, issued, err := r.describe(ctx, obj, spec, seq, int(want-live), now)
+		instances, issued, err := r.describe(ctx, obj, spec, seq, int(count), now)
 		if err != nil {
 			createFailed = true
 			provisioned = condition{Type: CondProvisioned, Status: "False", Reason: "NoBootstrap", Message: err.Error()}
@@ -395,11 +433,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 					}
 				}
 				_, _, _, live = o.counts()
-				provisioned.Message = fmt.Sprintf("%d instances for a scale of %d", live, want)
-				r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
-					fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, len(req.Instances), req.RequestID))
+				provisioned.Message = provisionedMessage(live, want, o.pending)
+				if again != nil {
+					// The answer says what the request made; the grace time
+					// of those the listing does not show starts again.
+					r.event(ctx, obj, api.ObjectEventTypeWarning, "InstancesNotListed", fmt.Sprintf(
+						"provider %q did not list %d instances of request %s in %s; the request was made again with the same ID and answered with %d instances",
+						spec.Provider, again.unlisted(), req.RequestID, now.Sub(again.At).Round(time.Second), len(created)))
+					again.answered(created, now)
+					pend = complete(pend)
+				} else {
+					r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
+						fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, len(req.Instances), req.RequestID))
+					p := &pendingRequest{Number: seq}
+					p.answered(created, now)
+					pend = complete(append(pend, p))
+				}
 			}
 		}
+	}
+	if c := r.notListed(obj.Name, spec.Provider, pend); c != nil && provisioned.Status == "True" {
+		provisioned = *c
 	}
 
 	ready, joining, failed, _ := o.counts()
@@ -436,7 +490,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 			status["allocatable"] = allocatable(*o.capacity, spec.Node.Reserved)
 		}
 		if requested {
-			status["lastRequest"] = seq
+			// A request made again has its old number: the last one stays.
+			status["lastRequest"] = max(seq, lastRequest(status))
+		}
+		if d := pendingDocs(pend); d != nil {
+			status["pendingRequests"] = d
+		} else {
+			delete(status, "pendingRequests")
 		}
 		status["join"] = js.doc()
 		status["strayNodes"] = strayRecords
@@ -584,7 +644,9 @@ func (r *Reconciler) requestID(group string, seq int64) string {
 // created instances and its number could not be written to the status, the
 // instances still carry it, so a later request gets a new number; when the
 // instances are not listed yet, the number is used again, and the provider
-// answers with the instances of the first request.
+// answers with the instances of the first request. When the number was
+// written and the instances are not listed yet, the request is in
+// status.pendingRequests and its instances count as live (pending.go).
 func (r *Reconciler) nextRequest(obj *api.CustomObject, instances []provider.Instance) int64 {
 	last := lastRequest(normalize(obj.Status))
 	prefix := r.cfg.Region + "/" + obj.Name + "/"
