@@ -99,12 +99,23 @@ type Operator struct {
 	// propagationTimeout is how long a DNS record may take to be seen.
 	propagationTimeout time.Duration
 
+	// http01Settle is how long after the responder of this instance started
+	// to answer (answering) the certificate authority is not told to check
+	// an HTTP-01 challenge yet: the time the edge takes to route to an
+	// instance that became ready. 0: no wait.
+	http01Settle time.Duration
+
 	mu       sync.Mutex
 	accounts map[string]*account
 	// tokens are the HTTP-01 tokens answered for an order.
 	tokens map[string][]string
 	// waiting is since when an order waits for its DNS records.
 	waiting map[string]time.Time
+	// answeringSince is when the responder of this instance started to
+	// answer the HTTP-01 challenges: the start of the passes, which is the
+	// start of the process without leader election and the start of the
+	// term with it. Zero: never, nothing waits for it.
+	answeringSince time.Time
 
 	// leading is the fence of the side effects (fence); nil: the operator
 	// runs without leader election.
@@ -118,6 +129,7 @@ type Operator struct {
 // the same orders).
 func (o *Operator) run(ctx context.Context, every time.Duration, elector *controller.LeaderElector) {
 	passes := func(ctx context.Context) {
+		o.answering()
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
 		for {
@@ -152,6 +164,44 @@ func (o *Operator) run(ctx context.Context, every time.Duration, elector *contro
 func (o *Operator) follow(elector *controller.LeaderElector) {
 	o.leading = elector.Leading
 	o.responder.follow(elector.Leading)
+}
+
+// answering records that the responder of this instance starts to answer the
+// HTTP-01 challenges now, which is also when it becomes ready (ReadyPath):
+// the passes start, at the start of the process or of a term as the leader.
+// The settle time of the HTTP-01 challenges counts from here, again with
+// every term.
+func (o *Operator) answering() {
+	o.mu.Lock()
+	o.answeringSince = o.now()
+	o.mu.Unlock()
+	if o.http01Settle > 0 {
+		o.log().Info("answering HTTP-01 challenges; the certificate authority is told to check them once the edge had time to route here",
+			"settle", o.http01Settle.String())
+	}
+}
+
+// settling returns how much of the settle time of the HTTP-01 challenges is
+// left; nothing is left at 0 or below.
+//
+// An edge that follows the readiness of the instances does not route to an
+// instance at the moment it becomes ready: the check of the service runs on
+// its interval, Norca passes its result on, and the edge reads the services
+// on an interval of its own. A challenge the certificate authority checks
+// before that reaches nobody, or a standby, and its order fails (review
+// finding CON-6g). So the challenge is presented at once, and the certificate
+// authority is told to check it only after the settle time.
+func (o *Operator) settling() time.Duration {
+	if o.http01Settle <= 0 {
+		return 0
+	}
+	o.mu.Lock()
+	since := o.answeringSince
+	o.mu.Unlock()
+	if since.IsZero() {
+		return 0
+	}
+	return o.http01Settle - o.now().Sub(since)
 }
 
 // fence is called right before a side effect that no check-and-set
@@ -633,7 +683,9 @@ func (o *Operator) caError(what string, err error) error {
 
 // authorize works on the authorizations of an order that is pending: for
 // each name that is not proven yet it presents a challenge and, once the
-// proof can be seen, tells the certificate authority to check it.
+// proof can be seen, tells the certificate authority to check it. A DNS-01
+// record can be seen when the name servers show it; an HTTP-01 answer when
+// the edge had the settle time to route to this instance (settling).
 func (o *Operator) authorize(ctx context.Context, is *issuer, orderName string, order *xacme.Order, pr *Progress) error {
 	auth := is.account.authority
 	for _, authzURL := range order.AuthzURLs {
@@ -666,6 +718,16 @@ func (o *Operator) authorize(ctx context.Context, is *issuer, orderName string, 
 				o.tokens[orderName] = append(o.tokens[orderName], chal.Token)
 			}
 			o.mu.Unlock()
+			if chal.Status == xacme.StatusPending {
+				// The answer is there for the edge to find; the certificate
+				// authority is told to look when the edge had time to route
+				// here. A later pass comes back to the order: nothing failed.
+				if left := o.settling(); left > 0 {
+					o.log().Debug("the HTTP-01 challenge waits for the settle time", "order", orderName, "name", name,
+						"left", left.Round(time.Second).String())
+					continue
+				}
+			}
 		case "dns-01":
 			value, err := auth.DNS01Record(chal.Token)
 			if err != nil {

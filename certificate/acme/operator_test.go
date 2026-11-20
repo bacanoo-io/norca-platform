@@ -857,6 +857,9 @@ func TestSettings(t *testing.T) {
 	if err := Run(t.Context(), []string{"-max-attempts", "0"}, "test"); err == nil {
 		t.Error("-max-attempts 0 accepted")
 	}
+	if err := Run(t.Context(), []string{"-http01-settle", "-1s"}, "test"); err == nil {
+		t.Error("a negative -http01-settle accepted")
+	}
 	if err := Run(t.Context(), []string{"-version"}, "test"); err != nil {
 		t.Errorf("-version: %v", err)
 	}

@@ -25,11 +25,23 @@ import (
 // keys, the certificates it issued) and the tokens of the DNS zones.
 const systemNamespace = "norca-system"
 
+// DefaultHTTP01Settle is the default of -http01-settle: the longest an edge
+// that follows the readiness takes to route to an instance that became
+// ready, with the defaults of the chain. The check of the service on
+// ReadyPath runs within its interval (5s in the documentation, 10s in the
+// norca-acme pack) and may take its timeout (2s); the Norca client passes the
+// result on within a second; the edge reads the services on its own interval
+// (Traefik: 15s by default) and applies a change after its throttle (2s).
+// That is 20s to 29s; a longer check interval or refresh needs a longer
+// settle time.
+const DefaultHTTP01Settle = 30 * time.Second
+
 // Settings are the flags of norca-acme.
 type Settings struct {
 	Controller      string
 	Interval        time.Duration
 	HTTP01Listen    string
+	HTTP01Settle    time.Duration
 	SecretNamespace string
 	SecretPrefix    string
 
@@ -58,6 +70,7 @@ func (s *Settings) register(fs *flag.FlagSet) {
 	fs.StringVar(&s.Controller, "controller", DefaultController, "name issuers name this operator by (spec.external.controller)")
 	fs.DurationVar(&s.Interval, "interval", 5*time.Second, "time between two passes over the issuers and the orders")
 	fs.StringVar(&s.HTTP01Listen, "http01-listen", ":8089", "address the HTTP-01 challenges are answered on (empty: not served)")
+	fs.DurationVar(&s.HTTP01Settle, "http01-settle", DefaultHTTP01Settle, "time after this instance became ready (its start, or the start of its lead with -leader-election) before the certificate authority is told to check an HTTP-01 challenge: the time the edge takes to route to it (0: no wait)")
 	fs.StringVar(&s.SecretNamespace, "secret-namespace", systemNamespace, "namespace of the secrets of the operator")
 	fs.StringVar(&s.SecretPrefix, "secret-prefix", "norca-acme/", "path prefix of the secrets of the operator (accounts/, issued/)")
 	fs.StringVar(&s.ZoneTokenNamespace, "zone-token-namespace", systemNamespace, "namespace of the Variables holding the tokens of the DNS zones")
@@ -88,6 +101,8 @@ func (s *Settings) validate() error {
 		return errors.New("-retry-base must be positive and -retry-max not below it")
 	case s.MaxAttempts < 1:
 		return errors.New("-max-attempts must be at least 1")
+	case s.HTTP01Settle < 0:
+		return errors.New("-http01-settle must not be negative")
 	case s.ZoneTTL <= 0 || s.DNSPropagationTimeout <= 0:
 		return errors.New("-zone-ttl and -dns-propagation-timeout must be positive")
 	}
@@ -214,6 +229,7 @@ func New(s Settings, version string, client *api.Client, logger *slog.Logger) (*
 		retryMax:           s.RetryMax,
 		maxAttempts:        s.MaxAttempts,
 		propagationTimeout: s.DNSPropagationTimeout,
+		http01Settle:       s.HTTP01Settle,
 		accounts:           map[string]*account{},
 		tokens:             map[string][]string{},
 		waiting:            map[string]time.Time{},
