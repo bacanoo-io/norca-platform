@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/bacanoo-io/norca/norca/api"
 )
@@ -27,6 +28,14 @@ func TestSettings_Defaults(t *testing.T) {
 	}
 	if err := s.validate(); err != nil {
 		t.Fatal(err)
+	}
+	// The settle time of the HTTP-01 challenges is on, and 0 turns it off.
+	if s.HTTP01Settle != 30*time.Second {
+		t.Fatalf("-http01-settle is %s by default", s.HTTP01Settle)
+	}
+	s.HTTP01Settle = 0
+	if err := s.validate(); err != nil {
+		t.Fatalf("-http01-settle 0: %v", err)
 	}
 }
 
