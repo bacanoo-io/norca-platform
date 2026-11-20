@@ -32,8 +32,8 @@ type JoinIssuer interface {
 	Ticket(ctx context.Context, group, request, instance string, ttl time.Duration) (bootstrap.JoinTicket, error)
 	// Prune drops the records of the group whose token expired unused and
 	// those of instances that are gone; live are the instances the
-	// provider lists, prefix is the start of the names of the group's
-	// instances.
+	// provider lists and those of the requests its listing has not all
+	// shown, prefix is the start of the names of the group's instances.
 	Prune(ctx context.Context, group, prefix string, live map[string]bool) error
 	// Forget drops every record of a group whose instances are gone with
 	// it (a deletion with the policy drain or terminate).

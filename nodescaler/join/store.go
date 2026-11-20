@@ -351,10 +351,10 @@ func (s *Store) Seen(ctx context.Context, group, instance string, addresses []st
 
 // Prune deletes the records of a group that are no longer needed: a token
 // that expired unused, and an instance that joined and is gone. live are
-// the instances the provider lists for the group; only the records of
-// instances whose names start with namePrefix are read. The instances of a
-// request are recorded before the request, so an instance that joined is
-// listed until it is deleted.
+// the instances of the group: those the provider lists, and those of the
+// requests its listing has not all shown (a machine can join before the
+// listing shows it; review finding CON-6i). Only the records of instances
+// whose names start with namePrefix are read.
 func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[string]bool) error {
 	list, _, err := s.Vars.ListVariables(ctx, s.Namespace, s.prefix()+namePrefix, 0)
 	if err != nil {

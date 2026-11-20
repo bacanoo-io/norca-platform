@@ -302,8 +302,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// grace time those instances count as live.
 	pend := r.pending(obj.Name, prevStatus, o.instances)
 	o.pending = r.awaited(pend, now)
+	// The names of their instances are names of instances of the group, as
+	// those of the listing are: a machine can boot before the listing shows
+	// it.
+	awaitedNames := pendingNames(obj.Name, pend)
 	if r.cfg.Join != nil {
-		live := make(map[string]bool, len(o.instances))
+		live := maps.Clone(awaitedNames)
 		for _, inst := range o.instances {
 			live[instanceKey(inst)] = true
 		}
@@ -329,10 +333,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	for name := range readJoinState(prevStatus).deletedNames() {
 		removing[name] = true
 	}
-	strays := matchNodes(obj.Name, o, nodes, removing)
+	strays := matchNodes(obj.Name, o, nodes, removing, awaitedNames)
 
 	// Nodes without an instance: reported, the foreign ones made ineligible.
-	strayRecords, foreignCond := r.handleStrays(ctx, obj, strays, prevStatus)
+	strayRecords, foreignCond, madeIneligible := r.handleStrays(ctx, obj, strays, prevStatus, o, now)
 	netCond := r.networkCondition(ctx, spec)
 	if netCond.Status == "False" && conditionStatusOf(prevStatus, CondNetworkCovered) != "False" {
 		r.event(ctx, obj, api.ObjectEventTypeWarning, "NetworkNotCovered", netCond.Message)
@@ -440,13 +444,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 					r.event(ctx, obj, api.ObjectEventTypeWarning, "InstancesNotListed", fmt.Sprintf(
 						"provider %q did not list %d instances of request %s in %s; the request was made again with the same ID and answered with %d instances",
 						spec.Provider, again.unlisted(), req.RequestID, now.Sub(again.At).Round(time.Second), len(created)))
-					again.answered(created, now)
+					again.answered(created, len(req.Instances), now)
 					pend = complete(pend)
 				} else {
 					r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
 						fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, len(req.Instances), req.RequestID))
 					p := &pendingRequest{Number: seq}
-					p.answered(created, now)
+					p.answered(created, len(req.Instances), now)
 					pend = complete(append(pend, p))
 				}
 			}
@@ -500,6 +504,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		}
 		status["join"] = js.doc()
 		status["strayNodes"] = strayRecords
+		if d := madeIneligible.docs(); d != nil {
+			status["madeIneligible"] = d
+		} else {
+			delete(status, "madeIneligible")
+		}
 		setCondition(status, foreignCond, now)
 		setCondition(status, netCond, now)
 		setCondition(status, repairCond, now)

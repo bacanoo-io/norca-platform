@@ -84,10 +84,11 @@ The operator writes the status of the group:
 | `capacity`, `allocatable` | The size of a machine from the provider, less `spec.node.reserved`. |
 | `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
-| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made) and `listed` (the instances a listing has shown). |
+| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made), `asked` (the largest number of instances it was made for: its instances have the names `<group>-<number>-1` to `-<asked>`) and `listed` (the instances a listing has shown). |
 | `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
 | `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`, `NotListed`), `JoinFailing` (`TooManyFailures`), `ForeignNode` and `NetworkCovered` (`Covered`, `NotCovered`, `NetworkUnchecked`, `NoNetwork`). |
 | `strayNodes` | Nodes of the group without an instance: `node`, `name`, `instance`, `kind` (`gone`: down, what is left of a deleted instance; `foreign`: ready). |
+| `madeIneligible` | The nodes the operator made ineligible because the provider did not have their instance (`node`, `name`, `at`): only these are made eligible again, when the listing shows their instance. |
 
 **The join of the nodes.** An instance whose node has not joined by
 `join.deadline` (15 minutes) is deleted, and so is one the provider reports
@@ -112,7 +113,12 @@ and creates nothing, the answer says what the request made, and the grace
 time starts again. This is an event (`InstancesNotListed`), and `Provisioned`
 is False (`NotListed`) until the listing shows them. Set `-list-grace` above
 the lag of the listing of the slowest provider; a request that was lost is
-made again that much later.
+made again that much later. A machine can boot before the listing shows it:
+while a request is in `pendingRequests`, the names of its instances count as
+instances of the group, so a node with one of them is the node of its
+instance (not a node without an instance, below), and with `-join-listen`
+its join record is kept, so its certificate renews. Once the request is
+forgotten, the names are handled like any other.
 
 **The bootstrap of a machine.** The deployer writes the static parts of a
 region into the Variable `nodescaler/bootstrap/<region>` (namespace
@@ -241,6 +247,15 @@ for new work. So is a second ready node with the name of an instance that
 has one (the first that registered is the node of the instance; a machine
 that came up again leaves its old node down and is not foreign). Nodes
 without the marks are left alone. This detects; it does not prevent.
+The instances of the requests in `pendingRequests` are instances the
+provider has (see the listings that lag). A node the operator made
+ineligible because its instance was not known is in `madeIneligible`, and
+is made eligible again (`NodeEligible`) when the listing shows the
+instance, if the instance was created before the node was made ineligible:
+the listing was behind. A node that had the name before the instance was
+made stays ineligible, and so does a node that was ineligible already, a
+second node of an instance, and a node that is being drained: the operator
+undoes only what it did, for this reason alone.
 
 **The network of a group.** The firewall of the servers must let the nodes
 in: the range of a group (`spec.network`) must be inside the cluster ranges

@@ -24,6 +24,16 @@ import (
 // with the request by the request ID of the instance, and an instance that
 // was listed stays so in the record when it is deleted later.
 //
+// The machine of such an instance can boot and its node join before a listing
+// shows it (review finding CON-6i). So the names of the instances of the
+// requests in the status (pendingNames: the names describe gives the
+// instances of a request, for as many as it was asked for) are names of
+// instances of the group, like those of the listing: a node with one of them
+// is not a node without an instance (stray.go), and the join record of one is
+// not dropped (join.Store.Prune). This holds while the request is in the
+// status, also past the grace time while it is made again; once it is
+// forgotten, the names are handled like any other.
+//
 // A request whose instances are still missing after the grace time counts as
 // not fulfilled. If the group is then short of its scale, the request is made
 // again with its own number: a provider that has the instances answers with
@@ -63,6 +73,9 @@ type pendingRequest struct {
 	// Asks is how many times it was made: more than once after the grace
 	// time passed without its instances.
 	Asks int
+	// Asked is the largest number of instances it was made for, or answered
+	// with: its instances have the names instanceName gives the first Asked.
+	Asked int64
 	// Listed are the provider's IDs of its instances a listing has shown.
 	Listed []string
 }
@@ -83,7 +96,8 @@ func readPending(status map[string]any) []*pendingRequest {
 		if number < 1 || count < 1 || err != nil {
 			continue
 		}
-		p := &pendingRequest{Number: int64(number), Count: int64(count), At: t, Asks: int(asks)}
+		asked, _ := d["asked"].(float64)
+		p := &pendingRequest{Number: int64(number), Count: int64(count), At: t, Asks: int(asks), Asked: int64(asked)}
 		listed, _ := d["listed"].([]any)
 		for _, v := range listed {
 			if id, ok := v.(string); ok && id != "" {
@@ -103,6 +117,9 @@ func pendingDocs(pend []*pendingRequest) []any {
 	out := make([]any, 0, len(pend))
 	for _, p := range pend {
 		d := map[string]any{"number": p.Number, "count": p.Count, "asks": p.Asks, "at": p.At.UTC().Format(time.RFC3339)}
+		if p.Asked > 0 {
+			d["asked"] = p.Asked
+		}
 		if len(p.Listed) > 0 {
 			listed := make([]any, 0, len(p.Listed))
 			for _, id := range p.Listed {
@@ -126,10 +143,24 @@ func (p *pendingRequest) overdue(now time.Time, grace time.Duration) bool {
 	return now.Sub(p.At) > grace
 }
 
-// answered records the answer of the provider to the request: the request
-// made the instances of the answer and those a listing has shown, and the
-// grace time of the ones not listed starts now.
-func (p *pendingRequest) answered(created []provider.Instance, now time.Time) {
+// pendingNames are the names of the instances of the requests: those
+// describe gave them. A record without the number asked for has the names of
+// as many as the request made.
+func pendingNames(group string, pend []*pendingRequest) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range pend {
+		for i := 1; int64(i) <= max(p.Asked, p.Count); i++ {
+			out[instanceName(group, p.Number, i)] = true
+		}
+	}
+	return out
+}
+
+// answered records the answer of the provider to the request made for asked
+// instances: the request made the instances of the answer and those a
+// listing has shown, and the grace time of the ones not listed starts now.
+func (p *pendingRequest) answered(created []provider.Instance, asked int, now time.Time) {
+	p.Asked = max(p.Asked, int64(asked), int64(len(created)))
 	p.Count = int64(len(p.Listed))
 	for _, inst := range created {
 		if !slices.Contains(p.Listed, inst.ID) {
