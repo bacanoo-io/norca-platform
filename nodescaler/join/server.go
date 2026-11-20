@@ -224,7 +224,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "join", req.Instance, err)
 		return
 	}
-	if err := s.Store.Joined(ctx, rec, serial); err != nil {
+	if err := s.Store.Joined(ctx, rec, req.Token, serial); err != nil {
 		s.fail(w, statusOf(err), "join", req.Instance, err)
 		return
 	}

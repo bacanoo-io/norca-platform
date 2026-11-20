@@ -35,18 +35,37 @@ const (
 	// join endpoint binds the join and the renewals to these addresses.
 	itemAddresses = "addresses"
 	itemSeen      = "seen"
+	// The request of the operator the token was issued for, and the tokens
+	// issued for the same request before (see Issue): entries
+	// <hash>@<expiry>, comma separated, the oldest first. A record without
+	// them has no request and no earlier token.
+	itemRequest  = "request"
+	itemPrevious = "previous_tokens"
 )
+
+// maxPrevious is how many earlier tokens of a request a record keeps beside
+// the latest. The operator makes a request again each time the grace time of
+// the listing passes (two minutes by default) and after each failed create,
+// and a token lives for the join deadline and five minutes (twenty minutes
+// by default): the number covers the repeats of the listing within the life
+// of a token. Beyond it the oldest is dropped, so a record stays small.
+const maxPrevious = 16
 
 // ErrRefused is a join or a renewal the record does not allow: an unknown
 // instance, a wrong, used or expired token, a certificate that is not the
 // latest of its instance.
 var ErrRefused = errors.New("refused")
 
+// ErrJoined is an issue for an instance of a request that has joined: it
+// needs no token, and its record is left as it is.
+var ErrJoined = errors.New("the instance has joined")
+
 // Store keeps the record of every instance that joins with its own key, a
 // Variable nodescaler/join/<region>/<instance>: first the hash of its
-// one-time token and its expiry, after the join the serial of the latest
-// certificate of the instance. Only the operator reads and writes these
-// Variables (the policy of its pack).
+// one-time token and its expiry (and of the earlier tokens of the same
+// request), after the join the serial of the latest certificate of the
+// instance. Only the operator reads and writes these Variables (the policy
+// of its pack).
 //
 // The writes are check-and-set: of two uses of one token, or two renewals
 // with one certificate, one wins, at whichever instance of the operator
@@ -74,27 +93,125 @@ func hashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// heldToken is a token of a record: its hash and when it expires.
+type heldToken struct {
+	hash    string
+	expires time.Time
+}
+
+// parseToken reads a hash and its expiry; one that does not parse is no
+// token (it cannot be used).
+func parseToken(hash, expires string) (heldToken, bool) {
+	exp, err := time.Parse(time.RFC3339, expires)
+	if hash == "" || err != nil {
+		return heldToken{}, false
+	}
+	return heldToken{hash: hash, expires: exp}, true
+}
+
+// previousOf returns the earlier tokens of the request of a record, the
+// oldest first; none for a record without the item.
+func previousOf(v *api.Variable) []heldToken {
+	var out []heldToken
+	for entry := range strings.SplitSeq(v.Items[itemPrevious], ",") {
+		hash, expires, _ := strings.Cut(entry, "@")
+		if t, ok := parseToken(hash, expires); ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// tokensOf returns the tokens of a record: the earlier ones of its request,
+// the oldest first, then the latest. The record of an instance that joined
+// has none.
+func tokensOf(v *api.Variable) []heldToken {
+	out := previousOf(v)
+	if t, ok := parseToken(v.Items[itemToken], v.Items[itemExpires]); ok {
+		out = append(out, t)
+	}
+	return out
+}
+
+// holds returns the token of a record with the hash, if it has one. Every
+// token of the record is compared, each in constant time.
+func holds(v *api.Variable, hash string) (heldToken, bool) {
+	var found heldToken
+	ok := false
+	for _, t := range tokensOf(v) {
+		if subtle.ConstantTimeCompare([]byte(hash), []byte(t.hash)) == 1 && !ok {
+			found, ok = t, true
+		}
+	}
+	return found, ok
+}
+
 // Issue makes the one-time token of an instance of the group, valid for
-// ttl, and records its hash. An instance asked for again (after a restart
-// of the operator) gets a new token; the old one is void.
-func (s *Store) Issue(ctx context.Context, group, instance string, ttl time.Duration) (string, error) {
+// ttl, and records its hash with the request of the operator it is for (its
+// request ID; empty for none).
+//
+// A request the operator makes again (after a lost answer, or when the
+// listing of the provider did not show its instances in time) is answered by
+// the provider with the instances it made the first time, which carry the
+// tokens of that time. So an issue for the same instance, group and request
+// keeps the tokens issued for it before, each until its own expiry, beside
+// the new one (at most maxPrevious of them; the addresses of the record stay
+// too). Any one of them joins the instance, once: the join voids them all.
+// And when the instance has joined, nothing is issued and the record, with
+// the serial of its certificate, is left as it is: ErrJoined.
+//
+// An issue for another request, another group or no request replaces the
+// record: every token issued for the name before is void.
+func (s *Store) Issue(ctx context.Context, group, request, instance string, ttl time.Duration) (string, error) {
 	if !ValidInstance(instance) {
 		return "", fmt.Errorf("the instance %q is not a host name", instance)
+	}
+	path := s.path(instance)
+	old, err := s.Vars.ReadVariable(ctx, s.Namespace, path)
+	switch {
+	case errors.Is(err, controller.ErrNotFound):
+		old = nil
+	case err != nil:
+		return "", fmt.Errorf("reading the join record of %s: %w", instance, err)
+	}
+	again := old != nil && request != "" && old.Items[itemGroup] == group && old.Items[itemRequest] == request
+	if again && old.Items[itemSerial] != "" {
+		return "", fmt.Errorf("%w: %s", ErrJoined, instance)
 	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
-	v := &api.Variable{Namespace: s.Namespace, Path: s.path(instance), Items: api.VariableItems{
-		itemGroup: group, itemToken: hashToken(token), itemExpires: s.now().Add(ttl).UTC().Format(time.RFC3339),
+	now := s.now()
+	v := &api.Variable{Namespace: s.Namespace, Path: path, Items: api.VariableItems{
+		itemGroup: group, itemToken: hashToken(token), itemExpires: now.Add(ttl).UTC().Format(time.RFC3339),
 	}}
-	old, err := s.Vars.ReadVariable(ctx, s.Namespace, v.Path)
-	switch {
-	case err == nil:
+	if request != "" {
+		v.Items[itemRequest] = request
+	}
+	if old != nil {
 		v.ModifyIndex = old.ModifyIndex
-	case !errors.Is(err, controller.ErrNotFound):
-		return "", fmt.Errorf("reading the join record of %s: %w", instance, err)
+	}
+	if again {
+		// The tokens of the request so far stay until their own expiry.
+		var keep []string
+		for _, t := range tokensOf(old) {
+			if now.Before(t.expires) {
+				keep = append(keep, t.hash+"@"+t.expires.UTC().Format(time.RFC3339))
+			}
+		}
+		if len(keep) > maxPrevious {
+			keep = keep[len(keep)-maxPrevious:]
+		}
+		if len(keep) > 0 {
+			v.Items[itemPrevious] = strings.Join(keep, ",")
+		}
+		for _, item := range []string{itemAddresses, itemSeen} {
+			if val := old.Items[item]; val != "" {
+				v.Items[item] = val
+			}
+		}
 	}
 	if _, err := s.Vars.WriteVariable(ctx, v); err != nil {
 		return "", fmt.Errorf("writing the join record of %s: %w", instance, err)
@@ -102,38 +219,45 @@ func (s *Store) Issue(ctx context.Context, group, instance string, ttl time.Dura
 	return token, nil
 }
 
-// Redeem checks the token of an instance: it returns the record, to be
-// passed to Joined, and the group of the instance.
+// Redeem checks the token of an instance against the tokens of its record
+// (the latest and the earlier ones of the same request, each with its own
+// expiry): it returns the record, to be passed to Joined, and the group of
+// the instance.
 func (s *Store) Redeem(ctx context.Context, instance, token string) (*api.Variable, string, error) {
 	v, err := s.read(ctx, instance)
 	if err != nil {
 		return nil, "", err
 	}
-	want := v.Items[itemToken]
-	if want == "" {
+	if v.Items[itemToken] == "" || v.Items[itemSerial] != "" {
 		return nil, "", fmt.Errorf("%w: the token of %s was used", ErrRefused, instance)
 	}
-	if subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(want)) != 1 {
+	held, ok := holds(v, hashToken(token))
+	if !ok {
 		return nil, "", fmt.Errorf("%w: a wrong token for %s", ErrRefused, instance)
 	}
-	if exp, err := time.Parse(time.RFC3339, v.Items[itemExpires]); err != nil || !s.now().Before(exp) {
+	if !s.now().Before(held.expires) {
 		return nil, "", fmt.Errorf("%w: the token of %s expired", ErrRefused, instance)
 	}
 	return v, v.Items[itemGroup], nil
 }
 
-// Joined records the first certificate of a redeemed instance; the token is
-// void from now. It fails if the token was used meanwhile; a change of the
-// record by the operator (its addresses) is not a use.
-func (s *Store) Joined(ctx context.Context, v *api.Variable, serial string) error {
-	token := v.Items[itemToken]
-	return s.updateRetry(ctx, v, func(cur *api.Variable) bool { return cur.Items[itemToken] == token },
-		func(items api.VariableItems) {
-			delete(items, itemToken)
-			delete(items, itemExpires)
-			items[itemSerial] = serial
-			items[itemJoined] = s.now().UTC().Format(time.RFC3339)
-		})
+// Joined records the first certificate of an instance redeemed with the
+// token; every token of the instance is void from now. It fails if a token
+// of the instance was used meanwhile; a change of the record by the operator
+// (its addresses, a token for the same request) is not a use.
+func (s *Store) Joined(ctx context.Context, v *api.Variable, token, serial string) error {
+	hash := hashToken(token)
+	still := func(cur *api.Variable) bool {
+		_, ok := holds(cur, hash)
+		return ok && cur.Items[itemSerial] == ""
+	}
+	return s.updateRetry(ctx, v, still, func(items api.VariableItems) {
+		delete(items, itemToken)
+		delete(items, itemExpires)
+		delete(items, itemPrevious)
+		items[itemSerial] = serial
+		items[itemJoined] = s.now().UTC().Format(time.RFC3339)
+	})
 }
 
 // Renewing checks that a certificate of an instance is its latest: it
@@ -227,10 +351,10 @@ func (s *Store) Seen(ctx context.Context, group, instance string, addresses []st
 
 // Prune deletes the records of a group that are no longer needed: a token
 // that expired unused, and an instance that joined and is gone. live are
-// the instances the provider lists for the group; only the records of
-// instances whose names start with namePrefix are read. The instances of a
-// request are recorded before the request, so an instance that joined is
-// listed until it is deleted.
+// the instances of the group: those the provider lists, and those of the
+// requests its listing has not all shown (a machine can join before the
+// listing shows it; review finding CON-6i). Only the records of instances
+// whose names start with namePrefix are read.
 func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[string]bool) error {
 	list, _, err := s.Vars.ListVariables(ctx, s.Namespace, s.prefix()+namePrefix, 0)
 	if err != nil {
@@ -254,8 +378,9 @@ func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[st
 			continue
 		}
 		joined := v.Items[itemSerial] != ""
-		exp, err := time.Parse(time.RFC3339, v.Items[itemExpires])
-		expired := err != nil || !s.now().Before(exp)
+		// Expired: no token of the record can be used any more.
+		now := s.now()
+		expired := !slices.ContainsFunc(tokensOf(v), func(t heldToken) bool { return now.Before(t.expires) })
 		if joined || expired {
 			if err := s.Vars.DeleteVariable(ctx, s.Namespace, meta.Path, v.ModifyIndex); err != nil {
 				errs = append(errs, err)

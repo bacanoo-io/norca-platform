@@ -128,7 +128,7 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
 	}
-	strays := matchNodes(obj.Name, o, nodes, nil)
+	strays := matchNodes(obj.Name, o, nodes, nil, nil)
 
 	for _, inst := range slices.Clone(o.instances) {
 		name := instanceKey(inst)

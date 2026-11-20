@@ -47,7 +47,7 @@ func TestRunSupervisesTheAgent(t *testing.T) {
 	defer hs.Close()
 	url := strings.Replace(hs.URL, "http://", "https://", 1)
 
-	token, err := store.Issue(context.Background(), "workers", "workers-1-1", time.Minute)
+	token, err := store.Issue(context.Background(), "workers", "", "workers-1-1", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

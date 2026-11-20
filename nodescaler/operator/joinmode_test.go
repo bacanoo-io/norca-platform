@@ -103,7 +103,7 @@ func TestJoin_InstancesGetATokenNotAKey(t *testing.T) {
 
 	// The instance joined and is gone (by other hands): its record goes.
 	v, _, _ := store.Redeem(context.Background(), "workers-dc1-1-1", conf.Token)
-	if err := store.Joined(context.Background(), v, "abc"); err != nil {
+	if err := store.Joined(context.Background(), v, conf.Token, "abc"); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.mock.Delete(context.Background(), "dc1", insts[0].ID); err != nil {

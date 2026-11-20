@@ -41,10 +41,17 @@ func TestParseFlags(t *testing.T) {
 	if f, err := parseFlags([]string{"-join-check-address=false"}); err != nil || f.joinCheckAddr {
 		t.Fatalf("-join-check-address=false: %+v %v", f, err)
 	}
+	if f, err := parseFlags(nil); err != nil || f.listGrace != 2*time.Minute {
+		t.Fatalf("the default of -list-grace: %+v %v", f, err)
+	}
+	if f, err := parseFlags([]string{"-list-grace=5m"}); err != nil || f.listGrace != 5*time.Minute {
+		t.Fatalf("-list-grace=5m: %+v %v", f, err)
+	}
 	for args, want := range map[string]string{
 		"-region=":            "-region must not be empty",
 		"-workers=0":          "-workers must be at least 1",
 		"-join-key-store=hsm": "-join-key-store \"hsm\" is not file, tpm or auto",
+		"-list-grace=0":       "-list-grace must be at least 1s",
 		"-unknown=1":          "flag provided but not defined",
 	} {
 		if _, err := parseFlags(strings.Fields(args)); err == nil || !strings.Contains(err.Error(), want) {

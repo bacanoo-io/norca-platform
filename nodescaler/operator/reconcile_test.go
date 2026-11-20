@@ -243,9 +243,80 @@ type env struct {
 	backend *fake.Backend
 	nodes   *fakeNodes
 	mock    *mock.Provider
-	r       *Reconciler
-	now     time.Time
-	url     string
+	// lag is what the operator calls: the mock, with a listing that can lag
+	// behind its creates.
+	lag *laggingProvider
+	r   *Reconciler
+	now time.Time
+	url string
+}
+
+// laggingProvider is the mock provider behind a listing that may not show
+// every instance yet, as the list call of a platform lags behind its creates.
+// It records the IDs of the requests it was asked to create.
+type laggingProvider struct {
+	provider.Provider
+
+	mu       sync.Mutex
+	hidden   func(provider.Instance) bool // the instances the listing does not show
+	requests []string
+	last     provider.CreateRequest // the last create request
+	lose     bool                   // the answer of the next create is lost
+}
+
+// loseNextAnswer makes the next create happen and its answer fail.
+func (l *laggingProvider) loseNextAnswer() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lose = true
+}
+
+// lastRequest returns the last create request.
+func (l *laggingProvider) lastRequest() provider.CreateRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.last
+}
+
+// hide sets the instances the listing does not show; nil shows all.
+func (l *laggingProvider) hide(hidden func(provider.Instance) bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hidden = hidden
+}
+
+// asked returns the IDs of the create requests so far.
+func (l *laggingProvider) asked() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.requests)
+}
+
+func (l *laggingProvider) Group(ctx context.Context, group string, params map[string]any) (*provider.Group, error) {
+	g, err := l.Provider.Group(ctx, group, params)
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.hidden != nil {
+		g.Instances = slices.DeleteFunc(g.Instances, l.hidden)
+	}
+	return g, nil
+}
+
+func (l *laggingProvider) Create(ctx context.Context, group string, req provider.CreateRequest) ([]provider.Instance, error) {
+	l.mu.Lock()
+	l.requests = append(l.requests, req.RequestID)
+	l.last = req
+	lose := l.lose
+	l.lose = false
+	l.mu.Unlock()
+	created, err := l.Provider.Create(ctx, group, req)
+	if err == nil && lose {
+		return nil, errors.New("the connection was reset")
+	}
+	return created, err
 }
 
 func newEnv(t *testing.T, token string) *env {
@@ -256,7 +327,8 @@ func newEnv(t *testing.T, token string) *env {
 		"dc1": {Capacity: provider.Capacity{CPU: 4000, Memory: 8192, Disk: 40000}, Max: 5},
 	})
 	e.mock.Now = func() time.Time { return e.now }
-	srv := httptest.NewServer(provider.NewHandler(e.mock, token, nil))
+	e.lag = &laggingProvider{Provider: e.mock}
+	srv := httptest.NewServer(provider.NewHandler(e.lag, token, nil))
 	t.Cleanup(srv.Close)
 	e.url = srv.URL
 	e.r = NewReconciler(e.backend, e.nodes, Config{
