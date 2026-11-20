@@ -140,8 +140,18 @@ func (o *Operator) run(ctx context.Context, every time.Duration, elector *contro
 		passes(ctx)
 		return
 	}
-	o.leading = elector.Leading
+	o.follow(elector)
 	elector.Run(ctx, passes, nil)
+}
+
+// follow ties the operator to a leader election: its side effects are fenced
+// by the leadership, and its responder answers the HTTP-01 challenges and is
+// ready only while this instance leads (review finding CON-6f). Run calls it
+// before the responder is served, so an instance is never ready before it
+// leads.
+func (o *Operator) follow(elector *controller.LeaderElector) {
+	o.leading = elector.Leading
+	o.responder.follow(elector.Leading)
 }
 
 // fence is called right before a side effect that no check-and-set

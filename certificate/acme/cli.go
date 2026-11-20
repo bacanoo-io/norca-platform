@@ -127,6 +127,21 @@ func Run(ctx context.Context, args []string, version string) error {
 		return err
 	}
 
+	// The passes run on the instance that leads, and the HTTP-01 server
+	// answers the challenges and is ready (ReadyPath) there only: what it
+	// answers is in the memory of that instance. The responder follows the
+	// election before it is served.
+	var elector *controller.LeaderElector
+	if s.LeaderElection {
+		elector, err = controller.NewLeaderElector(controller.NewBackend(client), controller.LeaderElectionConfig{
+			Namespace: s.LeaseNamespace, Path: controller.LeaseRoot + "/" + s.Controller, ReleaseOnCancel: true,
+		}, logger)
+		if err != nil {
+			return err
+		}
+		op.follow(elector)
+	}
+
 	// A failure of the HTTP-01 server ends the operator.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -153,17 +168,6 @@ func Run(ctx context.Context, args []string, version string) error {
 		}()
 	}
 
-	// The HTTP-01 server answers on every instance (what it answers is in
-	// the memory of the instance that leads); the passes run on the leader.
-	var elector *controller.LeaderElector
-	if s.LeaderElection {
-		elector, err = controller.NewLeaderElector(controller.NewBackend(client), controller.LeaderElectionConfig{
-			Namespace: s.LeaseNamespace, Path: controller.LeaseRoot + "/" + s.Controller, ReleaseOnCancel: true,
-		}, logger)
-		if err != nil {
-			return err
-		}
-	}
 	logger.Info("norca-acme started", "controller", s.Controller, "version", version, "interval", s.Interval.String(),
 		"leader_election", s.LeaderElection)
 	op.run(ctx, s.Interval, elector)
