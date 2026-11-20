@@ -25,8 +25,11 @@ import (
 // needed.
 type JoinIssuer interface {
 	// Ticket records the token of an instance of the group, valid for ttl,
-	// and names the join endpoints.
-	Ticket(ctx context.Context, group, instance string, ttl time.Duration) (bootstrap.JoinTicket, error)
+	// for the request with the ID, and names the join endpoints. For a
+	// request made again, the tokens it issued for the instance before stay
+	// valid beside the new one; an instance of the request that has joined
+	// gets none: its ticket has no token (join.Store.Issue).
+	Ticket(ctx context.Context, group, request, instance string, ttl time.Duration) (bootstrap.JoinTicket, error)
 	// Prune drops the records of the group whose token expired unused and
 	// those of instances that are gone; live are the instances the
 	// provider lists, prefix is the start of the names of the group's
@@ -62,7 +65,7 @@ type StoreJoin struct {
 }
 
 // Ticket implements JoinIssuer.
-func (s *StoreJoin) Ticket(ctx context.Context, group, instance string, ttl time.Duration) (bootstrap.JoinTicket, error) {
+func (s *StoreJoin) Ticket(ctx context.Context, group, request, instance string, ttl time.Duration) (bootstrap.JoinTicket, error) {
 	urls, err := s.URLs(ctx)
 	if err != nil {
 		return bootstrap.JoinTicket{}, fmt.Errorf("the join endpoints: %w", err)
@@ -70,12 +73,15 @@ func (s *StoreJoin) Ticket(ctx context.Context, group, instance string, ttl time
 	if len(urls) == 0 {
 		return bootstrap.JoinTicket{}, errors.New("no join endpoint is known: the operator's join service has no instance and no -join-url is set")
 	}
-	// A new token is a new record: what the provider reports is recorded
-	// again.
+	// A new token may be a new record: what the provider reports is
+	// recorded again.
 	s.mu.Lock()
 	delete(s.seen, group+"/"+instance)
 	s.mu.Unlock()
-	token, err := s.Store.Issue(ctx, group, instance, ttl)
+	token, err := s.Store.Issue(ctx, group, request, instance, ttl)
+	if errors.Is(err, join.ErrJoined) {
+		return bootstrap.JoinTicket{URLs: urls, KeyStore: s.KeyStore}, nil
+	}
 	if err != nil {
 		return bootstrap.JoinTicket{}, err
 	}

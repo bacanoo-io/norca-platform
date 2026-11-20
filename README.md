@@ -170,6 +170,21 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
   all records of a group when it is deleted with its instances (`drain`,
   `terminate`); orphaned instances keep theirs, so their nodes go on
   renewing.
+- **A request made again keeps the tokens of the first time.** When the
+  operator makes a request again with its own number (a lost answer of the
+  create, or instances its listing did not show within `-list-grace`), the
+  provider answers with the machines it made the first time, which were
+  started with the tokens of the first time. So the new token of an instance
+  does not void the ones issued for it **by the same request** (the record
+  names the request, `request`): they stay valid beside it
+  (`previous_tokens`, hashes; at most 16, the oldest dropped first), each
+  until its own expiry, which a new issue does not extend. Whichever of them
+  a machine has, it joins once: the join voids every token of the name, and
+  a used token is never valid again. An instance of the request that has
+  joined gets no token and no bootstrap in the repeated request, and its
+  record is not written, so its renewals go on. A token issued for the name
+  by another request or another group replaces the record: every token
+  before it is void.
 - A renewal rotates the key: the endpoint refuses a request for the key of
   the current certificate (`RenewalRefused`), so a key that leaked does not
   stay valid through the renewals.

@@ -260,6 +260,22 @@ type laggingProvider struct {
 	mu       sync.Mutex
 	hidden   func(provider.Instance) bool // the instances the listing does not show
 	requests []string
+	last     provider.CreateRequest // the last create request
+	lose     bool                   // the answer of the next create is lost
+}
+
+// loseNextAnswer makes the next create happen and its answer fail.
+func (l *laggingProvider) loseNextAnswer() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lose = true
+}
+
+// lastRequest returns the last create request.
+func (l *laggingProvider) lastRequest() provider.CreateRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.last
 }
 
 // hide sets the instances the listing does not show; nil shows all.
@@ -292,8 +308,15 @@ func (l *laggingProvider) Group(ctx context.Context, group string, params map[st
 func (l *laggingProvider) Create(ctx context.Context, group string, req provider.CreateRequest) ([]provider.Instance, error) {
 	l.mu.Lock()
 	l.requests = append(l.requests, req.RequestID)
+	l.last = req
+	lose := l.lose
+	l.lose = false
 	l.mu.Unlock()
-	return l.Provider.Create(ctx, group, req)
+	created, err := l.Provider.Create(ctx, group, req)
+	if err == nil && lose {
+		return nil, errors.New("the connection was reset")
+	}
+	return created, err
 }
 
 func newEnv(t *testing.T, token string) *env {

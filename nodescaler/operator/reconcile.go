@@ -564,9 +564,18 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 			node := bootstrap.Node{Name: name, Datacenter: spec.Datacenter, Pool: spec.Pool, Class: spec.NodeClass, Meta: meta}
 			if r.cfg.Join != nil {
 				// The node makes its key and fetches its certificate.
-				ticket, err := r.cfg.Join.Ticket(ctx, obj.Name, name, spec.joinDeadline()+joinSlack)
+				ticket, err := r.cfg.Join.Ticket(ctx, obj.Name, r.requestID(obj.Name, seq), name, spec.joinDeadline()+joinSlack)
 				if err != nil {
 					return nil, nil, fmt.Errorf("the join of %s: %w", name, err)
+				}
+				if ticket.Token == "" {
+					// An instance of a request made again that has joined:
+					// it needs no token, and the provider, which has it,
+					// answers with it. Its name stays in the request,
+					// without a bootstrap: a machine made from it could not
+					// join.
+					out = append(out, ir)
+					continue
 				}
 				if spec.Join.KeyStore != "" {
 					ticket.KeyStore = spec.Join.KeyStore

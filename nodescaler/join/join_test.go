@@ -79,7 +79,7 @@ func newEnv(t *testing.T) *env {
 // node is the configuration of norca-join of an instance, with a token.
 func (e *env) node(instance string) (*join.Client, string) {
 	e.t.Helper()
-	token, err := e.store.Issue(context.Background(), "workers", instance, 10*time.Minute)
+	token, err := e.store.Issue(context.Background(), "workers", "", instance, 10*time.Minute)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -417,10 +417,10 @@ func TestOperatorWritesDoNotRefuse(t *testing.T) {
 	if _, err := e.store.Seen(ctx, "workers", "workers-1-1", []string{"10.0.0.9"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.store.Joined(ctx, rec, "aa"); err != nil {
+	if err := e.store.Joined(ctx, rec, c.Config.Token, "aa"); err != nil {
 		t.Fatalf("a join after a write of the operator: %v", err)
 	}
-	if err := e.store.Joined(ctx, rec, "bb"); !errors.Is(err, join.ErrRefused) {
+	if err := e.store.Joined(ctx, rec, c.Config.Token, "bb"); !errors.Is(err, join.ErrRefused) {
 		t.Fatalf("the token was used twice: %v", err)
 	}
 	rec, _, err = e.store.Renewing(ctx, "workers-1-1", "aa")
@@ -578,11 +578,11 @@ func TestPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.node("workers-1-2") // a fresh token of an instance being created
-	if _, err := e.store.Issue(ctx, "other", "other-1-1", time.Minute); err != nil {
+	if _, err := e.store.Issue(ctx, "other", "", "other-1-1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	// A group whose instances start like those of "workers".
-	if _, err := e.store.Issue(ctx, "workers-x", "workers-x-1-1", time.Minute); err != nil {
+	if _, err := e.store.Issue(ctx, "workers-x", "", "workers-x-1-1", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	e.node("workers-1-3")

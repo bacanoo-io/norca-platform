@@ -30,7 +30,10 @@ import (
 // them and creates nothing. The answer says what the request made, and the
 // grace time starts again for those of its instances the listing does not
 // show. This is reported: the event InstancesNotListed, and Provisioned is
-// False (NotListed) until the listing shows them. If the group is not short
+// False (NotListed) until the listing shows them. With the join, the request
+// made again carries new tokens and the ones of the first time stay valid
+// for the machines that have them (join.Store.Issue; review finding CON-6h);
+// an instance that has joined gets none. If the group is not short
 // (the scale was lowered meanwhile), the request is forgotten.
 //
 // The record is written with the status of the look that made the request,
