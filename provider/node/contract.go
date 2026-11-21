@@ -96,9 +96,25 @@ type Group struct {
 }
 
 // CreateRequest asks for instances, one per entry of Instances. It is
-// idempotent by RequestID: the same request again returns the instances of
-// the first one and creates nothing, so a request repeated after a failure or
-// a restart of the operator does not create more machines.
+// idempotent by RequestID, and the rule is about the instances the provider
+// has, not about the entries of the request:
+//
+//   - While the provider has an instance with the RequestID (in any state),
+//     a request with that ID is answered with the instances of the ID it has,
+//     and nothing is created from the entries of the request. This holds also
+//     when the provider has fewer of them than the request names: because a
+//     create failed part of the way, or because instances of the request were
+//     deleted since. The request is not brought up to the number it names.
+//     The operator makes a request again after a lost answer, a restart, or
+//     when the listing did not show its instances in time, and the request
+//     made again can name instances the operator deleted on purpose, and
+//     instances whose node has joined, without a bootstrap: none of them may
+//     be made again. What a group is still short of, the operator asks for in
+//     a request with a new ID.
+//   - A provider that has no instance with the RequestID treats the request
+//     as a new one and creates its instances. A provider need not remember
+//     the IDs of requests whose instances are all gone: it knows a request by
+//     the instances of its platform (a label or a tag with the ID).
 type CreateRequest struct {
 	RequestID  string            `json:"request_id"`
 	Instances  []InstanceRequest `json:"instances"`
@@ -134,9 +150,11 @@ type Provider interface {
 	// group.
 	Group(ctx context.Context, group string, params map[string]any) (*Group, error)
 
-	// Create creates the instances of a request, or returns those of an
-	// earlier request with the same ID. An error with a reason (see Fail)
-	// says why nothing was created.
+	// Create creates the instances of a request. When the provider has an
+	// instance of a request with the same ID, it returns the instances of
+	// that ID it has and creates nothing, whatever the request names; when
+	// it has none, the request is a new one (see CreateRequest). An error
+	// with a reason (see Fail) says why nothing was created.
 	Create(ctx context.Context, group string, req CreateRequest) ([]Instance, error)
 
 	// Delete deletes an instance. Deleting one that is gone is not an error.

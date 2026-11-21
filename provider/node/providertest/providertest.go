@@ -10,6 +10,9 @@
 //     an empty list of instances, not none;
 //   - a create is idempotent by its request ID, and the instances carry the
 //     names, the labels and the request ID they were asked for;
+//   - a request made again creates nothing while the provider has an instance
+//     of it, also when one of its instances was deleted, and is a new request
+//     once none is left;
 //   - invalid requests and unknown groups are refused with their reason;
 //   - a full group refuses with the reason quota and creates nothing;
 //   - a deleted instance goes, and deleting it again is not an error;
@@ -96,6 +99,7 @@ func Run(t *testing.T, cfg Config) {
 	c := checks{cfg: cfg}
 	t.Run("GroupHasTheCapacityWithoutInstances", c.capacity)
 	t.Run("CreateIsIdempotentByRequestID", c.idempotent)
+	t.Run("ARepeatedRequestCreatesNothingWhileAnInstanceIsLeft", c.repeated)
 	t.Run("InvalidRequestsAreRefused", c.invalid)
 	t.Run("QuotaHasAReason", c.quota)
 	t.Run("Delete", c.delete)
@@ -227,6 +231,86 @@ func (c checks) idempotent(t *testing.T) {
 		got := ofRequest(g, req.RequestID)
 		return slices.Equal(ids(got), ids(first)), fmt.Sprintf("listed %v, created %v", ids(got), ids(first))
 	})
+}
+
+// repeated checks what a request made again creates (review finding CON-6j):
+// nothing while the provider has an instance of the request, also when it has
+// fewer than the request names; and all of it, as a new request, once the
+// provider has no instance of the request left.
+func (c checks) repeated(t *testing.T) {
+	ctx := context.Background()
+	cl := serve(t, c.cfg.New(t))
+	want := names("pt-again", 2)
+	req := c.request(t, "providertest/repeated/1", want...)
+	first, err := cl.Create(ctx, c.cfg.Group, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 {
+		t.Fatalf("%d instances for a request of 2: %+v", len(first), first)
+	}
+	// listed are the instances of the request the group lists, in any state.
+	listed := func() ([]node.Instance, error) {
+		g, err := cl.Group(ctx, c.cfg.Group, c.cfg.Params)
+		if err != nil {
+			return nil, err
+		}
+		var out []node.Instance
+		for _, inst := range g.Instances {
+			if inst.RequestID == req.RequestID {
+				out = append(out, inst)
+			}
+		}
+		return out, nil
+	}
+	gone := func(n int) {
+		t.Helper()
+		if err := cl.Delete(ctx, c.cfg.Group, first[n].ID); err != nil {
+			t.Fatal(err)
+		}
+		c.eventually(t, "a deleted instance goes", func() (bool, string) {
+			got, err := listed()
+			if err != nil {
+				return false, err.Error()
+			}
+			return !slices.ContainsFunc(got, func(i node.Instance) bool { return i.ID == first[n].ID }), fmt.Sprintf("listed %+v", got)
+		})
+	}
+
+	// One of the two is deleted: the request again is answered with the one
+	// that is left, and the deleted one is not made again.
+	gone(0)
+	again, err := cl.Create(ctx, c.cfg.Group, req)
+	if err != nil {
+		t.Fatalf("the same request again, one of its instances deleted: %v", err)
+	}
+	if len(again) != 1 || again[0].ID != first[1].ID {
+		t.Fatalf("the same request again, one of its instances deleted, returned %+v: it must return the instance that is left (%s) and create nothing",
+			again, first[1].ID)
+	}
+	if got, err := listed(); err != nil || len(got) != 1 || got[0].ID != first[1].ID {
+		t.Fatalf("the same request again, one of its instances deleted: the group lists %+v (%v), want only %s", got, err, first[1].ID)
+	}
+
+	// Both are deleted: the provider has no instance of the request, and the
+	// request is a new one.
+	gone(1)
+	fresh, err := cl.Create(ctx, c.cfg.Group, req)
+	if err != nil {
+		t.Fatalf("the same request again, all of its instances deleted: %v", err)
+	}
+	var got []string
+	for _, inst := range fresh {
+		if inst.RequestID != req.RequestID {
+			t.Fatalf("instance %s has the request %q, want %q", inst.ID, inst.RequestID, req.RequestID)
+		}
+		got = append(got, inst.Name)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Fatalf("the same request again, all of its instances deleted, returned %v: a provider that has no instance of a request creates its instances (%v)",
+			got, want)
+	}
 }
 
 func (c checks) invalid(t *testing.T) {

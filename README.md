@@ -428,7 +428,17 @@ DELETE {endpoint}/v1/groups/{group}/instances/{id}  delete one instance
 
 with a bearer token. A create request lists the instances, each with its
 name and its bootstrap (`user_data`); the provider gives the machine that
-name. A request that cannot be served fails with a reason:
+name. **A create is idempotent by its `request_id`, by the instances the
+provider has:** while it has an instance with the `request_id` (in any
+state), a request with that ID is answered with the instances of the ID it
+has, and nothing is created from the entries of the request, also when it
+has fewer of them than the request names (a create that failed part of the
+way, instances deleted since). The request is not brought up to the number
+it names: a request made again can name instances the operator deleted on
+purpose, and what a group is still short of is asked for with a new ID. A
+provider that has no instance left with the `request_id` treats the request
+as a new one; it need not remember the IDs of requests whose instances are
+gone. A request that cannot be served fails with a reason:
 `quota`, `no_capacity`, `invalid` or `error`. An instance may report its
 `addresses`, every IP address its node's traffic to the operator can come
 from (its own, a NAT in front of it), best already in the answer of the
@@ -438,7 +448,9 @@ of `provider/node`.
 
 **`provider/node/providertest`** checks a node provider against the
 contract over HTTP, as the operator calls it: the capacity of a group
-without instances, a create that is idempotent by its request ID, the names,
+without instances, a create that is idempotent by its request ID (a request
+made again creates nothing while an instance of it is left, and is a new
+request once none is), the names,
 labels and request IDs of the instances, invalid requests, the quota reason,
 the delete, a restart that loses nothing, and the token. The mock and the
 docker provider run it in their tests; a provider for a cloud runs it

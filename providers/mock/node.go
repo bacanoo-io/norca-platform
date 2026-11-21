@@ -101,7 +101,15 @@ func (p *Provider) Create(_ context.Context, group string, req node.CreateReques
 				out = append(out, inst)
 			}
 		}
-		return out, nil
+		if len(out) > 0 {
+			// The request again: the instances of it that are left, and
+			// nothing new, also when it names more.
+			return out, nil
+		}
+		// None of its instances is left: the request is a new one, as for a
+		// provider that knows a request only by the instances of its
+		// platform (review finding CON-6j).
+		delete(p.requests, req.RequestID)
 	}
 	if cfg.Max > 0 && len(p.inst[group])+len(req.Instances) > cfg.Max {
 		return nil, node.Fail(node.ReasonQuota, "group %s has %d of %d instances, %d more asked for",
