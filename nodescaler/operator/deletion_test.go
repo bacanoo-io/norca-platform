@@ -172,6 +172,118 @@ func TestDeletion_NodeStaysUp(t *testing.T) {
 	}
 }
 
+// joinRecords counts the join records of the two instances of the first
+// request of the group.
+func (e *env) joinRecords() int {
+	n := 0
+	for _, inst := range []string{"workers-dc1-1-1", "workers-dc1-1-2"} {
+		if e.backend.GetVariable("default", "nodescaler/join/eu/"+inst) != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// A group deleted while the listing of the provider does not show the
+// instances of a request yet waits for them: the deletion deletes them when
+// the listing shows them, and their join records go with them (review
+// finding CON-6k: the group went at once, with the join records, and the
+// machines were left for the orphan sweep).
+func TestDeletion_WaitsForInstancesNotListed(t *testing.T) {
+	e, _ := joinEnv(t)
+	e.putGroup(2, map[string]any{"deletion": map[string]any{"policy": "terminate"}})
+	e.reconcile()
+	if n := len(e.instances()); n != 2 || e.joinRecords() != 2 {
+		t.Fatalf("%d instances, %d join records", n, e.joinRecords())
+	}
+	e.lag.hide(hideAll)
+	e.backend.RemoveObject(NodeGroupKind, "", "workers-dc1")
+
+	// Within the grace time: the group stays, and so do the records.
+	for range 2 {
+		d := e.reconcile()
+		if e.gone() {
+			t.Fatalf("the group went while the listing does not show %d instances of its request", len(e.instances()))
+		}
+		if d != e.r.cfg.JoinCheck {
+			t.Fatalf("requeue %v, want the join check", d)
+		}
+	}
+	if n := e.joinRecords(); n != 2 {
+		t.Fatalf("%d join records while the instances are waited for, want 2", n)
+	}
+	st := e.status()
+	d, _ := st["deletion"].(map[string]any)
+	waiting, _ := d["waiting"].([]any)
+	if len(waiting) != 1 || !strings.Contains(waiting[0].(string), "2 instances of request eu/workers-dc1/1") {
+		t.Fatalf("status.deletion: %+v", st["deletion"])
+	}
+	if p := pendingOf(st); len(p) != 1 || p[0]["count"] != 2.0 {
+		t.Fatalf("pendingRequests: %+v", p)
+	}
+	if asked := e.lag.asked(); len(asked) != 1 {
+		t.Fatalf("a deleted group asked for instances: %v", asked)
+	}
+
+	// One is listed: it is deleted, the other is still waited for.
+	insts := e.instances()
+	e.lag.hide(func(i provider.Instance) bool { return i.ID != insts[0].ID })
+	e.reconcile()
+	if got := e.instanceIDs(); !slices.Equal(got, []string{insts[1].ID}) || e.gone() {
+		t.Fatalf("instances %v, gone %t; want only %s and the group", got, e.gone(), insts[1].ID)
+	}
+	if p := pendingOf(e.status()); len(p) != 1 || len(p[0]["listed"].([]any)) != 1 {
+		t.Fatalf("pendingRequests: %+v", p)
+	}
+
+	// The other is listed: it is deleted, and the group goes with the records.
+	e.lag.hide(nil)
+	e.reconcile()
+	if n := len(e.instances()); n != 0 || !e.gone() {
+		t.Fatalf("%d instances left, gone %t", n, e.gone())
+	}
+	if n := e.joinRecords(); n != 0 {
+		t.Fatalf("%d join records after the deletion", n)
+	}
+}
+
+// The deletion does not wait for ever: after the grace time the instances
+// that no listing has shown count as not there, as they do for the scale.
+func TestDeletion_GraceTimeOfInstancesNotListed(t *testing.T) {
+	e := newEnv(t, "")
+	e.putGroup(2, map[string]any{"deletion": map[string]any{"policy": "terminate"}})
+	e.reconcile()
+	e.lag.hide(hideAll)
+	e.backend.RemoveObject(NodeGroupKind, "", "workers-dc1")
+
+	e.advance(e.r.cfg.ListGrace)
+	e.reconcile()
+	if e.gone() {
+		t.Fatal("the group went within the grace time")
+	}
+	e.advance(time.Second)
+	e.reconcile()
+	if !e.gone() {
+		t.Fatal("the group is still there after the grace time")
+	}
+	if asked := e.lag.asked(); len(asked) != 1 {
+		t.Fatalf("a deleted group asked for instances: %v", asked)
+	}
+}
+
+// With the policy orphan nothing is waited for: the instances stay anyway.
+func TestDeletion_OrphanDoesNotWaitForTheListing(t *testing.T) {
+	e := newEnv(t, "")
+	e.putGroup(2, map[string]any{"deletion": map[string]any{"policy": "orphan"}})
+	e.reconcile()
+	e.lag.hide(hideAll)
+	e.backend.RemoveObject(NodeGroupKind, "", "workers-dc1")
+	e.reconcile()
+	if !e.gone() || len(e.instances()) != 2 {
+		t.Fatalf("gone %t, %d instances", e.gone(), len(e.instances()))
+	}
+}
+
 func TestDeletion_DisabledGroupHasNoFinalizer(t *testing.T) {
 	e := newEnv(t, "")
 	e.putGroup(1, map[string]any{"enabled": false})

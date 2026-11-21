@@ -126,7 +126,13 @@ while a request is in `pendingRequests`, the names of its instances count as
 instances of the group, so a node with one of them is the node of its
 instance (not a node without an instance, below), and with `-join-listen`
 its join record is kept, so its certificate renews. Once the request is
-forgotten, the names are handled like any other.
+forgotten, the names are handled like any other. A group that is deleted
+(`spec.deletion.policy` `drain` or `terminate`) while a request is in
+`pendingRequests` waits for its instances for the same grace time
+(`status.deletion.waiting` names the request and until when): each is drained
+or deleted when the listing shows it, and the join records of the group go
+after them. The deleted group makes no request again; an instance that no
+listing showed within the grace time and turns up later is an orphan.
 
 **The bootstrap of a machine.** The deployer writes the static parts of a
 region into the Variable `nodescaler/bootstrap/<region>` (namespace

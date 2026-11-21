@@ -29,6 +29,15 @@ import (
 //   - orphan: the instances stay, with the labels of the group, and only the
 //     object goes. The orphan sweep reports them (orphans.go).
 //
+// With drain and terminate the deletion also waits for the instances of the
+// requests the provider answered and its listing has not all shown
+// (status.pendingRequests, pending.go), for the grace time of the listing
+// (Config.ListGrace): it deals with each when the listing shows it, so the
+// machine is deleted by the deletion of its group and not left for the orphan
+// sweep, and its join record is kept until then (review finding CON-6k). It
+// makes no request again; after the grace time such an instance counts as
+// not there, and one that turns up later is an orphan.
+//
 // Once the provider lists no instance of the group, and the nodes of the
 // deleted instances are down (and purged) or did not go down within downWait,
 // the finalizer is removed and the object goes. A deletion that waits longer
@@ -121,9 +130,13 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 	}
 	if err != nil {
 		state.Waiting = append(state.Waiting, fmt.Sprintf("provider %q: %v", spec.Provider, err))
-		return r.deletionStatus(ctx, obj, spec, state, nil, now)
+		return r.deletionStatus(ctx, obj, spec, state, nil, nil, now)
 	}
 	o := r.observe(obj.Name, pg)
+	// The requests whose instances the listing has not all shown (pending.go):
+	// those instances are instances of the group too, and are dealt with
+	// once the listing shows them.
+	pend := r.pending(obj.Name, prev, o.instances)
 	nodes, err := r.Nodes.Nodes(ctx, spec.Datacenter, spec.Pool, spec.NodeClass)
 	if err != nil {
 		return 0, fmt.Errorf("listing the nodes of node group %s: %w", obj.Name, err)
@@ -184,9 +197,25 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 			r.log.Warn("the node of a deleted instance is still up, it is left as it is", "group", obj.Name, "node", n.ID)
 		}
 	}
+	// The instances the provider answered a request with and its listing has
+	// not shown: waited for within the grace time, so that they are deleted
+	// here and their join records go with them. A deleted group makes no
+	// request again; after the grace time they count as not there, as for the
+	// scale, and one that turns up later is an orphan (orphans.go).
+	for _, p := range pend {
+		if p.overdue(now, r.cfg.ListGrace) {
+			continue
+		}
+		state.Waiting = append(state.Waiting, fmt.Sprintf("%d instances of request %s that provider %q does not list yet (until %s)",
+			p.unlisted(), r.requestID(obj.Name, p.Number), spec.Provider, p.At.Add(r.cfg.ListGrace).UTC().Format(time.RFC3339)))
+	}
 	state.Waiting = uniq(state.Waiting)
 
 	if len(state.Waiting) == 0 {
+		for _, p := range pend {
+			r.log.Warn("node group deleted while the provider never listed instances of a request; if they exist, the orphan sweep finds them",
+				"group", obj.Name, "provider", spec.Provider, "request", r.requestID(obj.Name, p.Number), "instances", p.unlisted())
+		}
 		r.log.Info("node group deleted, its instances are gone", "group", obj.Name, "policy", policy)
 		// The join records of the instances go with them. Orphaned
 		// instances (above) keep theirs: their nodes go on renewing.
@@ -197,7 +226,7 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 		}
 		return 0, r.release(ctx, obj)
 	}
-	return r.deletionStatus(ctx, obj, spec, state, o, now)
+	return r.deletionStatus(ctx, obj, spec, state, o, pend, now)
 }
 
 // drainForDeletion drains the node of an instance of a deleted group, and
@@ -238,9 +267,11 @@ func (r *Reconciler) drainForDeletion(ctx context.Context, obj *api.CustomObject
 }
 
 // deletionStatus writes what the deletion waits for, and DeletionBlocked
-// once it has waited longer than deletion.drain_timeout.
+// once it has waited longer than deletion.drain_timeout. With what the
+// provider lists (o), it writes the requests whose instances the listing has
+// not all shown (pend) too; without, status.pendingRequests stays as it is.
 func (r *Reconciler) deletionStatus(ctx context.Context, obj *api.CustomObject, spec *groupSpec, state deletionState,
-	o *observed, now time.Time) (time.Duration, error) {
+	o *observed, pend []*pendingRequest, now time.Time) (time.Duration, error) {
 
 	since := time.Unix(0, obj.DeletionTime)
 	blocked := condition{Type: CondDeletionBlocked, Status: "False", Reason: "Deleting",
@@ -259,6 +290,11 @@ func (r *Reconciler) deletionStatus(ctx context.Context, obj *api.CustomObject, 
 			ready, joining, failed, _ := o.counts()
 			status["replicas"], status["joining"], status["failed"] = ready, joining, failed
 			status["nodes"] = nodeRecords(o, nil, nil)
+			if d := pendingDocs(pend); d != nil {
+				status["pendingRequests"] = d
+			} else {
+				delete(status, "pendingRequests")
+			}
 		}
 		delete(status, "removal")
 		delete(status, "rollout")
