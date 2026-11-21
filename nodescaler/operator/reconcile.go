@@ -23,12 +23,15 @@ package operator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
 	"net/http"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -609,11 +612,42 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 	return out, issued, nil
 }
 
-// instanceName is the name of the i-th instance of a request: the group, the
-// number of the request and i, as a host name (lower case letters, digits and
-// dashes, at most 63 characters).
-func instanceName(group string, seq int64, i int) string {
-	suffix := fmt.Sprintf("-%d-%d", seq, i)
+// The names of the instances. A name is a host name (lower case letters,
+// digits and dashes, at most 63 characters): <base>-<request>-<i>, where the
+// base says which group the instance is of. No two groups have the same base
+// (review finding CON-6l: Edge_Pool and edge-pool both had edge-pool, so both
+// named a machine edge-pool-1-1, and the two machines shared one join
+// record):
+//
+//   - a group whose name is a host name already, of at most maxPlainBase
+//     characters, and does not end like a mark, is its own base
+//     (workers-dc1-3-1);
+//   - any other name is made a host name (lower case, a dash for every other
+//     character, cut to headLen characters), and the mark of the group follows
+//     it: the first markLen hex digits of the SHA-256 of the exact name
+//     (edge-pool-d68a2eab-1-1 for Edge_Pool).
+//
+// A plain base never ends like a mark, so it is not the base another group
+// gets with its mark; two bases with a mark are the same only when the marks
+// are.
+const (
+	// maxInstanceName is the longest name of an instance (a DNS label).
+	maxInstanceName = 63
+	// maxPlainBase is the longest base. It leaves 24 characters for the
+	// numbers: every request number with up to 999 instances.
+	maxPlainBase = 39
+	// markLen is the length of the mark of a group; headLen what is left of
+	// the base before it and its dash.
+	markLen = 8
+	headLen = maxPlainBase - markLen - 1
+)
+
+// markEnd is how a base with a mark ends.
+var markEnd = regexp.MustCompile(`-[0-9a-f]{8}$`)
+
+// hostName makes a group name a host name: lower case, a dash for every
+// character that is not a letter or a digit, none at the ends.
+func hostName(group string) string {
 	var b strings.Builder
 	for _, c := range strings.ToLower(group) {
 		switch {
@@ -623,14 +657,43 @@ func instanceName(group string, seq int64, i int) string {
 			b.WriteByte('-')
 		}
 	}
-	base := strings.Trim(b.String(), "-")
-	if base == "" {
-		base = "node"
+	return strings.Trim(b.String(), "-")
+}
+
+// plainBase reports a group whose name is the base of its instances as it
+// is.
+func plainBase(group string) bool {
+	return group != "" && hostName(group) == group && len(group) <= maxPlainBase && !markEnd.MatchString(group)
+}
+
+// baseHead is the start of the base of a group that is not its own base: its
+// name as a host name, cut to at most n characters.
+func baseHead(group string, n int) string {
+	head := hostName(group)
+	if len(head) > n {
+		head = strings.TrimRight(head[:max(n, 0)], "-")
 	}
-	if max := 63 - len(suffix); len(base) > max {
-		base = strings.TrimRight(base[:max], "-")
+	if head == "" {
+		head = "node"
 	}
-	return base + suffix
+	return head
+}
+
+// instanceBase is the base of the names of the instances of a group, of at
+// most room characters (room is maxPlainBase or more for every request an
+// operator makes; a shorter one cuts the head, never the mark).
+func instanceBase(group string, room int) string {
+	if plainBase(group) && len(group) <= room {
+		return group
+	}
+	sum := sha256.Sum256([]byte(group))
+	return baseHead(group, min(headLen, room-markLen-1)) + "-" + hex.EncodeToString(sum[:])[:markLen]
+}
+
+// instanceName is the name of the i-th instance of a request of the group.
+func instanceName(group string, seq int64, i int) string {
+	suffix := fmt.Sprintf("-%d-%d", seq, i)
+	return instanceBase(group, maxInstanceName-len(suffix)) + suffix
 }
 
 // instanceKey is how an instance is matched with its node: the name the

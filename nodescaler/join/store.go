@@ -60,6 +60,11 @@ var ErrRefused = errors.New("refused")
 // needs no token, and its record is left as it is.
 var ErrJoined = errors.New("the instance has joined")
 
+// ErrOtherGroup is an issue for a name whose record belongs to another
+// group, and that a machine of that group can still use (it joined, or one
+// of its tokens is valid): the record is left as it is.
+var ErrOtherGroup = errors.New("the instance belongs to another group")
+
 // Store keeps the record of every instance that joins with its own key, a
 // Variable nodescaler/join/<region>/<instance>: first the hash of its
 // one-time token and its expiry (and of the earlier tokens of the same
@@ -146,6 +151,13 @@ func holds(v *api.Variable, hash string) (heldToken, bool) {
 	return found, ok
 }
 
+// inUse reports a record a machine can still use: its instance joined (its
+// certificate renews), or a token of it is valid.
+func inUse(v *api.Variable, now time.Time) bool {
+	return v.Items[itemSerial] != "" ||
+		slices.ContainsFunc(tokensOf(v), func(t heldToken) bool { return now.Before(t.expires) })
+}
+
 // Issue makes the one-time token of an instance of the group, valid for
 // ttl, and records its hash with the request of the operator it is for (its
 // request ID; empty for none).
@@ -160,8 +172,15 @@ func holds(v *api.Variable, hash string) (heldToken, bool) {
 // And when the instance has joined, nothing is issued and the record, with
 // the serial of its certificate, is left as it is: ErrJoined.
 //
-// An issue for another request, another group or no request replaces the
-// record: every token issued for the name before is void.
+// An issue for another request or no request replaces the record: every
+// token issued for the name before is void.
+//
+// The record of a name belongs to its group. An issue by another group does
+// not replace it while a machine of that group can use it (it joined, or one
+// of its tokens is valid): ErrOtherGroup, and the record is left as it is
+// (review finding CON-6l). The operator gives the instances of two groups
+// different names, so this is a second guard. A record of another group that
+// no machine can use any more is replaced, as Prune would drop it.
 func (s *Store) Issue(ctx context.Context, group, request, instance string, ttl time.Duration) (string, error) {
 	if !ValidInstance(instance) {
 		return "", fmt.Errorf("the instance %q is not a host name", instance)
@@ -178,12 +197,15 @@ func (s *Store) Issue(ctx context.Context, group, request, instance string, ttl 
 	if again && old.Items[itemSerial] != "" {
 		return "", fmt.Errorf("%w: %s", ErrJoined, instance)
 	}
+	now := s.now()
+	if old != nil && old.Items[itemGroup] != group && inUse(old, now) {
+		return "", fmt.Errorf("%w: %s is an instance of group %q, not of %q", ErrOtherGroup, instance, old.Items[itemGroup], group)
+	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
-	now := s.now()
 	v := &api.Variable{Namespace: s.Namespace, Path: path, Items: api.VariableItems{
 		itemGroup: group, itemToken: hashToken(token), itemExpires: now.Add(ttl).UTC().Format(time.RFC3339),
 	}}

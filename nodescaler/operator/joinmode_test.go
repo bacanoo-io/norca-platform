@@ -170,6 +170,32 @@ func TestJoin_DeletionForgetsTheRecords(t *testing.T) {
 	}
 }
 
+// A name whose join record belongs to another group, with a token a machine
+// of that group can still use, is not issued again: the record stays, and
+// the group says why it asks for no instance (review finding CON-6l).
+func TestJoin_TheRecordOfAnotherGroupIsNotReplaced(t *testing.T) {
+	e := newEnv(t, "")
+	items, _ := bootstraptest.Items(t)
+	e.withBootstrap(items)
+	store := e.withJoin("https://10.0.0.7:8490")
+	token, err := store.Issue(context.Background(), "another-group", "eu/another-group/1", "workers-dc1-1-1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.putGroup(1, nil)
+	e.reconcile()
+	if n := len(e.instances()); n != 0 {
+		t.Fatalf("%d instances were asked for with the name of an instance of another group", n)
+	}
+	if c := conditionOf(e.status(), CondProvisioned); c["status"] != "False" || c["reason"] != "NoBootstrap" ||
+		!strings.Contains(c["message"].(string), "another-group") || !e.hasEvent("BootstrapFailed") {
+		t.Fatalf("Provisioned: %+v", c)
+	}
+	if _, group, err := store.Redeem(context.Background(), "workers-dc1-1-1", token); err != nil || group != "another-group" {
+		t.Fatalf("the token of the other group: %q %v", group, err)
+	}
+}
+
 func TestInstancePrefix(t *testing.T) {
 	for _, group := range []string{"workers-dc1", "Edge_Pool", strings.Repeat("a", 80)} {
 		p := instancePrefix(group)
@@ -177,6 +203,18 @@ func TestInstancePrefix(t *testing.T) {
 			if name := instanceName(group, seq, 3); !strings.HasPrefix(name, p) {
 				t.Errorf("%s: %q does not start with %q", group, name, p)
 			}
+		}
+	}
+	// The names instances had before the names carried the mark of their
+	// group: their records are still found.
+	for group, old := range map[string]string{
+		"Edge_Pool":             "edge-pool-1-1",
+		strings.Repeat("a", 80): strings.Repeat("a", 59) + "-1-1",
+		strings.Repeat("b", 45): strings.Repeat("b", 45) + "-12-3",
+		"---":                   "node-1-1",
+	} {
+		if p := instancePrefix(group); !strings.HasPrefix(old, p) {
+			t.Errorf("%s: the old name %q does not start with %q", group, old, p)
 		}
 	}
 }

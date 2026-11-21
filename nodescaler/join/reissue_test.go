@@ -169,14 +169,74 @@ func TestReissue_TheTokenBeforeExpiresAtItsOwnTime(t *testing.T) {
 	}
 }
 
+// The record of an instance belongs to its group: an issue for the name by
+// another group is refused and leaves the record as it is, the one of a
+// machine that joined too (review finding CON-6l: the issue of a group whose
+// instances had the same names replaced the record, and the renewal of the
+// node that had joined was refused from then on).
+func TestReissue_AnotherGroupDoesNotReplaceTheRecord(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a token that is valid", func(t *testing.T) {
+		e := newEnv(t)
+		first := e.issue("Edge_Pool", "eu/Edge_Pool/1", "edge-pool-1-1")
+		before := e.backend.GetVariable("default", "nodescaler/join/eu/edge-pool-1-1")
+		token, err := e.store.Issue(ctx, "edge-pool", "eu/edge-pool/1", "edge-pool-1-1", 10*time.Minute)
+		if !errors.Is(err, join.ErrOtherGroup) || token != "" {
+			t.Fatalf("an issue for the instance of another group: token %t, error %v; want none and ErrOtherGroup", token != "", err)
+		}
+		after := e.backend.GetVariable("default", "nodescaler/join/eu/edge-pool-1-1")
+		if after.ModifyIndex != before.ModifyIndex || after.Items["group"] != "Edge_Pool" {
+			t.Fatalf("the record was written by the issue of another group: %v", after.Items)
+		}
+		if _, group, err := e.store.Redeem(ctx, "edge-pool-1-1", first); err != nil || group != "Edge_Pool" {
+			t.Fatalf("the token of the first group after the issue of another: %q %v", group, err)
+		}
+	})
+
+	t.Run("a machine that joined", func(t *testing.T) {
+		e := newEnv(t)
+		c := e.machine("edge-pool-1-1", e.issue("Edge_Pool", "eu/Edge_Pool/1", "edge-pool-1-1"))
+		if err := c.Join(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		before := e.backend.GetVariable("default", "nodescaler/join/eu/edge-pool-1-1")
+		if _, err := e.store.Issue(ctx, "edge-pool", "eu/edge-pool/1", "edge-pool-1-1", 10*time.Minute); !errors.Is(err, join.ErrOtherGroup) {
+			t.Fatalf("an issue for the joined instance of another group: %v, want ErrOtherGroup", err)
+		}
+		after := e.backend.GetVariable("default", "nodescaler/join/eu/edge-pool-1-1")
+		if after.ModifyIndex != before.ModifyIndex || after.Items["serial"] != before.Items["serial"] || after.Items["group"] != "Edge_Pool" {
+			t.Fatalf("the record of a joined instance was written by the issue of another group: %v", after.Items)
+		}
+		if err := c.Renew(ctx); err != nil {
+			t.Fatalf("the renewal after the issue of another group: %v", err)
+		}
+	})
+
+	// A record no machine can use any more (not joined, every token expired)
+	// does not keep the name for ever: it is what Prune drops.
+	t.Run("a record that expired unused", func(t *testing.T) {
+		e := newEnv(t)
+		now := time.Now()
+		e.store.Now = func() time.Time { return now }
+		old := e.issue("Edge_Pool", "eu/Edge_Pool/1", "edge-pool-1-1")
+		now = now.Add(11 * time.Minute)
+		token := e.issue("edge-pool", "eu/edge-pool/1", "edge-pool-1-1")
+		if _, group, err := e.store.Redeem(ctx, "edge-pool-1-1", token); err != nil || group != "edge-pool" {
+			t.Fatalf("the new token: %q %v", group, err)
+		}
+		if _, _, err := e.store.Redeem(ctx, "edge-pool-1-1", old); !errors.Is(err, join.ErrRefused) {
+			t.Fatalf("the expired token of the other group: %v", err)
+		}
+	})
+}
+
 // Only the same request keeps a token: an issue for the name by another
-// request, by another group or without a request voids every token before,
-// and so does an issue over a record that names no request.
+// request or without a request voids every token before, and so does an
+// issue over a record that names no request.
 func TestReissue_AnotherRequestVoidsTheTokens(t *testing.T) {
 	ctx := context.Background()
 	for name, next := range map[string][2]string{
 		"another request": {"workers", request2},
-		"another group":   {"workers-b", request1},
 		"no request":      {"workers", ""},
 	} {
 		t.Run(name, func(t *testing.T) {

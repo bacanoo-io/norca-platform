@@ -4,11 +4,14 @@
 package operator
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
+	"github.com/bacanoo-io/norca-platform/nodescaler/join"
 	"github.com/bacanoo-io/norca/norca/api"
 )
 
@@ -112,21 +115,66 @@ func TestBootstrap_MissingAsksForNothing(t *testing.T) {
 	}
 }
 
+// hashOf is the mark of a group in the names of its instances.
+func hashOf(group string) string {
+	sum := sha256.Sum256([]byte(group))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
 func TestInstanceName(t *testing.T) {
+	long := strings.Repeat("a", 70)
 	for _, tc := range []struct {
 		group string
 		seq   int64
 		i     int
 		want  string
 	}{
+		// A group whose name is a host name already is in the names as it is.
 		{"workers-dc1", 3, 1, "workers-dc1-3-1"},
-		{"Workers_DC.1", 12, 2, "workers-dc-1-12-2"},
-		{"---", 1, 1, "node-1-1"},
-		{strings.Repeat("a", 70), 1, 1, strings.Repeat("a", 59) + "-1-1"},
+		{strings.Repeat("a", 39), 1, 1, strings.Repeat("a", 39) + "-1-1"},
+		// A name that had to be changed carries the mark of its group.
+		{"Edge_Pool", 1, 1, "edge-pool-d68a2eab-1-1"},
+		{"Workers_DC.1", 12, 2, "workers-dc-1-" + hashOf("Workers_DC.1") + "-12-2"},
+		{"---", 1, 1, "node-" + hashOf("---") + "-1-1"},
+		{long, 1, 1, strings.Repeat("a", 30) + "-" + hashOf(long) + "-1-1"},
+		{strings.Repeat("a", 40), 1, 1, strings.Repeat("a", 30) + "-" + hashOf(strings.Repeat("a", 40)) + "-1-1"},
+		// The cut does not depend on the number of the request.
+		{long, 999999999999, 3, strings.Repeat("a", 30) + "-" + hashOf(long) + "-999999999999-3"},
+		// A name that ends like a mark gets its own, so it is not the name of
+		// a group with that mark.
+		{"edge-pool-0a1b2c3d", 1, 1, "edge-pool-0a1b2c3d-" + hashOf("edge-pool-0a1b2c3d") + "-1-1"},
 	} {
 		got := instanceName(tc.group, tc.seq, tc.i)
-		if got != tc.want || len(got) > 63 {
+		if got != tc.want || !join.ValidInstance(got) {
 			t.Errorf("%q %d %d: got %q, want %q", tc.group, tc.seq, tc.i, got, tc.want)
+		}
+	}
+}
+
+// Two groups never give an instance the same name (review finding CON-6l:
+// Edge_Pool and edge-pool both made edge-pool-1-1, one machine name and one
+// join record for two machines).
+func TestInstanceName_UniquePerGroup(t *testing.T) {
+	long := strings.Repeat("a", 70)
+	for _, pair := range [][2]string{
+		{"Edge_Pool", "edge-pool"},
+		{"Edge_Pool", "edge.pool"},
+		{"edge-pool", "-edge-pool-"},
+		{long + "1", long + "2"},
+		{"a", "A"},
+		// The name one group gets from its mark, as the name of another.
+		{"Edge_Pool", "edge-pool-" + hashOf("Edge_Pool")},
+	} {
+		for _, seq := range []int64{1, 12, 999999999999} {
+			a, b := instanceName(pair[0], seq, 1), instanceName(pair[1], seq, 1)
+			if a == b {
+				t.Errorf("groups %q and %q: both name an instance %q", pair[0], pair[1], a)
+			}
+			for _, name := range []string{a, b} {
+				if !join.ValidInstance(name) {
+					t.Errorf("groups %q and %q: %q is not a host name", pair[0], pair[1], name)
+				}
+			}
 		}
 	}
 }

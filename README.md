@@ -71,9 +71,17 @@ cmd/norca-acme/           the ACME operator
 `norca-nodescaler` reconciles every `norca.io/NodeGroup` with a `provider`:
 it asks the provider for the instances the scale (`spec.replicas`) is
 missing, in a request that is idempotent by its ID (`<region>/<group>/<n>`).
-Each instance has a name of the operator (`<group>-<n>-<i>`) and a
-bootstrap of its own; the node it runs registers with that name in the meta
-key `norca.instance`, which is how nodes are matched with their instances.
+Each instance has a name of the operator (`<base>-<n>-<i>`, a host name of
+at most 63 characters) and a bootstrap of its own; the node it runs
+registers with that name in the meta key `norca.instance`, which is how
+nodes are matched with their instances. The base is the name of the group
+when that is a host name already (lower case letters, digits and dashes, at
+most 39 characters, not ending in a dash and eight hex digits):
+`workers-dc1-3-1`. Any other group name is made a host name (lower case, a
+dash for every other character, cut to 30 characters) and is followed by the
+first eight hex digits of the SHA-256 of the exact name: the instances of
+`Edge_Pool` are `edge-pool-d68a2eab-<n>-<i>`. So two groups never name a
+machine the same, however alike their names are.
 The operator writes the status of the group:
 
 | Field | Meaning |
@@ -84,7 +92,7 @@ The operator writes the status of the group:
 | `capacity`, `allocatable` | The size of a machine from the provider, less `spec.node.reserved`. |
 | `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
-| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made), `asked` (the largest number of instances it was made for: its instances have the names `<group>-<number>-1` to `-<asked>`) and `listed` (the instances a listing has shown). |
+| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made), `asked` (the largest number of instances it was made for: its instances have the names `<base>-<number>-1` to `-<asked>`) and `listed` (the instances a listing has shown). |
 | `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
 | `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`, `NotListed`), `JoinFailing` (`TooManyFailures`), `ForeignNode` and `NetworkCovered` (`Covered`, `NotCovered`, `NetworkUnchecked`, `NoNetwork`). |
 | `strayNodes` | Nodes of the group without an instance: `node`, `name`, `instance`, `kind` (`gone`: down, what is left of a deleted instance; `foreign`: ready). |
@@ -189,8 +197,14 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
   a used token is never valid again. An instance of the request that has
   joined gets no token and no bootstrap in the repeated request, and its
   record is not written, so its renewals go on. A token issued for the name
-  by another request or another group replaces the record: every token
-  before it is void.
+  by another request replaces the record: every token before it is void.
+- **The record of a name belongs to its group.** The instances of two groups
+  have different names, and as a second guard an issue for a name whose
+  record is of another group is refused while a machine of that group can
+  use the record (it joined, or one of its tokens is valid): no instance is
+  asked for (`Provisioned` False, `NoBootstrap`, event `BootstrapFailed`),
+  and the record is left as it is. A record of another group that no machine
+  can use any more is replaced.
 - A renewal rotates the key: the endpoint refuses a request for the key of
   the current certificate (`RenewalRefused`), so a key that leaked does not
   stay valid through the renewals.
