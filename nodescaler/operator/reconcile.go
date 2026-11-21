@@ -371,39 +371,62 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	want := spec.replicas()
 	_, _, _, live := o.counts()
 	seq := r.nextRequest(obj, o.instances)
-	count := want - live
+	// The instances of the request to ask for, by their index in it: the
+	// first ones of a new request.
+	var indexes []int
+	for i := 1; int64(i) <= want-live; i++ {
+		indexes = append(indexes, i)
+	}
 	// A request whose instances the listing still does not show after the
 	// grace time is made again with its own number while the group is short,
 	// so a provider that has them answers with them; when the group is not
-	// short, such a request is forgotten.
+	// short, such a request is forgotten. A provider that has none of them
+	// left makes what the request names: so it names only instances no
+	// listing has shown, and no more than what is missing now (pending.go).
 	var again *pendingRequest
 	if want > live {
-		if again = r.overdueRequest(pend, now); again != nil {
-			seq = again.Number
-			if count = again.Count; len(again.Listed) == 0 {
-				// None of it was ever seen: if the provider never had the
-				// request, it makes no more than what is missing now.
-				count = min(again.Count, want-live)
+		for again == nil {
+			p := r.overdueRequest(pend, now)
+			if p == nil {
+				break
 			}
+			unlisted, known := p.unlistedIndexes(obj.Name)
+			if !known || len(unlisted) == 0 {
+				// The record does not say which names are free: the request
+				// is forgotten, and what is missing is a new request.
+				r.log.Warn("a request whose instances are not listed is not made again: its record does not name the listed ones",
+					"group", obj.Name, "request", r.requestID(obj.Name, p.Number))
+				pend = slices.DeleteFunc(pend, func(q *pendingRequest) bool { return q == p })
+				continue
+			}
+			again, seq = p, p.Number
+			indexes = unlisted[:min(int64(len(unlisted)), want-live)]
 		}
 	} else {
 		pend = slices.DeleteFunc(pend, func(p *pendingRequest) bool { return p.overdue(now, r.cfg.ListGrace) })
 	}
 	provisioned := condition{Type: CondProvisioned, Status: "True", Reason: "Requested",
 		Message: provisionedMessage(live, want, o.pending)}
-	requested, createFailed := false, false
+	requested, createFailed, notAsked := false, false, false
 	if failing && want > live {
 		provisioned = condition{Type: CondProvisioned, Status: "False", Reason: CondJoinFailing,
 			Message: fmt.Sprintf("%d instances for a scale of %d; none is asked for while the nodes do not join", live, want)}
 	}
 	if !failing && want > live {
 		reqID := r.requestID(obj.Name, seq)
-		instances, issued, err := r.describe(ctx, obj, spec, seq, int(count), now)
-		if err != nil {
+		instances, issued, joined, err := r.describe(ctx, obj, spec, seq, indexes, now)
+		switch {
+		case err != nil:
 			createFailed = true
 			provisioned = condition{Type: CondProvisioned, Status: "False", Reason: "NoBootstrap", Message: err.Error()}
 			r.event(ctx, obj, api.ObjectEventTypeWarning, "BootstrapFailed", err.Error())
-		} else {
+		case len(instances) == 0:
+			// Every instance left to ask for has joined: there is nothing a
+			// provider could make of the request (an instance without a
+			// bootstrap could not join), so it is not made.
+			notAsked = true
+			pend = r.joinedNotListed(ctx, obj, spec, pend, again, seq, joined, nodes, now)
+		default:
 			req := provider.CreateRequest{
 				RequestID:  reqID,
 				Instances:  instances,
@@ -447,13 +470,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 					r.event(ctx, obj, api.ObjectEventTypeWarning, "InstancesNotListed", fmt.Sprintf(
 						"provider %q did not list %d instances of request %s in %s; the request was made again with the same ID and answered with %d instances",
 						spec.Provider, again.unlisted(), req.RequestID, now.Sub(again.At).Round(time.Second), len(created)))
-					again.answered(created, len(req.Instances), now)
+					again.answered(created, slices.Max(indexes), now)
 					pend = complete(pend)
 				} else {
 					r.event(ctx, obj, api.ObjectEventTypeNormal, "InstancesRequested",
 						fmt.Sprintf("asked provider %q for %d instances (request %s)", spec.Provider, len(req.Instances), req.RequestID))
 					p := &pendingRequest{Number: seq}
-					p.answered(created, len(req.Instances), now)
+					p.answered(created, slices.Max(indexes), now)
 					pend = complete(append(pend, p))
 				}
 			}
@@ -496,8 +519,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 			status["capacity"] = map[string]any{"cpu": o.capacity.CPU, "memory": o.capacity.Memory, "disk": o.capacity.Disk}
 			status["allocatable"] = allocatable(*o.capacity, spec.Node.Reserved)
 		}
-		if requested {
+		if requested || notAsked {
 			// A request made again has its old number: the last one stays.
+			// A request that was not made, because all of its instances have
+			// joined, has used its number too.
 			status["lastRequest"] = max(seq, lastRequest(status))
 		}
 		if d := pendingDocs(pend); d != nil {
@@ -529,7 +554,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		// The failure is in the condition and the event; the provider is
 		// asked again after a while, not at the pace of the error backoff.
 		requeue = r.cfg.RetryAfter
-	case joining > 0 || len(o.slow) > 0:
+	case joining > 0 || len(o.slow) > 0 || notAsked:
 		requeue = r.cfg.JoinCheck
 	}
 	for _, d := range []time.Duration{down.requeue, roll.requeue} {
@@ -544,23 +569,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	return requeue, nil
 }
 
-// describe names the instances of a request and renders the bootstrap of
-// each, with the marks of the operator in the meta of its node. Without a
-// bootstrap source the instances have names only (a provider that brings its
-// own machines, tests).
-func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *groupSpec, seq int64, count int,
-	now time.Time) ([]provider.InstanceRequest, map[string]*bootstrap.Rendered, error) {
+// describe names the instances of a request with the indexes and renders the
+// bootstrap of each, with the marks of the operator in the meta of its node.
+// Without a bootstrap source the instances have names only (a provider that
+// brings its own machines, tests). An instance that has joined (with the
+// join, in a request made again) is left out of the request and returned in
+// joined.
+func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *groupSpec, seq int64, indexes []int,
+	now time.Time) (out []provider.InstanceRequest, issued map[string]*bootstrap.Rendered, joined []string, err error) {
 
 	var tmpl *bootstrap.Template
 	if r.cfg.Bootstrap != nil {
-		var err error
 		if tmpl, err = r.cfg.Bootstrap.Template(ctx); err != nil {
-			return nil, nil, fmt.Errorf("the bootstrap of the nodes is not available: %w", err)
+			return nil, nil, nil, fmt.Errorf("the bootstrap of the nodes is not available: %w", err)
 		}
 	}
-	out := make([]provider.InstanceRequest, 0, count)
-	issued := map[string]*bootstrap.Rendered{}
-	for i := 1; i <= count; i++ {
+	out = make([]provider.InstanceRequest, 0, len(indexes))
+	issued = map[string]*bootstrap.Rendered{}
+	for _, i := range indexes {
 		name := instanceName(obj.Name, seq, i)
 		ir := provider.InstanceRequest{Name: name}
 		if tmpl != nil {
@@ -578,15 +604,15 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 				// The node makes its key and fetches its certificate.
 				ticket, err := r.cfg.Join.Ticket(ctx, obj.Name, r.requestID(obj.Name, seq), name, spec.joinDeadline()+joinSlack)
 				if err != nil {
-					return nil, nil, fmt.Errorf("the join of %s: %w", name, err)
+					return nil, nil, nil, fmt.Errorf("the join of %s: %w", name, err)
 				}
 				if ticket.Token == "" {
 					// An instance of a request made again that has joined:
-					// it needs no token, and the provider, which has it,
-					// answers with it. Its name stays in the request,
-					// without a bootstrap: a machine made from it could not
-					// join.
-					out = append(out, ir)
+					// it needs no token, and a provider that has it answers
+					// with it, named or not. It is not named: a provider
+					// that has no instance of the request left would make
+					// it, without a bootstrap, and it could not join.
+					joined = append(joined, name)
 					continue
 				}
 				if spec.Join.KeyStore != "" {
@@ -594,7 +620,7 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 				}
 				rd, err := tmpl.RenderJoin(node, ticket)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				ir.Bootstrap = &provider.Bootstrap{UserData: rd.UserData}
 				out = append(out, ir)
@@ -602,14 +628,42 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 			}
 			rd, err := tmpl.Render(node)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			ir.Bootstrap = &provider.Bootstrap{UserData: rd.UserData}
 			issued[name] = rd
 		}
 		out = append(out, ir)
 	}
-	return out, issued, nil
+	return out, issued, joined, nil
+}
+
+// joinedNotListed deals with a request that is not made because every
+// instance left to ask for has joined (joined, of request seq) while the
+// listing does not show them. For a request of the status (again): while
+// each of them has a ready node, they are instances the group has, so the
+// request stays and its grace time starts again; otherwise the request is
+// forgotten. When it is not kept, the number of the request counts as used,
+// and what the group is short of is asked for in a new request at the next
+// look. It returns the pending requests.
+func (r *Reconciler) joinedNotListed(ctx context.Context, obj *api.CustomObject, spec *groupSpec, pend []*pendingRequest,
+	again *pendingRequest, seq int64, joined []string, nodes []Node, now time.Time) []*pendingRequest {
+
+	ready := again != nil && len(joined) > 0
+	for _, name := range joined {
+		ready = ready && slices.ContainsFunc(nodes, func(n Node) bool { return n.Instance == name && n.Ready })
+	}
+	reqID := r.requestID(obj.Name, seq)
+	if !ready {
+		r.log.Warn("a request is not made and forgotten: the instances left to ask for have joined, and not all of their nodes are ready",
+			"group", obj.Name, "request", reqID, "instances", joined)
+		return slices.DeleteFunc(pend, func(p *pendingRequest) bool { return p == again })
+	}
+	r.event(ctx, obj, api.ObjectEventTypeWarning, "InstancesNotListed", fmt.Sprintf(
+		"provider %q did not list %d instances of request %s in %s; their nodes have joined and are ready, so the request is not made again",
+		spec.Provider, len(joined), reqID, now.Sub(again.At).Round(time.Second)))
+	again.waited(now)
+	return pend
 }
 
 // The names of the instances. A name is a host name (lower case letters,

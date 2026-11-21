@@ -149,13 +149,26 @@ func TestJoinReissue_LostCreateAnswerKeepsTheTokensOfTheMachines(t *testing.T) {
 
 // A request is made again for instances one of which has joined: its record
 // keeps the serial of its certificate (the renewal of the node goes on), it
-// gets no token and no bootstrap, and the others get theirs.
+// gets no token, and the others get theirs. The request made again does not
+// name it, whether the listing shows it or not: a provider that has it
+// answers with it anyway, and one that has no instance of the request left
+// would make a machine without a bootstrap of the name (review finding
+// CON-6m).
 func TestJoinReissue_AJoinedNodeKeepsItsRecord(t *testing.T) {
+	const joined, missing = "workers-dc1-1-1", "workers-dc1-1-2"
+	for name, hidden := range map[string]func(provider.Instance) bool{
+		"the one that joined is listed":     func(i provider.Instance) bool { return i.Name == missing },
+		"the one that joined is not listed": hideAll,
+	} {
+		t.Run(name, func(t *testing.T) { joinedNodeKeepsItsRecord(t, joined, missing, hidden) })
+	}
+}
+
+func joinedNodeKeepsItsRecord(t *testing.T, joined, missing string, hidden func(provider.Instance) bool) {
 	e, store := joinEnv(t)
 	e.putGroup(2, nil)
 	e.reconcile()
 	first := e.machineTokens()
-	const joined, missing = "workers-dc1-1-1", "workers-dc1-1-2"
 	ctx := context.Background()
 	rec, _, err := store.Redeem(ctx, joined, first[joined])
 	if err != nil {
@@ -166,8 +179,8 @@ func TestJoinReissue_AJoinedNodeKeepsItsRecord(t *testing.T) {
 	}
 	before := e.backend.GetVariable("default", "nodescaler/join/eu/"+joined)
 
-	// The listing shows the one that joined and not the other.
-	e.lag.hide(func(i provider.Instance) bool { return i.Name == missing })
+	// The listing does not show the other.
+	e.lag.hide(hidden)
 	e.advance(e.r.cfg.ListGrace + time.Second)
 	e.reconcile()
 	if n, asked := len(e.instances()), e.lag.asked(); n != 2 || !slices.Equal(asked, []string{"eu/workers-dc1/1", "eu/workers-dc1/1"}) {
@@ -191,22 +204,78 @@ func TestJoinReissue_AJoinedNodeKeepsItsRecord(t *testing.T) {
 	}
 
 	req := e.lag.lastRequest()
-	if len(req.Instances) != 2 {
-		t.Fatalf("the repeated request: %+v", req.Instances)
+	if !slices.Equal(namesOf(req), []string{missing}) {
+		t.Fatalf("the repeated request names %v, want only %s", namesOf(req), missing)
 	}
-	for _, ir := range req.Instances {
-		switch ir.Name {
-		case joined:
-			if ir.Bootstrap != nil {
-				t.Fatalf("the node that joined got a bootstrap again:\n%s", ir.Bootstrap.UserData)
-			}
-		case missing:
-			if ir.Bootstrap == nil || tokenIn(t, ir.Bootstrap.UserData) == first[missing] {
-				t.Fatal("the instance that is not listed got no new token")
-			}
-		default:
-			t.Fatalf("the repeated request names %s", ir.Name)
-		}
+	if ir := req.Instances[0]; ir.Bootstrap == nil || tokenIn(t, ir.Bootstrap.UserData) == first[missing] {
+		t.Fatal("the instance that is not listed got no new token")
 	}
 	redeems(t, store, map[string]string{missing: first[missing]}, "after the request was made again")
+}
+
+// joinAll makes every machine of the provider join with the token it was
+// started with.
+func joinAll(t *testing.T, e *env, store *join.Store) {
+	t.Helper()
+	ctx := context.Background()
+	for name, token := range e.machineTokens() {
+		rec, _, err := store.Redeem(ctx, name, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Joined(ctx, rec, token, "aa"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Every instance of a request has joined and none is listed after the grace
+// time: a request made again could name only instances without a bootstrap,
+// so none is made. While their nodes are ready the request stays, its grace
+// time starts again, and the group says so.
+func TestJoinReissue_OnlyJoinedInstancesAreLeftToAskFor(t *testing.T) {
+	e, store := joinEnv(t)
+	e.putGroup(2, nil)
+	e.reconcile()
+	joinAll(t, e, store)
+	e.nodes.set(
+		Node{ID: "n1", Name: "workers-dc1-1-1", Instance: "workers-dc1-1-1", Group: "workers-dc1", Ready: true, Eligible: true},
+		Node{ID: "n2", Name: "workers-dc1-1-2", Instance: "workers-dc1-1-2", Group: "workers-dc1", Ready: true, Eligible: true})
+	e.lag.hide(hideAll)
+
+	e.advance(e.r.cfg.ListGrace + time.Second)
+	if d := e.reconcile(); d != e.r.cfg.JoinCheck {
+		t.Fatalf("requeue %v, want the join check", d)
+	}
+	if n, asked := len(e.instances()), e.lag.asked(); n != 2 || len(asked) != 1 {
+		t.Fatalf("%d instances, requests %v: a request was made for instances that have joined", n, asked)
+	}
+	st := e.status()
+	if p := pendingOf(st); len(p) != 1 || p[0]["asks"] != 2.0 || p[0]["at"] != e.now.Format(time.RFC3339) || !e.hasEvent("InstancesNotListed") {
+		t.Fatalf("pendingRequests: %+v", p)
+	}
+	if c := conditionOf(st, CondProvisioned); c["status"] != "False" || c["reason"] != "NotListed" {
+		t.Fatalf("Provisioned: %+v", c)
+	}
+	if len(e.nodes.madeIneligible()) != 0 {
+		t.Fatalf("made ineligible: %v", e.nodes.madeIneligible())
+	}
+
+	// Their nodes are gone: the request is forgotten, and what is missing is
+	// a new request.
+	e.nodes.set()
+	e.advance(e.r.cfg.ListGrace + time.Second)
+	e.reconcile()
+	if p := pendingOf(e.status()); len(p) != 0 {
+		t.Fatalf("pendingRequests after the nodes went: %+v", p)
+	}
+	e.reconcile()
+	if asked := e.lag.asked(); !slices.Equal(asked, []string{"eu/workers-dc1/1", "eu/workers-dc1/2"}) {
+		t.Fatalf("requests after the request was forgotten: %v", asked)
+	}
+	for _, ir := range e.lag.lastRequest().Instances {
+		if ir.Bootstrap == nil {
+			t.Fatalf("%s has no bootstrap", ir.Name)
+		}
+	}
 }

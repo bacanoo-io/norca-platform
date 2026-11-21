@@ -92,7 +92,7 @@ The operator writes the status of the group:
 | `capacity`, `allocatable` | The size of a machine from the provider, less `spec.node.reserved`. |
 | `nodes` | One entry per instance: `instance`, `state`, `request`, `created`, `node` and `ready` once it joined, `slow` while it joins after `join.slow_after`. |
 | `lastRequest` | The number of the last request. |
-| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made), `asked` (the largest number of instances it was made for: its instances have the names `<base>-<number>-1` to `-<asked>`) and `listed` (the instances a listing has shown). |
+| `pendingRequests` | The requests the provider answered whose instances its listing has not all shown: `number`, `count` (the instances the request made), `at` (when it was made, the last time), `asks` (how many times it was made), `asked` (the largest number of instances it was made for: its instances have the names `<base>-<number>-1` to `-<asked>`), `listed` (the IDs of the instances a listing has shown) and `listedNames` (their names: a request made again does not name them). |
 | `join` | The join failures in a row (`failures`, `lastFailure`) and the template (`revision`) and `resumed` generation they count for. |
 | `conditions` | `ProviderAvailable` (`UnknownProvider`, `ProviderUnavailable`, `UnknownGroup`, `InvalidProvider`), `Provisioned` (`Quota`, `NoCapacity`, `Invalid`, `ProviderError`, `JoinFailing`, `NotListed`), `JoinFailing` (`TooManyFailures`), `ForeignNode` and `NetworkCovered` (`Covered`, `NotCovered`, `NetworkUnchecked`, `NoNetwork`). |
 | `strayNodes` | Nodes of the group without an instance: `node`, `name`, `instance`, `kind` (`gone`: down, what is left of a deleted instance; `foreign`: ready). |
@@ -119,7 +119,18 @@ After the grace time, if the group is short of its scale, the request is made
 again with the same ID: a provider that has the instances answers with them
 and creates nothing, the answer says what the request made, and the grace
 time starts again. This is an event (`InstancesNotListed`), and `Provisioned`
-is False (`NotListed`) until the listing shows them. Set `-list-grace` above
+is False (`NotListed`) until the listing shows them. A provider that has no
+instance of the request left makes what the request names, so **the request
+made again names only the instances no listing has shown, and no more of
+them than the group is short of**: an instance the operator saw listed and
+deleted since (a scale down, a join failure, a repair, a replacement) is not
+asked for again. A record that does not name every listed instance (written
+before `listedNames`) is not made again but forgotten, and what is missing is
+asked for in a new request. With `-join-listen` it does not name an instance
+whose node has joined either (it would have no bootstrap); when only such
+instances are left to ask for, no request is made: while their nodes are
+ready the grace time starts again (`InstancesNotListed`), otherwise the
+request is forgotten. Set `-list-grace` above
 the lag of the listing of the slowest provider; a request that was lost is
 made again that much later. A machine can boot before the listing shows it:
 while a request is in `pendingRequests`, the names of its instances count as
@@ -201,7 +212,7 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
   until its own expiry, which a new issue does not extend. Whichever of them
   a machine has, it joins once: the join voids every token of the name, and
   a used token is never valid again. An instance of the request that has
-  joined gets no token and no bootstrap in the repeated request, and its
+  joined gets no token and is not named in the repeated request, and its
   record is not written, so its renewals go on. A token issued for the name
   by another request replaces the record: every token before it is void.
 - **The record of a name belongs to its group.** The instances of two groups

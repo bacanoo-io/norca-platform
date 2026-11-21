@@ -388,3 +388,128 @@ func TestPending_RequestTheProviderNeverHad(t *testing.T) {
 		t.Fatalf("instances: %d", n)
 	}
 }
+
+// namesOf are the names a create request asks for.
+func namesOf(req provider.CreateRequest) []string {
+	var out []string
+	for _, ir := range req.Instances {
+		out = append(out, ir.Name)
+	}
+	return out
+}
+
+// A request made again names only the instances no listing has shown: an
+// instance the operator saw listed and deleted is not asked for again, also
+// when the provider has no instance of the request left and so makes what
+// the request names (review finding CON-6m: the request named all of its
+// instances again, and the deleted one came back, 3 machines at a scale of
+// 2).
+func TestPending_ReAskNamesOnlyTheInstancesNotListed(t *testing.T) {
+	e := newEnv(t, "")
+	e.putGroup(2, nil)
+	e.reconcile()
+	insts := e.instances()
+	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.Name, b.Name) })
+	// The second instance of request 1 is never listed.
+	e.lag.hide(func(i provider.Instance) bool { return i.ID == insts[1].ID })
+	e.reconcile()
+	p := pendingOf(e.status())
+	if len(p) != 1 {
+		t.Fatalf("pendingRequests: %+v", p)
+	}
+	listedNames, _ := p[0]["listedNames"].([]any)
+
+	// The first one fails: the operator deletes it and asks for one more, in
+	// request 2.
+	e.mock.Fail("dc1", insts[0].ID, provider.ReasonError, "it did not boot")
+	e.reconcile()
+	if asked := e.lag.asked(); !slices.Equal(asked, []string{"eu/workers-dc1/1", "eu/workers-dc1/2"}) {
+		t.Fatalf("requests after the failure: %v", asked)
+	}
+	// The provider loses the one that was never listed: it has no instance of
+	// request 1 left.
+	if err := e.mock.Delete(context.Background(), "dc1", insts[1].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	e.advance(e.r.cfg.ListGrace + time.Second)
+	e.reconcile()
+	req := e.lag.lastRequest()
+	if req.RequestID != "eu/workers-dc1/1" || !slices.Equal(namesOf(req), []string{"workers-dc1-1-2"}) {
+		t.Fatalf("the request made again is %s and names %v, want eu/workers-dc1/1 with only workers-dc1-1-2, the instance no listing has shown",
+			req.RequestID, namesOf(req))
+	}
+	got := e.instances()
+	if len(got) != 2 || slices.ContainsFunc(got, func(i provider.Instance) bool { return i.Name == "workers-dc1-1-1" }) {
+		t.Fatalf("instances at a scale of 2: %+v", got)
+	}
+	if !slices.Equal(listedNames, []any{"workers-dc1-1-1"}) {
+		t.Fatalf("pendingRequests after the first listing: %+v, want listedNames workers-dc1-1-1", p)
+	}
+}
+
+// The re-ask is for no more than the group is short of, also when some of
+// the request were listed: the scale was lowered meanwhile and a listed
+// instance deleted for it.
+func TestPending_ReAskAfterAScaleDown(t *testing.T) {
+	e := newEnv(t, "")
+	e.putGroup(4, nil)
+	e.reconcile()
+	insts := e.instances()
+	slices.SortFunc(insts, func(a, b provider.Instance) int { return strings.Compare(a.Name, b.Name) })
+	// The last two are never listed.
+	e.lag.hide(func(i provider.Instance) bool { return i.ID == insts[2].ID || i.ID == insts[3].ID })
+	e.reconcile()
+
+	// A scale of 3: a listed instance whose node had not joined goes.
+	e.putGroup(3, nil)
+	e.reconcile()
+	if n := len(e.instances()); n != 3 {
+		t.Fatalf("instances after the scale down: %d", n)
+	}
+	// The provider loses the request.
+	for _, inst := range e.instances() {
+		if err := e.mock.Delete(context.Background(), "dc1", inst.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.putGroup(1, nil)
+	e.advance(e.r.cfg.ListGrace + time.Second)
+	e.reconcile()
+	req := e.lag.lastRequest()
+	if req.RequestID != "eu/workers-dc1/1" || !slices.Equal(namesOf(req), []string{"workers-dc1-1-3"}) {
+		t.Fatalf("the request made again is %s and names %v, want eu/workers-dc1/1 with only workers-dc1-1-3", req.RequestID, namesOf(req))
+	}
+	if n := len(e.instances()); n != 1 {
+		t.Fatalf("instances at a scale of 1: %d", n)
+	}
+}
+
+// A record of a request that does not say which of its instances were listed
+// (written before listedNames, or for an instance without a name) is not
+// made again: the names it would ask for could be those of instances the
+// operator deleted. The request is forgotten, and what is missing is asked
+// for in a new request.
+func TestPending_RecordWithoutTheListedNamesIsNotMadeAgain(t *testing.T) {
+	e := newEnv(t, "")
+	e.putGroup(1, nil)
+	obj := e.backend.GetObject(NodeGroupKind, "", "workers-dc1")
+	if _, err := e.backend.UpdateObjectStatus(context.Background(), NodeGroupKind, "", "workers-dc1", map[string]any{
+		"lastRequest": 1,
+		"pendingRequests": []any{map[string]any{
+			"number": 1, "count": 2, "asked": 2, "asks": 1, "at": e.now.Add(-10 * time.Minute).Format(time.RFC3339),
+			"listed": []any{"mock-dc1-1"},
+		}},
+	}, obj.ModifyIndex); err != nil {
+		t.Fatal(err)
+	}
+	e.reconcile()
+	insts := e.instances()
+	if asked := e.lag.asked(); !slices.Equal(asked, []string{"eu/workers-dc1/2"}) || len(insts) != 1 || insts[0].Name != "workers-dc1-2-1" {
+		t.Fatalf("requests %v, instances %+v; want one new request and its instance", asked, insts)
+	}
+	e.reconcile()
+	if p := pendingOf(e.status()); len(p) != 0 {
+		t.Fatalf("pendingRequests: %+v", p)
+	}
+}

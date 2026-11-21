@@ -39,8 +39,27 @@ import (
 // again with its own number: a provider that has the instances answers with
 // them and creates nothing. The answer says what the request made, and the
 // grace time starts again for those of its instances the listing does not
-// show. This is reported: the event InstancesNotListed, and Provisioned is
-// False (NotListed) until the listing shows them. With the join, the request
+// show.
+//
+// A provider that has no instance of the request left makes what the request
+// made again names (the contract of provider/node). So the request made again
+// names only instances no listing has shown, and no more of them than the
+// group is short of: an instance the operator saw listed, and then deleted
+// for a scale down, a join failure, a repair or a replacement, is not asked
+// for again (review finding CON-6m). The record keeps the names of the
+// instances a listing has shown for this (listedNames, beside their IDs in
+// listed). A record that does not name every listed instance (one written
+// before listedNames, or an instance without the name the operator gave it)
+// cannot tell which names are free: it is not made again but forgotten, and
+// what the group is short of is asked for in a new request. Nor does a
+// request made again name an instance whose node has joined: it would have
+// no bootstrap (join.Store.Issue gives no token), and a machine made from it
+// could not join. When only such instances are left to ask for, no request is
+// made: while their nodes are ready the grace time starts again, as after an
+// answer, and otherwise the request is forgotten.
+//
+// A request made again is reported: the event InstancesNotListed, and
+// Provisioned is False (NotListed) until the listing shows them. With the join, the request
 // made again carries new tokens and the ones of the first time stay valid
 // for the machines that have them (join.Store.Issue; review finding CON-6h);
 // an instance that has joined gets none. If the group is not short
@@ -78,6 +97,10 @@ type pendingRequest struct {
 	Asked int64
 	// Listed are the provider's IDs of its instances a listing has shown.
 	Listed []string
+	// ListedNames are the names of the instances a listing has shown: a
+	// request made again does not name them. One name per ID of Listed in a
+	// record the operator can make again (unlistedIndexes).
+	ListedNames []string
 }
 
 func readPending(status map[string]any) []*pendingRequest {
@@ -104,6 +127,12 @@ func readPending(status map[string]any) []*pendingRequest {
 				p.Listed = append(p.Listed, id)
 			}
 		}
+		listedNames, _ := d["listedNames"].([]any)
+		for _, v := range listedNames {
+			if name, ok := v.(string); ok && name != "" {
+				p.ListedNames = append(p.ListedNames, name)
+			}
+		}
 		out = append(out, p)
 	}
 	return out
@@ -126,6 +155,13 @@ func pendingDocs(pend []*pendingRequest) []any {
 				listed = append(listed, id)
 			}
 			d["listed"] = listed
+		}
+		if len(p.ListedNames) > 0 {
+			names := make([]any, 0, len(p.ListedNames))
+			for _, name := range p.ListedNames {
+				names = append(names, name)
+			}
+			d["listedNames"] = names
 		}
 		out = append(out, d)
 	}
@@ -156,9 +192,43 @@ func pendingNames(group string, pend []*pendingRequest) map[string]bool {
 	return out
 }
 
-// answered records the answer of the provider to the request made for asked
-// instances: the request made the instances of the answer and those a
-// listing has shown, and the grace time of the ones not listed starts now.
+// unlistedIndexes are the instances of the request no listing has shown, by
+// their index in the request (the i of instanceName): those a request made
+// again may name. known is false for a record that does not say which of its
+// instances were listed: it has an ID without a name, or a name that is not
+// one of the request (an instance named before the names carried the mark of
+// the group). Such a request is not made again.
+func (p *pendingRequest) unlistedIndexes(group string) (indexes []int, known bool) {
+	if len(p.ListedNames) != len(p.Listed) {
+		return nil, false
+	}
+	listed := map[string]bool{}
+	for _, name := range p.ListedNames {
+		listed[name] = true
+	}
+	for i := 1; int64(i) <= max(p.Asked, p.Count); i++ {
+		name := instanceName(group, p.Number, i)
+		if listed[name] {
+			delete(listed, name)
+			continue
+		}
+		indexes = append(indexes, i)
+	}
+	return indexes, len(listed) == 0
+}
+
+// waited records that the request was not made again at the end of its grace
+// time, because every instance left to ask for has a node that joined and is
+// ready: the grace time starts again, as after an answer.
+func (p *pendingRequest) waited(now time.Time) {
+	p.At = now
+	p.Asks++
+}
+
+// answered records the answer of the provider to the request made for the
+// instances up to the index asked: the request made the instances of the
+// answer and those a listing has shown, and the grace time of the ones not
+// listed starts now.
 func (p *pendingRequest) answered(created []provider.Instance, asked int, now time.Time) {
 	p.Asked = max(p.Asked, int64(asked), int64(len(created)))
 	p.Count = int64(len(p.Listed))
@@ -183,8 +253,14 @@ func (r *Reconciler) pending(group string, status map[string]any, instances []pr
 	for _, p := range pend {
 		id := r.requestID(group, p.Number)
 		for _, inst := range instances {
-			if inst.RequestID == id && !slices.Contains(p.Listed, inst.ID) {
+			if inst.RequestID != id {
+				continue
+			}
+			if !slices.Contains(p.Listed, inst.ID) {
 				p.Listed = append(p.Listed, inst.ID)
+			}
+			if inst.Name != "" && !slices.Contains(p.ListedNames, inst.Name) {
+				p.ListedNames = append(p.ListedNames, inst.Name)
 			}
 		}
 	}
