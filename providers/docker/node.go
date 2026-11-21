@@ -446,7 +446,7 @@ func (p *Provider) start(ctx context.Context, group string, req node.CreateReque
 	switch _, err := p.cfg.Docker.Run(ctx, "inspect", ir.Name); {
 	case err == nil:
 		return node.Instance{}, fmt.Errorf("a container named %s exists already; it is left as it is", ir.Name)
-	case !strings.Contains(err.Error(), "No such"):
+	case !noSuch(err):
 		return node.Instance{}, fmt.Errorf("looking for a container named %s: %w", ir.Name, err)
 	}
 	dir := filepath.Join(p.cfg.StateDir, ir.Name)
@@ -534,9 +534,22 @@ func (p *Provider) Delete(ctx context.Context, group, id string) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, err := p.cfg.Docker.Run(ctx, "rm", "-f", id); err != nil && !strings.Contains(err.Error(), "No such container") {
+	if _, err := p.cfg.Docker.Run(ctx, "rm", "-f", id); err != nil && !noSuch(err) {
 		return err
 	}
 	p.removeCgroups(id)
 	return os.RemoveAll(filepath.Join(p.cfg.StateDir, id))
+}
+
+// noSuch reports whether docker says that the container it was asked about
+// does not exist. The spelling differs between the versions of docker and
+// between its commands ("Error: No such object", "error: no such object",
+// "No such container"), so the case is not looked at. Another "no such"
+// (a host, an image) is not a missing container.
+func noSuch(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "no such object") || strings.Contains(text, "no such container")
 }

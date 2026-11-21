@@ -68,7 +68,8 @@ func (f *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
 		var out []container
 		for _, id := range args[1:] {
 			if f.containers[id] == nil {
-				return "", errors.New("Error: No such object: " + id)
+				// The text of the docker CLI of the lab (27.x): lower case.
+				return "", errors.New("error: no such object: " + id)
 			}
 			out = append(out, *f.containers[id])
 		}
@@ -470,5 +471,25 @@ func TestDocker_StartLeavesTheFilesOfAnExistingContainer(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("the stale files of a name without a container are left: %v", err)
+	}
+}
+
+// The docker of the lab answers an inspect of a missing container with
+// "error: no such object", an older one with "Error: No such object": a
+// create worked with neither of them being an error.
+func TestNoSuch(t *testing.T) {
+	for text, want := range map[string]bool{
+		"exit status 1: error: no such object: workers-1-1":                  true,
+		"exit status 1: Error: No such object: workers-1-1":                  true,
+		"Error response from daemon: No such container: workers-1-1":         true,
+		"Cannot connect to the Docker daemon at unix:///var/run/docker.sock": false,
+		"dial tcp: lookup docker.lab: no such host":                          false,
+	} {
+		if got := noSuch(errors.New(text)); got != want {
+			t.Errorf("noSuch(%q) = %v, want %v", text, got, want)
+		}
+	}
+	if noSuch(nil) {
+		t.Error("no error is not a missing container")
 	}
 }
