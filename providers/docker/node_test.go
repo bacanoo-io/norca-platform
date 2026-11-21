@@ -67,6 +67,9 @@ func (f *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
 	case "inspect":
 		var out []container
 		for _, id := range args[1:] {
+			if f.containers[id] == nil {
+				return "", errors.New("Error: No such object: " + id)
+			}
 			out = append(out, *f.containers[id])
 		}
 		data, _ := json.Marshal(out)
@@ -77,6 +80,9 @@ func (f *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
 		}
 		if f.failRunAfter > 0 && len(f.runs) >= f.failRunAfter {
 			return "", errors.New("no space left on device")
+		}
+		if name := argAfter(args, "--name"); f.containers[name] != nil {
+			return "", fmt.Errorf("Error response from daemon: Conflict. The container name %q is already in use", "/"+name)
 		}
 		f.runs = append(f.runs, args)
 		c := &container{Name: "/" + argAfter(args, "--name")}
@@ -416,5 +422,53 @@ func TestDocker_CreateThatFailsPartOfTheWay(t *testing.T) {
 	rest, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/2", "workers-dc1-2-1"))
 	if err != nil || len(rest) != 1 || rest[0].RequestID != "eu/workers-dc1/2" {
 		t.Fatalf("a new request for the rest: %+v, %v", rest, err)
+	}
+}
+
+// A request that names a container that exists (another request gave its
+// instance the same name, as two regions on one docker did) fails and leaves
+// the files of that container alone: they are mounted into it (review
+// finding CON-6n: start removed the state directory of the name before the
+// run, and again when the run failed).
+func TestDocker_StartLeavesTheFilesOfAnExistingContainer(t *testing.T) {
+	p, fd, dir := newTestProvider(t)
+	ctx := context.Background()
+	if _, err := p.Create(ctx, "dc1", request(t, "eu/workers/1", "workers-1-1")); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, "workers-1-1", "etc", "norca", "tls", "client-key.pem")
+	before, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = p.Create(ctx, "dc1", request(t, "us/workers/1", "workers-1-1"))
+	if node.ReasonOf(err) != node.ReasonError || err == nil || !strings.Contains(err.Error(), "workers-1-1") {
+		t.Fatalf("a request for the name of a container that exists: %v", err)
+	}
+	after, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatalf("the files of the container that exists are gone: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("the key of the container that exists was written again")
+	}
+	if c := fd.containers["workers-1-1"]; c == nil || c.Config.Labels["norca.request"] != "eu/workers/1" || len(fd.runs) != 1 {
+		t.Fatalf("the container that exists was touched: %+v, %d runs", c, len(fd.runs))
+	}
+
+	// A directory without a container (left by a crash) is not in the way.
+	stale := filepath.Join(dir, "workers-1-2", "etc", "stale")
+	if err := os.MkdirAll(filepath.Dir(stale), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Create(ctx, "dc1", request(t, "eu/workers/2", "workers-1-2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("the stale files of a name without a container are left: %v", err)
 	}
 }

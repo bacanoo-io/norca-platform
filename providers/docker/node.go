@@ -436,6 +436,19 @@ func (p *Provider) start(ctx context.Context, group string, req node.CreateReque
 	if err != nil {
 		return node.Instance{}, err
 	}
+	// The files of an instance are mounted into its container. A container
+	// with the name may exist: one of another request (two regions on one
+	// docker gave their instances the same names; review finding CON-6n).
+	// Its files are not touched then, neither before the run nor when the run
+	// fails: the directory is cleared, and removed on a failure, only once it
+	// is known that no container has the name, so it holds what a crash left
+	// or what this call wrote.
+	switch _, err := p.cfg.Docker.Run(ctx, "inspect", ir.Name); {
+	case err == nil:
+		return node.Instance{}, fmt.Errorf("a container named %s exists already; it is left as it is", ir.Name)
+	case !strings.Contains(err.Error(), "No such"):
+		return node.Instance{}, fmt.Errorf("looking for a container named %s: %w", ir.Name, err)
+	}
 	dir := filepath.Join(p.cfg.StateDir, ir.Name)
 	if err := os.RemoveAll(dir); err != nil {
 		return node.Instance{}, err
