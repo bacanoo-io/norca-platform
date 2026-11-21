@@ -72,7 +72,7 @@ func TestPendingNodes_ANodeJoinsBeforeItsInstanceIsListed(t *testing.T) {
 	e.putGroup(2, nil)
 	e.reconcile()
 	tokens := e.machineTokens()
-	const name = "workers-dc1-1-1"
+	const name = "eu-workers-dc1-1-1"
 	e.lag.hide(hideAll)
 
 	// The machine joins and its node registers.
@@ -131,18 +131,18 @@ func TestPendingNodes_OtherNamesAreForeign(t *testing.T) {
 	e.reconcile()
 	e.lag.hide(hideAll)
 	e.nodes.set(
-		nodeOfInstance("n1", "workers-dc1-1-1", 10),
+		nodeOfInstance("n1", "eu-workers-dc1-1-1", 10),
 		// A second ready node with the name: the first is the node.
-		Node{ID: "n2", Name: "copy", Instance: "workers-dc1-1-1", Group: "workers-dc1", Ready: true, Eligible: true, CreateIndex: 20},
+		Node{ID: "n2", Name: "copy", Instance: "eu-workers-dc1-1-1", Group: "workers-dc1", Ready: true, Eligible: true, CreateIndex: 20},
 		// The request asked for two instances: there is no third.
-		nodeOfInstance("n3", "workers-dc1-1-3", 30),
+		nodeOfInstance("n3", "eu-workers-dc1-1-3", 30),
 		// A request that was not made.
-		nodeOfInstance("n4", "workers-dc1-2-1", 40),
+		nodeOfInstance("n4", "eu-workers-dc1-2-1", 40),
 	)
 	e.reconcile()
 	st := e.status()
-	if got := strayKinds(st); len(got) != 3 || got["copy"] != strayForeign || got["workers-dc1-1-3"] != strayForeign ||
-		got["workers-dc1-2-1"] != strayForeign {
+	if got := strayKinds(st); len(got) != 3 || got["copy"] != strayForeign || got["eu-workers-dc1-1-3"] != strayForeign ||
+		got["eu-workers-dc1-2-1"] != strayForeign {
 		t.Fatalf("stray nodes: %v", got)
 	}
 	if e.nodes.eligible("n2") || e.nodes.eligible("n3") || e.nodes.eligible("n4") || !e.nodes.eligible("n1") {
@@ -163,7 +163,7 @@ func TestPendingNodes_AForgottenRequestFallsBack(t *testing.T) {
 	e.putGroup(1, nil)
 	e.reconcile()
 	tokens := e.machineTokens()
-	const name = "workers-dc1-1-1"
+	const name = "eu-workers-dc1-1-1"
 	e.lag.hide(hideAll)
 	rec, _, err := store.Redeem(ctx, name, tokens[name])
 	if err != nil {
@@ -217,7 +217,7 @@ func lostStatusWrite(t *testing.T, node Node) *env {
 // eligible again once the listing shows the instance, which was created
 // before the node was made ineligible.
 func TestPendingNodes_ANodeMadeIneligibleIsRestoredWhenListed(t *testing.T) {
-	const name = "workers-dc1-1-1"
+	const name = "eu-workers-dc1-1-1"
 	e := lostStatusWrite(t, nodeOfInstance("n1", name, 10))
 
 	// Neither the status nor the listing knows the request: the node is
@@ -265,7 +265,7 @@ func TestPendingNodes_ANodeMadeIneligibleIsRestoredWhenListed(t *testing.T) {
 // node that was ineligible already (by hand, by another controller), and a
 // node that is drained meanwhile.
 func TestPendingNodes_OnlyItsOwnIneligibilityIsUndone(t *testing.T) {
-	const name = "workers-dc1-1-1"
+	const name = "eu-workers-dc1-1-1"
 	t.Run("ineligible before", func(t *testing.T) {
 		n := nodeOfInstance("n1", name, 10)
 		n.Eligible = false
@@ -306,7 +306,7 @@ func TestPendingNodes_ANameTakenInAdvanceStaysIneligible(t *testing.T) {
 	e := newEnv(t, "")
 	e.putGroup(1, nil)
 	e.reconcile()
-	const name = "workers-dc1-2-1"
+	const name = "eu-workers-dc1-2-1"
 	first := e.instances()[0]
 	e.nodes.set(nodeOfInstance("n1", first.Name, 10), nodeOfInstance("ghost", name, 20))
 	e.reconcile()

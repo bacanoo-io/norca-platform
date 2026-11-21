@@ -43,12 +43,12 @@ func TestRender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := tmpl.Render(Node{Name: "workers-dc1-3-1", Datacenter: "dc1", Pool: "workers", Class: "gpu",
-		Meta: map[string]string{"norca.instance": "workers-dc1-3-1", "norca.node_group": "workers-dc1"}})
+	r, err := tmpl.Render(Node{Name: "eu-workers-dc1-3-1", Datacenter: "dc1", Pool: "workers", Class: "gpu",
+		Meta: map[string]string{"norca.instance": "eu-workers-dc1-3-1", "norca.node_group": "workers-dc1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(r.UserData, "#cloud-config\n") || !strings.Contains(r.UserData, "hostname: workers-dc1-3-1\n") ||
+	if !strings.HasPrefix(r.UserData, "#cloud-config\n") || !strings.Contains(r.UserData, "hostname: eu-workers-dc1-3-1\n") ||
 		!strings.Contains(r.UserData, "[systemctl, enable, --now, norca]") {
 		t.Fatalf("document:\n%s", r.UserData)
 	}
@@ -73,7 +73,7 @@ func TestRender(t *testing.T) {
 		t.Fatalf("the node certificate does not verify: %v", err)
 	}
 	if leaf.Subject.CommonName != "client.eu.norca" || len(leaf.URIs) != 1 ||
-		leaf.URIs[0].String() != "spiffe://lab.norca/region/eu/node/workers-dc1-3-1" {
+		leaf.URIs[0].String() != "spiffe://lab.norca/region/eu/node/eu-workers-dc1-3-1" {
 		t.Fatalf("names: %s %v", leaf.Subject.CommonName, leaf.URIs)
 	}
 	if left := time.Until(leaf.NotAfter); left < 59*24*time.Hour || left > 60*24*time.Hour {
@@ -88,8 +88,8 @@ func TestRender(t *testing.T) {
 
 	// The agent configuration has the node's own parts.
 	cfg := string(f["/etc/norca/norca.hcl"])
-	for _, want := range []string{`name       = "workers-dc1-3-1"`, `region     = "eu"`, `datacenter = "dc1"`,
-		`node_pool  = "workers"`, `node_class = "gpu"`, `"norca.instance" = "workers-dc1-3-1"`,
+	for _, want := range []string{`name       = "eu-workers-dc1-3-1"`, `region     = "eu"`, `datacenter = "dc1"`,
+		`node_pool  = "workers"`, `node_class = "gpu"`, `"norca.instance" = "eu-workers-dc1-3-1"`,
 		`"norca.cert_expires" = "` + leaf.NotAfter.UTC().Format(time.RFC3339) + `"`,
 		`cert_file = "/etc/norca/tls/client.pem"`} {
 		if !strings.Contains(cfg, want) {
@@ -98,7 +98,7 @@ func TestRender(t *testing.T) {
 	}
 
 	// Each node gets a key of its own.
-	r2, err := tmpl.Render(Node{Name: "workers-dc1-3-2", Datacenter: "dc1", Pool: "workers"})
+	r2, err := tmpl.Render(Node{Name: "eu-workers-dc1-3-2", Datacenter: "dc1", Pool: "workers"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestDecodeReadsRender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := tmpl.Render(Node{Name: "workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"})
+	r, err := tmpl.Render(Node{Name: "eu-workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestDecodeReadsRender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Hostname != "workers-dc1-1-1" || len(d.Files) != 4 || len(d.RunCmd) != 1 {
+	if d.Hostname != "eu-workers-dc1-1-1" || len(d.Files) != 4 || len(d.RunCmd) != 1 {
 		t.Fatalf("document: %+v", d)
 	}
 	want := files(t, r.UserData)

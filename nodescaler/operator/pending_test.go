@@ -377,7 +377,7 @@ func TestPending_RequestTheProviderNeverHad(t *testing.T) {
 	}
 	e.reconcile()
 	insts := e.instances()
-	if len(insts) != 1 || insts[0].RequestID != "eu/workers-dc1/1" || insts[0].Name != "workers-dc1-1-1" {
+	if len(insts) != 1 || insts[0].RequestID != "eu/workers-dc1/1" || insts[0].Name != "eu-workers-dc1-1-1" {
 		t.Fatalf("instances: %+v", insts)
 	}
 	e.reconcile()
@@ -435,16 +435,16 @@ func TestPending_ReAskNamesOnlyTheInstancesNotListed(t *testing.T) {
 	e.advance(e.r.cfg.ListGrace + time.Second)
 	e.reconcile()
 	req := e.lag.lastRequest()
-	if req.RequestID != "eu/workers-dc1/1" || !slices.Equal(namesOf(req), []string{"workers-dc1-1-2"}) {
-		t.Fatalf("the request made again is %s and names %v, want eu/workers-dc1/1 with only workers-dc1-1-2, the instance no listing has shown",
+	if req.RequestID != "eu/workers-dc1/1" || !slices.Equal(namesOf(req), []string{"eu-workers-dc1-1-2"}) {
+		t.Fatalf("the request made again is %s and names %v, want eu/workers-dc1/1 with only eu-workers-dc1-1-2, the instance no listing has shown",
 			req.RequestID, namesOf(req))
 	}
 	got := e.instances()
-	if len(got) != 2 || slices.ContainsFunc(got, func(i provider.Instance) bool { return i.Name == "workers-dc1-1-1" }) {
+	if len(got) != 2 || slices.ContainsFunc(got, func(i provider.Instance) bool { return i.Name == "eu-workers-dc1-1-1" }) {
 		t.Fatalf("instances at a scale of 2: %+v", got)
 	}
-	if !slices.Equal(listedNames, []any{"workers-dc1-1-1"}) {
-		t.Fatalf("pendingRequests after the first listing: %+v, want listedNames workers-dc1-1-1", p)
+	if !slices.Equal(listedNames, []any{"eu-workers-dc1-1-1"}) {
+		t.Fatalf("pendingRequests after the first listing: %+v, want listedNames eu-workers-dc1-1-1", p)
 	}
 }
 
@@ -477,8 +477,8 @@ func TestPending_ReAskAfterAScaleDown(t *testing.T) {
 	e.advance(e.r.cfg.ListGrace + time.Second)
 	e.reconcile()
 	req := e.lag.lastRequest()
-	if req.RequestID != "eu/workers-dc1/1" || !slices.Equal(namesOf(req), []string{"workers-dc1-1-3"}) {
-		t.Fatalf("the request made again is %s and names %v, want eu/workers-dc1/1 with only workers-dc1-1-3", req.RequestID, namesOf(req))
+	if req.RequestID != "eu/workers-dc1/1" || !slices.Equal(namesOf(req), []string{"eu-workers-dc1-1-3"}) {
+		t.Fatalf("the request made again is %s and names %v, want eu/workers-dc1/1 with only eu-workers-dc1-1-3", req.RequestID, namesOf(req))
 	}
 	if n := len(e.instances()); n != 1 {
 		t.Fatalf("instances at a scale of 1: %d", n)
@@ -505,7 +505,7 @@ func TestPending_RecordWithoutTheListedNamesIsNotMadeAgain(t *testing.T) {
 	}
 	e.reconcile()
 	insts := e.instances()
-	if asked := e.lag.asked(); !slices.Equal(asked, []string{"eu/workers-dc1/2"}) || len(insts) != 1 || insts[0].Name != "workers-dc1-2-1" {
+	if asked := e.lag.asked(); !slices.Equal(asked, []string{"eu/workers-dc1/2"}) || len(insts) != 1 || insts[0].Name != "eu-workers-dc1-2-1" {
 		t.Fatalf("requests %v, instances %+v; want one new request and its instance", asked, insts)
 	}
 	e.reconcile()

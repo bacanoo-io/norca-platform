@@ -24,8 +24,8 @@ func TestRenderJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := tmpl.RenderJoin(Node{Name: "workers-dc1-3-1", Datacenter: "dc1", Pool: "workers",
-		Meta: map[string]string{"norca.instance": "workers-dc1-3-1"}},
+	r, err := tmpl.RenderJoin(Node{Name: "eu-workers-dc1-3-1", Datacenter: "dc1", Pool: "workers",
+		Meta: map[string]string{"norca.instance": "eu-workers-dc1-3-1"}},
 		JoinTicket{Token: "secret-token", URLs: []string{"https://10.0.0.7:8490"}, KeyStore: join.KeyStoreAuto})
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestRenderJoin(t *testing.T) {
 	if err := conf.Check(); err != nil {
 		t.Fatal(err)
 	}
-	if conf.Instance != "workers-dc1-3-1" || conf.Token != "secret-token" || conf.Service != "norca" ||
+	if conf.Instance != "eu-workers-dc1-3-1" || conf.Token != "secret-token" || conf.Service != "norca" ||
 		conf.Endpoint != "spiffe://lab.norca/region/eu/nodescaler/join" || conf.KeyFile != "/etc/norca/tls/client-key.pem" ||
 		conf.KeyStore != join.KeyStoreAuto {
 		t.Fatalf("join configuration: %+v", conf)
@@ -116,7 +116,7 @@ func TestInstallScript(t *testing.T) {
 		t.Fatalf("install scripts: %q %q", plain.InstallScript, scripted.InstallScript)
 	}
 
-	node := Node{Name: "workers-dc1-3-1", Datacenter: "dc1", Pool: "workers"}
+	node := Node{Name: "eu-workers-dc1-3-1", Datacenter: "dc1", Pool: "workers"}
 	ticket := JoinTicket{Token: "secret-token", URLs: []string{"https://10.0.0.7:8490"}}
 	without, err := plain.RenderJoin(node, ticket)
 	if err != nil {

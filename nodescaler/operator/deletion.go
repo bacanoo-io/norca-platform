@@ -220,7 +220,7 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 		// The join records of the instances go with them. Orphaned
 		// instances (above) keep theirs: their nodes go on renewing.
 		if r.cfg.Join != nil {
-			if err := r.cfg.Join.Forget(ctx, obj.Name, instancePrefix(obj.Name)); err != nil {
+			if err := r.cfg.Join.Forget(ctx, obj.Name, instancePrefix(r.cfg.Region, obj.Name)); err != nil {
 				return 0, fmt.Errorf("dropping the join records of node group %s: %w", obj.Name, err)
 			}
 		}

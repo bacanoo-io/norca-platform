@@ -45,8 +45,8 @@ import (
 
 // Config are the settings of the operator.
 type Config struct {
-	// Region is the region of the cluster: a label of the instances and the
-	// first part of the request IDs.
+	// Region is the region of the cluster: a label of the instances, the start
+	// of their names (instanceName) and the first part of the request IDs.
 	Region string
 
 	// ProviderTTL is how old the heartbeat of a provider may be (default 3
@@ -308,13 +308,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 	// The names of their instances are names of instances of the group, as
 	// those of the listing are: a machine can boot before the listing shows
 	// it.
-	awaitedNames := pendingNames(obj.Name, pend)
+	awaitedNames := pendingNames(r.cfg.Region, obj.Name, pend)
 	if r.cfg.Join != nil {
 		live := maps.Clone(awaitedNames)
 		for _, inst := range o.instances {
 			live[instanceKey(inst)] = true
 		}
-		if err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(obj.Name), live); err != nil {
+		if err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(r.cfg.Region, obj.Name), live); err != nil {
 			r.log.Warn("pruning the join records failed", "group", obj.Name, "error", err)
 		}
 		r.recordSeen(ctx, obj.Name, o.instances)
@@ -390,7 +390,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 			if p == nil {
 				break
 			}
-			unlisted, known := p.unlistedIndexes(obj.Name)
+			unlisted, known := p.unlistedIndexes(r.cfg.Region, obj.Name)
 			if !known || len(unlisted) == 0 {
 				// The record does not say which names are free: the request
 				// is forgotten, and what is missing is a new request.
@@ -587,7 +587,7 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 	out = make([]provider.InstanceRequest, 0, len(indexes))
 	issued = map[string]*bootstrap.Rendered{}
 	for _, i := range indexes {
-		name := instanceName(obj.Name, seq, i)
+		name := instanceName(r.cfg.Region, obj.Name, seq, i)
 		ir := provider.InstanceRequest{Name: name}
 		if tmpl != nil {
 			meta := maps.Clone(spec.Node.Meta)
@@ -668,20 +668,26 @@ func (r *Reconciler) joinedNotListed(ctx context.Context, obj *api.CustomObject,
 
 // The names of the instances. A name is a host name (lower case letters,
 // digits and dashes, at most 63 characters): <base>-<request>-<i>, where the
-// base says which group the instance is of. No two groups have the same base
-// (review finding CON-6l: Edge_Pool and edge-pool both had edge-pool, so both
-// named a machine edge-pool-1-1, and the two machines shared one join
-// record):
+// base says which group of which region the instance is of. No two pairs of
+// a region and a group have the same base (review findings CON-6l: Edge_Pool
+// and edge-pool both had edge-pool, so both named a machine edge-pool-1-1,
+// and the two machines shared one join record; CON-6n: the same group name
+// in two regions that use one group of a provider gave the same names):
 //
-//   - a group whose name is a host name already, of at most maxPlainBase
-//     characters, and does not end like a mark, is its own base
-//     (workers-dc1-3-1);
-//   - any other name is made a host name (lower case, a dash for every other
-//     character, cut to headLen characters), and the mark of the group follows
-//     it: the first markLen hex digits of the SHA-256 of the exact name
-//     (edge-pool-d68a2eab-1-1 for Edge_Pool).
+//   - the plain base is <region>-<group> (eu-workers-dc1-3-1). It is used
+//     when the region is a host name without a dash, the group is a host
+//     name, the base has at most maxPlainBase characters and does not end
+//     like a mark. A region without a dash ends at the first dash of the
+//     base, so the base says which region and which group it is of;
+//   - any other pair gets a mark: the region and the group are made host
+//     names (lower case, a dash for every other character) and joined with a
+//     dash, cut to headLen characters, and followed by the first markLen hex
+//     digits of the SHA-256 of the exact region, a zero byte and the exact
+//     group name (eu-edge-pool-c26f0640-1-1 for Edge_Pool in eu). A region
+//     with a dash is such a pair: eu-west and workers would otherwise have
+//     the base of eu and west-workers.
 //
-// A plain base never ends like a mark, so it is not the base another group
+// A plain base never ends like a mark, so it is not the base another pair
 // gets with its mark; two bases with a mark are the same only when the marks
 // are.
 const (
@@ -690,7 +696,7 @@ const (
 	// maxPlainBase is the longest base. It leaves 24 characters for the
 	// numbers: every request number with up to 999 instances.
 	maxPlainBase = 39
-	// markLen is the length of the mark of a group; headLen what is left of
+	// markLen is the length of the mark of a pair; headLen what is left of
 	// the base before it and its dash.
 	markLen = 8
 	headLen = maxPlainBase - markLen - 1
@@ -699,8 +705,8 @@ const (
 // markEnd is how a base with a mark ends.
 var markEnd = regexp.MustCompile(`-[0-9a-f]{8}$`)
 
-// hostName makes a group name a host name: lower case, a dash for every
-// character that is not a letter or a digit, none at the ends.
+// hostName makes a region or a group name a host name: lower case, a dash
+// for every character that is not a letter or a digit, none at the ends.
 func hostName(group string) string {
 	var b strings.Builder
 	for _, c := range strings.ToLower(group) {
@@ -714,16 +720,21 @@ func hostName(group string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// plainBase reports a group whose name is the base of its instances as it
-// is.
-func plainBase(group string) bool {
-	return group != "" && hostName(group) == group && len(group) <= maxPlainBase && !markEnd.MatchString(group)
+// plainBase returns <region>-<group>, and whether it is the base of the
+// instances of the group as it is.
+func plainBase(region, group string) (string, bool) {
+	base := region + "-" + group
+	return base, region != "" && group != "" && hostName(region) == region && !strings.Contains(region, "-") &&
+		hostName(group) == group && len(base) <= maxPlainBase && !markEnd.MatchString(base)
 }
 
-// baseHead is the start of the base of a group that is not its own base: its
-// name as a host name, cut to at most n characters.
-func baseHead(group string, n int) string {
-	head := hostName(group)
+// baseHead is the start of the base of a pair that gets a mark: the region
+// and the group as host names, cut to at most n characters.
+func baseHead(region, group string, n int) string {
+	head := hostName(region)
+	if g := hostName(group); g != "" {
+		head = strings.TrimLeft(head+"-"+g, "-")
+	}
 	if len(head) > n {
 		head = strings.TrimRight(head[:max(n, 0)], "-")
 	}
@@ -733,21 +744,22 @@ func baseHead(group string, n int) string {
 	return head
 }
 
-// instanceBase is the base of the names of the instances of a group, of at
-// most room characters (room is maxPlainBase or more for every request an
-// operator makes; a shorter one cuts the head, never the mark).
-func instanceBase(group string, room int) string {
-	if plainBase(group) && len(group) <= room {
-		return group
+// instanceBase is the base of the names of the instances of a group of a
+// region, of at most room characters (room is maxPlainBase or more for every
+// request an operator makes; a shorter one cuts the head, never the mark).
+func instanceBase(region, group string, room int) string {
+	if base, ok := plainBase(region, group); ok && len(base) <= room {
+		return base
 	}
-	sum := sha256.Sum256([]byte(group))
-	return baseHead(group, min(headLen, room-markLen-1)) + "-" + hex.EncodeToString(sum[:])[:markLen]
+	sum := sha256.Sum256([]byte(region + "\x00" + group))
+	return baseHead(region, group, min(headLen, room-markLen-1)) + "-" + hex.EncodeToString(sum[:])[:markLen]
 }
 
-// instanceName is the name of the i-th instance of a request of the group.
-func instanceName(group string, seq int64, i int) string {
+// instanceName is the name of the i-th instance of a request of the group of
+// the region.
+func instanceName(region, group string, seq int64, i int) string {
 	suffix := fmt.Sprintf("-%d-%d", seq, i)
-	return instanceBase(group, maxInstanceName-len(suffix)) + suffix
+	return instanceBase(region, group, maxInstanceName-len(suffix)) + suffix
 }
 
 // instanceKey is how an instance is matched with its node: the name the

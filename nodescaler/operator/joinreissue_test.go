@@ -108,7 +108,7 @@ func TestJoinReissue_GraceTimeReAskKeepsTheTokensOfTheMachines(t *testing.T) {
 
 	// One machine per name: the join with the first token voids the later
 	// ones of the name.
-	const name = "workers-dc1-1-1"
+	const name = "eu-workers-dc1-1-1"
 	var later string
 	for _, ir := range e.lag.lastRequest().Instances {
 		if ir.Name == name {
@@ -155,7 +155,7 @@ func TestJoinReissue_LostCreateAnswerKeepsTheTokensOfTheMachines(t *testing.T) {
 // would make a machine without a bootstrap of the name (review finding
 // CON-6m).
 func TestJoinReissue_AJoinedNodeKeepsItsRecord(t *testing.T) {
-	const joined, missing = "workers-dc1-1-1", "workers-dc1-1-2"
+	const joined, missing = "eu-workers-dc1-1-1", "eu-workers-dc1-1-2"
 	for name, hidden := range map[string]func(provider.Instance) bool{
 		"the one that joined is listed":     func(i provider.Instance) bool { return i.Name == missing },
 		"the one that joined is not listed": hideAll,
@@ -239,8 +239,8 @@ func TestJoinReissue_OnlyJoinedInstancesAreLeftToAskFor(t *testing.T) {
 	e.reconcile()
 	joinAll(t, e, store)
 	e.nodes.set(
-		Node{ID: "n1", Name: "workers-dc1-1-1", Instance: "workers-dc1-1-1", Group: "workers-dc1", Ready: true, Eligible: true},
-		Node{ID: "n2", Name: "workers-dc1-1-2", Instance: "workers-dc1-1-2", Group: "workers-dc1", Ready: true, Eligible: true})
+		Node{ID: "n1", Name: "eu-workers-dc1-1-1", Instance: "eu-workers-dc1-1-1", Group: "workers-dc1", Ready: true, Eligible: true},
+		Node{ID: "n2", Name: "eu-workers-dc1-1-2", Instance: "eu-workers-dc1-1-2", Group: "workers-dc1", Ready: true, Eligible: true})
 	e.lag.hide(hideAll)
 
 	e.advance(e.r.cfg.ListGrace + time.Second)

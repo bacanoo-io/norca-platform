@@ -72,7 +72,7 @@ func TestJoin_InstancesGetATokenNotAKey(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &conf); err != nil {
 		t.Fatal(err)
 	}
-	if conf.Instance != "workers-dc1-1-1" || conf.Token == "" || len(conf.URLs) != 1 || conf.URLs[0] != "https://10.0.0.7:8490" {
+	if conf.Instance != "eu-workers-dc1-1-1" || conf.Token == "" || len(conf.URLs) != 1 || conf.URLs[0] != "https://10.0.0.7:8490" {
 		t.Fatalf("join configuration: %+v", conf)
 	}
 	if cfg := agentConfig(t, doc); !strings.Contains(cfg, `"norca.identity" = "join"`) || strings.Contains(cfg, "norca.cert_expires") {
@@ -82,7 +82,7 @@ func TestJoin_InstancesGetATokenNotAKey(t *testing.T) {
 	if n := e.eventCount("CertificateIssued"); n != 0 {
 		t.Fatalf("CertificateIssued events before a join: %d", n)
 	}
-	rec := e.backend.GetVariable("default", "nodescaler/join/eu/workers-dc1-1-1")
+	rec := e.backend.GetVariable("default", "nodescaler/join/eu/eu-workers-dc1-1-1")
 	if rec == nil || rec.Items["group"] != "workers-dc1" {
 		t.Fatalf("join record: %+v", rec)
 	}
@@ -93,16 +93,16 @@ func TestJoin_InstancesGetATokenNotAKey(t *testing.T) {
 		t.Fatalf("join record: %v, want the addresses %s", rec.Items, want)
 	}
 	e.reconcile()
-	if again := e.backend.GetVariable("default", "nodescaler/join/eu/workers-dc1-1-1"); again.ModifyIndex != rec.ModifyIndex {
+	if again := e.backend.GetVariable("default", "nodescaler/join/eu/eu-workers-dc1-1-1"); again.ModifyIndex != rec.ModifyIndex {
 		t.Fatalf("the record was written again: %v", again.Items)
 	}
 	// The token of the bootstrap is the recorded one.
-	if _, group, err := store.Redeem(context.Background(), "workers-dc1-1-1", conf.Token); err != nil || group != "workers-dc1" {
+	if _, group, err := store.Redeem(context.Background(), "eu-workers-dc1-1-1", conf.Token); err != nil || group != "workers-dc1" {
 		t.Fatalf("the token does not redeem: %q %v", group, err)
 	}
 
 	// The instance joined and is gone (by other hands): its record goes.
-	v, _, _ := store.Redeem(context.Background(), "workers-dc1-1-1", conf.Token)
+	v, _, _ := store.Redeem(context.Background(), "eu-workers-dc1-1-1", conf.Token)
 	if err := store.Joined(context.Background(), v, conf.Token, "abc"); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestJoin_InstancesGetATokenNotAKey(t *testing.T) {
 	}
 	e.putGroup(0, nil)
 	e.reconcile()
-	if rec := e.backend.GetVariable("default", "nodescaler/join/eu/workers-dc1-1-1"); rec != nil {
+	if rec := e.backend.GetVariable("default", "nodescaler/join/eu/eu-workers-dc1-1-1"); rec != nil {
 		t.Fatalf("the record of a gone instance stays: %+v", rec.Items)
 	}
 }
@@ -147,7 +147,7 @@ func TestJoin_DeletionForgetsTheRecords(t *testing.T) {
 			e.reconcile()
 			records := func() int {
 				n := 0
-				for _, inst := range []string{"workers-dc1-1-1", "workers-dc1-1-2"} {
+				for _, inst := range []string{"eu-workers-dc1-1-1", "eu-workers-dc1-1-2"} {
 					if e.backend.GetVariable("default", "nodescaler/join/eu/"+inst) != nil {
 						n++
 					}
@@ -178,7 +178,7 @@ func TestJoin_TheRecordOfAnotherGroupIsNotReplaced(t *testing.T) {
 	items, _ := bootstraptest.Items(t)
 	e.withBootstrap(items)
 	store := e.withJoin("https://10.0.0.7:8490")
-	token, err := store.Issue(context.Background(), "another-group", "eu/another-group/1", "workers-dc1-1-1", time.Hour)
+	token, err := store.Issue(context.Background(), "another-group", "eu/another-group/1", "eu-workers-dc1-1-1", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,30 +191,20 @@ func TestJoin_TheRecordOfAnotherGroupIsNotReplaced(t *testing.T) {
 		!strings.Contains(c["message"].(string), "another-group") || !e.hasEvent("BootstrapFailed") {
 		t.Fatalf("Provisioned: %+v", c)
 	}
-	if _, group, err := store.Redeem(context.Background(), "workers-dc1-1-1", token); err != nil || group != "another-group" {
+	if _, group, err := store.Redeem(context.Background(), "eu-workers-dc1-1-1", token); err != nil || group != "another-group" {
 		t.Fatalf("the token of the other group: %q %v", group, err)
 	}
 }
 
 func TestInstancePrefix(t *testing.T) {
-	for _, group := range []string{"workers-dc1", "Edge_Pool", strings.Repeat("a", 80)} {
-		p := instancePrefix(group)
-		for _, seq := range []int64{1, 12345, 999999999999} {
-			if name := instanceName(group, seq, 3); !strings.HasPrefix(name, p) {
-				t.Errorf("%s: %q does not start with %q", group, name, p)
+	for _, region := range []string{"eu", "eu-west-1", "EU", strings.Repeat("r", 40)} {
+		for _, group := range []string{"workers-dc1", "Edge_Pool", strings.Repeat("a", 80), "---"} {
+			p := instancePrefix(region, group)
+			for _, seq := range []int64{1, 12345, 999999999999} {
+				if name := instanceName(region, group, seq, 3); !strings.HasPrefix(name, p) || p == "" {
+					t.Errorf("%s %s: %q does not start with %q", region, group, name, p)
+				}
 			}
-		}
-	}
-	// The names instances had before the names carried the mark of their
-	// group: their records are still found.
-	for group, old := range map[string]string{
-		"Edge_Pool":             "edge-pool-1-1",
-		strings.Repeat("a", 80): strings.Repeat("a", 59) + "-1-1",
-		strings.Repeat("b", 45): strings.Repeat("b", 45) + "-12-3",
-		"---":                   "node-1-1",
-	} {
-		if p := instancePrefix(group); !strings.HasPrefix(old, p) {
-			t.Errorf("%s: the old name %q does not start with %q", group, old, p)
 		}
 	}
 }

@@ -74,14 +74,22 @@ missing, in a request that is idempotent by its ID (`<region>/<group>/<n>`).
 Each instance has a name of the operator (`<base>-<n>-<i>`, a host name of
 at most 63 characters) and a bootstrap of its own; the node it runs
 registers with that name in the meta key `norca.instance`, which is how
-nodes are matched with their instances. The base is the name of the group
-when that is a host name already (lower case letters, digits and dashes, at
-most 39 characters, not ending in a dash and eight hex digits):
-`workers-dc1-3-1`. Any other group name is made a host name (lower case, a
-dash for every other character, cut to 30 characters) and is followed by the
-first eight hex digits of the SHA-256 of the exact name: the instances of
-`Edge_Pool` are `edge-pool-d68a2eab-<n>-<i>`. So two groups never name a
-machine the same, however alike their names are.
+nodes are matched with their instances. The base names the region and the
+group, `<region>-<group>`: the instances of `workers-dc1` in the region `eu`
+are `eu-workers-dc1-<n>-<i>`. That plain base is used when the region is a
+host name without a dash, the group is a host name (lower case letters,
+digits and dashes), and the base has at most 39 characters and does not end
+in a dash and eight hex digits. Any other pair gets a mark: the region and
+the group are made host names (lower case, a dash for every other
+character), joined with a dash and cut to 30 characters, and followed by the
+first eight hex digits of the SHA-256 of the exact region, a zero byte and
+the exact group name. The instances of `Edge_Pool` in `eu` are
+`eu-edge-pool-c26f0640-<n>-<i>`, and those of `workers` in the region
+`eu-west` are `eu-west-workers-55cfcdb7-<n>-<i>`: a region with a dash
+always gets the mark, because the plain base would not say where the region
+ends (`eu` and `west-workers` are `eu-west-workers-<n>-<i>`). So two groups,
+and two regions that use the same group of a provider, never name a machine
+the same.
 The operator writes the status of the group:
 
 | Field | Meaning |

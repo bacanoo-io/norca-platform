@@ -162,13 +162,13 @@ func TestDocker_CreateRunsNorcaJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := tmpl.RenderJoin(bootstrap.Node{Name: "workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"},
+	r, err := tmpl.RenderJoin(bootstrap.Node{Name: "eu-workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"},
 		bootstrap.JoinTicket{Token: "t", URLs: []string{"https://10.0.0.7:8490"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := node.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []node.InstanceRequest{
-		{Name: "workers-dc1-1-1", Bootstrap: &node.Bootstrap{UserData: r.UserData}}}}
+		{Name: "eu-workers-dc1-1-1", Bootstrap: &node.Bootstrap{UserData: r.UserData}}}}
 	if _, err := p.Create(context.Background(), "dc1", req); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestDocker_CreateRunsNorcaJoin(t *testing.T) {
 		}
 	}
 	for _, f := range []string{"client-key.pem", "client.pem"} {
-		if _, err := os.Stat(filepath.Join(dir, "workers-dc1-1-1", "etc", "norca", "tls", f)); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "eu-workers-dc1-1-1", "etc", "norca", "tls", f)); err == nil {
 			t.Errorf("%s was written on the host", f)
 		}
 	}
@@ -199,12 +199,12 @@ func TestDocker_IgnoresTheInstallScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := tmpl.Render(bootstrap.Node{Name: "workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"})
+	r, err := tmpl.Render(bootstrap.Node{Name: "eu-workers-dc1-1-1", Datacenter: "dc1", Pool: "workers"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := node.CreateRequest{RequestID: "eu/workers-dc1/1", Instances: []node.InstanceRequest{
-		{Name: "workers-dc1-1-1", Bootstrap: &node.Bootstrap{UserData: r.UserData}}}}
+		{Name: "eu-workers-dc1-1-1", Bootstrap: &node.Bootstrap{UserData: r.UserData}}}}
 	if _, err := p.Create(context.Background(), "dc1", req); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestDocker_IgnoresTheInstallScript(t *testing.T) {
 		!strings.Contains(args, "agent -config /etc/norca/norca.hcl") {
 		t.Fatalf("docker run:\n%s", args)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "workers-dc1-1-1", "usr", "local", "sbin", "norca-node-install.sh")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "eu-workers-dc1-1-1", "usr", "local", "sbin", "norca-node-install.sh")); err == nil {
 		t.Fatal("the install script was written on the host")
 	}
 }
@@ -220,11 +220,11 @@ func TestDocker_IgnoresTheInstallScript(t *testing.T) {
 func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	p, fd, dir := newTestProvider(t)
 	ctx := context.Background()
-	insts, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2"))
+	insts, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "eu-workers-dc1-1-1", "eu-workers-dc1-1-2"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(insts) != 2 || insts[0].Name != "workers-dc1-1-1" || insts[0].ID != "workers-dc1-1-1" {
+	if len(insts) != 2 || insts[0].Name != "eu-workers-dc1-1-1" || insts[0].ID != "eu-workers-dc1-1-1" {
 		t.Fatalf("instances: %+v", insts)
 	}
 	// The addresses are in the answer of the create: the container's on its
@@ -234,7 +234,7 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	}
 	args := strings.Join(fd.runs[0], " ")
 	for _, want := range []string{
-		"--name workers-dc1-1-1", "--hostname workers-dc1-1-1", "--label norca.request=eu/workers-dc1/1",
+		"--name eu-workers-dc1-1-1", "--hostname eu-workers-dc1-1-1", "--label norca.request=eu/workers-dc1/1",
 		"--label norca.node_group=workers-dc1", "/usr/local/bin/norca:/usr/local/bin/norca:ro",
 		":/etc/norca/tls/client-key.pem:ro", ":/etc/norca/norca.hcl:ro",
 		"--entrypoint /usr/local/bin/norca debian:bookworm-slim agent -config /etc/norca/norca.hcl -config /etc/norca-provider/cgroup.hcl",
@@ -244,7 +244,7 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 			t.Errorf("docker run has no %q:\n%s", want, args)
 		}
 	}
-	key := filepath.Join(dir, "workers-dc1-1-1", "etc", "norca", "tls", "client-key.pem")
+	key := filepath.Join(dir, "eu-workers-dc1-1-1", "etc", "norca", "tls", "client-key.pem")
 	info, err := os.Stat(key)
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +270,7 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 	}
 
 	// The same request again starts nothing.
-	again, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2"))
+	again, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "eu-workers-dc1-1-1", "eu-workers-dc1-1-2"))
 	if err != nil || len(again) != 2 || len(fd.runs) != 2 {
 		t.Fatalf("again: %+v %v, %d runs", again, err, len(fd.runs))
 	}
@@ -282,10 +282,10 @@ func TestDocker_CreateRunsTheAgentOfTheBootstrap(t *testing.T) {
 func TestDocker_CgroupParentOfAnInstance(t *testing.T) {
 	p, fd, dir := newTestProvider(t)
 	ctx := context.Background()
-	if _, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2")); err != nil {
+	if _, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/1", "eu-workers-dc1-1-1", "eu-workers-dc1-1-2")); err != nil {
 		t.Fatal(err)
 	}
-	for i, name := range []string{"workers-dc1-1-1", "workers-dc1-1-2"} {
+	for i, name := range []string{"eu-workers-dc1-1-1", "eu-workers-dc1-1-2"} {
 		got, err := os.ReadFile(filepath.Join(dir, name, "etc", "norca-provider", "cgroup.hcl"))
 		if err != nil {
 			t.Fatal(err)
@@ -304,14 +304,14 @@ func TestDocker_CgroupParentOfAnInstance(t *testing.T) {
 	// What the agent of the first instance left on the host, and the parent
 	// of the second, which must stay.
 	root := filepath.Join(dir, ".cgroup")
-	own := filepath.Join(root, "norca-node-workers-dc1-1-1.slice")
-	other := filepath.Join(root, "norca-node-workers-dc1-1-2.slice")
+	own := filepath.Join(root, "norca-node-eu-workers-dc1-1-1.slice")
+	other := filepath.Join(root, "norca-node-eu-workers-dc1-1-2.slice")
 	for _, d := range []string{filepath.Join(own, "alloc-1.task.scope"), filepath.Join(own, "alloc-2.task.scope", "child"), other} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := p.Delete(ctx, "dc1", "workers-dc1-1-1"); err != nil {
+	if err := p.Delete(ctx, "dc1", "eu-workers-dc1-1-1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(own); !os.IsNotExist(err) {
@@ -321,10 +321,10 @@ func TestDocker_CgroupParentOfAnInstance(t *testing.T) {
 		t.Errorf("the cgroup parent of the other instance: %v", err)
 	}
 	// An instance whose agent made no cgroup.
-	if err := p.Delete(ctx, "dc1", "workers-dc1-1-2"); err != nil {
+	if err := p.Delete(ctx, "dc1", "eu-workers-dc1-1-2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Delete(ctx, "dc1", "workers-dc1-1-2"); err != nil {
+	if err := p.Delete(ctx, "dc1", "eu-workers-dc1-1-2"); err != nil {
 		t.Fatalf("a second delete: %v", err)
 	}
 }
@@ -396,9 +396,9 @@ func TestDocker_CreateThatFailsPartOfTheWay(t *testing.T) {
 	p, fd, _ := newTestProvider(t)
 	ctx := context.Background()
 	fd.failRunAfter = 1
-	req := request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2")
+	req := request(t, "eu/workers-dc1/1", "eu-workers-dc1-1-1", "eu-workers-dc1-1-2")
 	insts, err := p.Create(ctx, "dc1", req)
-	if node.ReasonOf(err) != node.ReasonError || err == nil || !strings.Contains(err.Error(), "workers-dc1-1-2") {
+	if node.ReasonOf(err) != node.ReasonError || err == nil || !strings.Contains(err.Error(), "eu-workers-dc1-1-2") {
 		t.Fatalf("a create whose second container does not start: %v", err)
 	}
 	if len(insts) != 0 {
@@ -408,18 +408,18 @@ func TestDocker_CreateThatFailsPartOfTheWay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(g.Instances) != 1 || g.Instances[0].Name != "workers-dc1-1-1" || g.Instances[0].RequestID != req.RequestID {
+	if len(g.Instances) != 1 || g.Instances[0].Name != "eu-workers-dc1-1-1" || g.Instances[0].RequestID != req.RequestID {
 		t.Fatalf("the listing after a create that failed part of the way: %+v", g.Instances)
 	}
 
 	// The request again: the container it has, nothing new.
 	fd.failRunAfter = 0
 	again, err := p.Create(ctx, "dc1", req)
-	if err != nil || len(again) != 1 || again[0].Name != "workers-dc1-1-1" || len(fd.runs) != 1 {
+	if err != nil || len(again) != 1 || again[0].Name != "eu-workers-dc1-1-1" || len(fd.runs) != 1 {
 		t.Fatalf("the request again: %+v, %v, %d runs", again, err, len(fd.runs))
 	}
 	// What is missing comes with a request of its own.
-	rest, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/2", "workers-dc1-2-1"))
+	rest, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/2", "eu-workers-dc1-2-1"))
 	if err != nil || len(rest) != 1 || rest[0].RequestID != "eu/workers-dc1/2" {
 		t.Fatalf("a new request for the rest: %+v, %v", rest, err)
 	}

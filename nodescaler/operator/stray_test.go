@@ -31,9 +31,9 @@ func TestStray_ForeignAndGoneNodes(t *testing.T) {
 		// A second ready node with the same name: foreign.
 		Node{ID: "n2", Name: "copy", Instance: inst.Name, Group: "workers-dc1", Ready: true, Eligible: true, CreateIndex: 20},
 		// A ready node of the group whose instance does not exist: foreign.
-		Node{ID: "n3", Name: "ghost", Instance: "workers-dc1-9-9", Group: "workers-dc1", Ready: true, Eligible: true, CreateIndex: 30},
+		Node{ID: "n3", Name: "ghost", Instance: "eu-workers-dc1-9-9", Group: "workers-dc1", Ready: true, Eligible: true, CreateIndex: 30},
 		// A node of a deleted instance, down: reported only.
-		Node{ID: "n4", Name: "old", Instance: "workers-dc1-0-1", Group: "workers-dc1", Ready: false, Eligible: true, CreateIndex: 5},
+		Node{ID: "n4", Name: "old", Instance: "eu-workers-dc1-0-1", Group: "workers-dc1", Ready: false, Eligible: true, CreateIndex: 5},
 		// Nodes that are not the group's: by hand, and of another group.
 		Node{ID: "n5", Name: "hand", Ready: true, Eligible: true},
 		Node{ID: "n6", Name: "other", Instance: "edge-1-1", Group: "edge", Ready: true, Eligible: true},

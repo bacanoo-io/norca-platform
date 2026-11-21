@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
 	"github.com/bacanoo-io/norca-platform/nodescaler/join"
@@ -53,7 +54,7 @@ func TestBootstrap_EachInstanceGetsItsOwn(t *testing.T) {
 	e.reconcile()
 
 	insts := e.instances()
-	if len(insts) != 2 || insts[0].Name != "workers-dc1-1-1" || insts[1].Name != "workers-dc1-1-2" {
+	if len(insts) != 2 || insts[0].Name != "eu-workers-dc1-1-1" || insts[1].Name != "eu-workers-dc1-1-2" {
 		t.Fatalf("instances: %+v", insts)
 	}
 	for _, inst := range insts {
@@ -115,66 +116,116 @@ func TestBootstrap_MissingAsksForNothing(t *testing.T) {
 	}
 }
 
-// hashOf is the mark of a group in the names of its instances.
-func hashOf(group string) string {
-	sum := sha256.Sum256([]byte(group))
+// hashOf is the mark of a group of a region in the names of its instances.
+func hashOf(region, group string) string {
+	sum := sha256.Sum256([]byte(region + "\x00" + group))
 	return hex.EncodeToString(sum[:])[:8]
 }
 
 func TestInstanceName(t *testing.T) {
 	long := strings.Repeat("a", 70)
 	for _, tc := range []struct {
-		group string
-		seq   int64
-		i     int
-		want  string
+		region, group string
+		seq           int64
+		i             int
+		want          string
 	}{
-		// A group whose name is a host name already is in the names as it is.
-		{"workers-dc1", 3, 1, "workers-dc1-3-1"},
-		{strings.Repeat("a", 39), 1, 1, strings.Repeat("a", 39) + "-1-1"},
-		// A name that had to be changed carries the mark of its group.
-		{"Edge_Pool", 1, 1, "edge-pool-d68a2eab-1-1"},
-		{"Workers_DC.1", 12, 2, "workers-dc-1-" + hashOf("Workers_DC.1") + "-12-2"},
-		{"---", 1, 1, "node-" + hashOf("---") + "-1-1"},
-		{long, 1, 1, strings.Repeat("a", 30) + "-" + hashOf(long) + "-1-1"},
-		{strings.Repeat("a", 40), 1, 1, strings.Repeat("a", 30) + "-" + hashOf(strings.Repeat("a", 40)) + "-1-1"},
+		// A region without a dash and a group that is a host name are in
+		// the names as they are.
+		{"eu", "workers-dc1", 3, 1, "eu-workers-dc1-3-1"},
+		{"global", "workers", 1, 2, "global-workers-1-2"},
+		{"eu", strings.Repeat("a", 36), 1, 1, "eu-" + strings.Repeat("a", 36) + "-1-1"},
+		// A group name that had to be changed carries the mark of the pair.
+		{"eu", "Edge_Pool", 1, 1, "eu-edge-pool-c26f0640-1-1"},
+		{"eu", "Workers_DC.1", 12, 2, "eu-workers-dc-1-" + hashOf("eu", "Workers_DC.1") + "-12-2"},
+		{"eu", "---", 1, 1, "eu-" + hashOf("eu", "---") + "-1-1"},
+		{"eu", long, 1, 1, "eu-" + strings.Repeat("a", 27) + "-" + hashOf("eu", long) + "-1-1"},
+		{"eu", strings.Repeat("a", 37), 1, 1, "eu-" + strings.Repeat("a", 27) + "-" + hashOf("eu", strings.Repeat("a", 37)) + "-1-1"},
 		// The cut does not depend on the number of the request.
-		{long, 999999999999, 3, strings.Repeat("a", 30) + "-" + hashOf(long) + "-999999999999-3"},
-		// A name that ends like a mark gets its own, so it is not the name of
-		// a group with that mark.
-		{"edge-pool-0a1b2c3d", 1, 1, "edge-pool-0a1b2c3d-" + hashOf("edge-pool-0a1b2c3d") + "-1-1"},
+		{"eu", long, 999999999999, 3, "eu-" + strings.Repeat("a", 27) + "-" + hashOf("eu", long) + "-999999999999-3"},
+		// A base that ends like a mark gets its own, so it is not the base
+		// of a pair with that mark.
+		{"eu", "edge-pool-0a1b2c3d", 1, 1, "eu-edge-pool-0a1b2c3d-" + hashOf("eu", "edge-pool-0a1b2c3d") + "-1-1"},
+		{"eu", "deadbeef", 1, 1, "eu-deadbeef-" + hashOf("eu", "deadbeef") + "-1-1"},
+		// A region with a dash: where it ends is not in the plain base, so
+		// the mark says it.
+		{"eu-west", "workers", 1, 1, "eu-west-workers-55cfcdb7-1-1"},
+		{"eu", "west-workers", 1, 1, "eu-west-workers-1-1"},
+		// A region that is not a host name, or is none.
+		{"EU", "workers", 1, 1, "eu-workers-" + hashOf("EU", "workers") + "-1-1"},
+		{"", "workers", 1, 1, "workers-" + hashOf("", "workers") + "-1-1"},
+		{"", "---", 1, 1, "node-" + hashOf("", "---") + "-1-1"},
+		{strings.Repeat("r", 40), "workers", 1, 1, strings.Repeat("r", 30) + "-" + hashOf(strings.Repeat("r", 40), "workers") + "-1-1"},
 	} {
-		got := instanceName(tc.group, tc.seq, tc.i)
+		got := instanceName(tc.region, tc.group, tc.seq, tc.i)
 		if got != tc.want || !join.ValidInstance(got) {
-			t.Errorf("%q %d %d: got %q, want %q", tc.group, tc.seq, tc.i, got, tc.want)
+			t.Errorf("%q %q %d %d: got %q, want %q", tc.region, tc.group, tc.seq, tc.i, got, tc.want)
 		}
 	}
 }
 
 // Two groups never give an instance the same name (review finding CON-6l:
 // Edge_Pool and edge-pool both made edge-pool-1-1, one machine name and one
-// join record for two machines).
-func TestInstanceName_UniquePerGroup(t *testing.T) {
+// join record for two machines), and neither do two regions, nor a region
+// and a group that read the same as another pair once joined (CON-6n).
+func TestInstanceName_UniquePerRegionAndGroup(t *testing.T) {
 	long := strings.Repeat("a", 70)
-	for _, pair := range [][2]string{
-		{"Edge_Pool", "edge-pool"},
-		{"Edge_Pool", "edge.pool"},
-		{"edge-pool", "-edge-pool-"},
-		{long + "1", long + "2"},
-		{"a", "A"},
-		// The name one group gets from its mark, as the name of another.
-		{"Edge_Pool", "edge-pool-" + hashOf("Edge_Pool")},
+	type pair struct{ region, group string }
+	for _, tc := range [][2]pair{
+		{{"eu", "Edge_Pool"}, {"eu", "edge-pool"}},
+		{{"eu", "Edge_Pool"}, {"eu", "edge.pool"}},
+		{{"eu", "edge-pool"}, {"eu", "-edge-pool-"}},
+		{{"eu", long + "1"}, {"eu", long + "2"}},
+		{{"eu", "a"}, {"eu", "A"}},
+		// The base one pair gets from its mark, as the plain base of another.
+		{{"eu", "Edge_Pool"}, {"eu", "edge-pool-" + hashOf("eu", "Edge_Pool")}},
+		// Two regions.
+		{{"eu", "workers"}, {"us", "workers"}},
+		{{"eu", "Edge_Pool"}, {"us", "Edge_Pool"}},
+		{{"eu", "workers"}, {"EU", "workers"}},
+		// The dash between the region and the group.
+		{{"eu-west", "workers"}, {"eu", "west-workers"}},
+		{{"eu-west-1", "workers"}, {"eu-west", "1-workers"}},
+		{{"eu-west", "Edge_Pool"}, {"eu", "west-Edge_Pool"}},
+		{{"eu", "west-workers"}, {"", "eu-west-workers"}},
 	} {
 		for _, seq := range []int64{1, 12, 999999999999} {
-			a, b := instanceName(pair[0], seq, 1), instanceName(pair[1], seq, 1)
+			a, b := instanceName(tc[0].region, tc[0].group, seq, 1), instanceName(tc[1].region, tc[1].group, seq, 1)
 			if a == b {
-				t.Errorf("groups %q and %q: both name an instance %q", pair[0], pair[1], a)
+				t.Errorf("%+v and %+v: both name an instance %q", tc[0], tc[1], a)
 			}
 			for _, name := range []string{a, b} {
 				if !join.ValidInstance(name) {
-					t.Errorf("groups %q and %q: %q is not a host name", pair[0], pair[1], name)
+					t.Errorf("%+v and %+v: %q is not a host name", tc[0], tc[1], name)
 				}
 			}
 		}
+	}
+}
+
+// Two regions whose groups have the same name and use the same group of a
+// provider do not give their instances the same names (review finding
+// CON-6n: both named a machine eu-workers-dc1-1-1).
+func TestInstanceName_RegionsOnOneProviderGroup(t *testing.T) {
+	eu := newEnv(t, "")
+	eu.putGroup(1, nil)
+	eu.reconcile()
+
+	// The operator of another region, with its own servers, on the same
+	// platform.
+	us := newEnv(t, "")
+	us.lag.Provider = eu.mock
+	us.r = NewReconciler(us.backend, us.nodes, Config{Region: "us", AllowHTTP: true, Now: func() time.Time { return us.now }})
+	us.r.providers.cacheFor = 0
+	us.putGroup(1, nil)
+	us.reconcile()
+
+	insts := eu.instances()
+	if len(insts) != 2 {
+		t.Fatalf("instances of the two regions: %+v", insts)
+	}
+	if insts[0].Name == insts[1].Name {
+		t.Fatalf("the instances of regions %s and %s are both named %s",
+			insts[0].Labels[LabelRegion], insts[1].Labels[LabelRegion], insts[0].Name)
 	}
 }

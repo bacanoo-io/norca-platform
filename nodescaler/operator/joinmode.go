@@ -176,15 +176,13 @@ func (r *Reconciler) recordSeen(ctx context.Context, group string, insts []provi
 	}
 }
 
-// instancePrefix is a start every name of an instance of the group has: its
-// base, without the mark of a group that has one (instanceName). The names of
-// other groups can start with it too, so the group of a record is checked
-// after it. Without the mark it is also a start of the names the instances of
-// the group had before the names carried marks, so the records of such
-// instances are still pruned and forgotten.
-func instancePrefix(group string) string {
-	if plainBase(group) {
-		return group
+// instancePrefix is a start every name of an instance of the group of the
+// region has: its base, without the mark of a pair that has one
+// (instanceName). The names of other groups can start with it too, so the
+// group of a record is checked after it.
+func instancePrefix(region, group string) string {
+	if base, ok := plainBase(region, group); ok {
+		return base
 	}
-	return baseHead(group, headLen)
+	return baseHead(region, group, headLen)
 }

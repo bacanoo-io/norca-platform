@@ -176,7 +176,7 @@ func TestDeletion_NodeStaysUp(t *testing.T) {
 // request of the group.
 func (e *env) joinRecords() int {
 	n := 0
-	for _, inst := range []string{"workers-dc1-1-1", "workers-dc1-1-2"} {
+	for _, inst := range []string{"eu-workers-dc1-1-1", "eu-workers-dc1-1-2"} {
 		if e.backend.GetVariable("default", "nodescaler/join/eu/"+inst) != nil {
 			n++
 		}

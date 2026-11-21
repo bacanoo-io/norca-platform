@@ -93,7 +93,7 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 func parseFlags(args []string) (*flags, error) {
 	var f flags
 	fs := flag.NewFlagSet("norca-nodescaler", flag.ContinueOnError)
-	fs.StringVar(&f.region, "region", envOr("NORCA_REGION", "global"), "region of the cluster: a label of the instances and part of the request IDs")
+	fs.StringVar(&f.region, "region", envOr("NORCA_REGION", "global"), "region of the cluster: a label of the instances and part of the request IDs and of the instance names")
 	fs.DurationVar(&f.providerTTL, "provider-ttl", 3*time.Minute, "how old the heartbeat of a NodeProvider may be")
 	fs.BoolVar(&f.allowHTTP, "provider-allow-http", false, "accept http endpoints of providers (development only)")
 	fs.StringVar(&f.tokenNamespace, "token-namespace", systemNamespace, "namespace of the Variables with the tokens of the providers")

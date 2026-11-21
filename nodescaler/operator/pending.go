@@ -182,11 +182,11 @@ func (p *pendingRequest) overdue(now time.Time, grace time.Duration) bool {
 // pendingNames are the names of the instances of the requests: those
 // describe gave them. A record without the number asked for has the names of
 // as many as the request made.
-func pendingNames(group string, pend []*pendingRequest) map[string]bool {
+func pendingNames(region, group string, pend []*pendingRequest) map[string]bool {
 	out := map[string]bool{}
 	for _, p := range pend {
 		for i := 1; int64(i) <= max(p.Asked, p.Count); i++ {
-			out[instanceName(group, p.Number, i)] = true
+			out[instanceName(region, group, p.Number, i)] = true
 		}
 	}
 	return out
@@ -196,9 +196,9 @@ func pendingNames(group string, pend []*pendingRequest) map[string]bool {
 // their index in the request (the i of instanceName): those a request made
 // again may name. known is false for a record that does not say which of its
 // instances were listed: it has an ID without a name, or a name that is not
-// one of the request (an instance named before the names carried the mark of
-// the group). Such a request is not made again.
-func (p *pendingRequest) unlistedIndexes(group string) (indexes []int, known bool) {
+// one of the request (an instance named before the names carried the
+// region). Such a request is not made again.
+func (p *pendingRequest) unlistedIndexes(region, group string) (indexes []int, known bool) {
 	if len(p.ListedNames) != len(p.Listed) {
 		return nil, false
 	}
@@ -207,7 +207,7 @@ func (p *pendingRequest) unlistedIndexes(group string) (indexes []int, known boo
 		listed[name] = true
 	}
 	for i := 1; int64(i) <= max(p.Asked, p.Count); i++ {
-		name := instanceName(group, p.Number, i)
+		name := instanceName(region, group, p.Number, i)
 		if listed[name] {
 			delete(listed, name)
 			continue
