@@ -106,11 +106,14 @@ type Group struct {
 //     create failed part of the way, or because instances of the request were
 //     deleted since. The request is not brought up to the number it names.
 //     The operator makes a request again after a lost answer, a restart, or
-//     when the listing did not show its instances in time, and the request
-//     made again can name instances the operator deleted on purpose, and
-//     instances whose node has joined, without a bootstrap: none of them may
-//     be made again. What a group is still short of, the operator asks for in
-//     a request with a new ID.
+//     when the listing did not show its instances in time. The request made
+//     again names only instances of the request that no listing has shown
+//     the operator, each with its bootstrap when the operator has a bootstrap
+//     source, and no more of them than the group is short of: so its entries
+//     can be fewer than, and other than, the instances the provider has of
+//     the ID, and the answer is still the instances it has. What a group is
+//     short of beyond that, the operator asks for in a request with a new
+//     ID.
 //   - A provider that has no instance with the RequestID treats the request
 //     as a new one and creates its instances. A provider need not remember
 //     the IDs of requests whose instances are all gone: it knows a request by

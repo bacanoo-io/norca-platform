@@ -445,8 +445,12 @@ state), a request with that ID is answered with the instances of the ID it
 has, and nothing is created from the entries of the request, also when it
 has fewer of them than the request names (a create that failed part of the
 way, instances deleted since). The request is not brought up to the number
-it names: a request made again can name instances the operator deleted on
-purpose, and what a group is still short of is asked for with a new ID. A
+it names. The request the operator makes again names only instances of the
+request that no listing has shown it, each with its bootstrap when the
+operator has a bootstrap source, and no more of them than the group is short
+of, so its entries can be fewer than, and other than, the instances the
+provider has of the ID; what a group is short of beyond that is asked for
+with a new ID. A
 provider that has no instance left with the `request_id` treats the request
 as a new one; it need not remember the IDs of requests whose instances are
 gone. A request that cannot be served fails with a reason:
