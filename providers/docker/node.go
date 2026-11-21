@@ -368,7 +368,10 @@ func (p *Provider) Create(ctx context.Context, group string, req node.CreateRequ
 	for _, ir := range req.Instances {
 		inst, err := p.start(ctx, group, req, ir)
 		if err != nil {
-			return out, node.Fail(node.ReasonError, "starting %s: %v", ir.Name, err)
+			// The error alone: the containers started before it stay, with
+			// the request in their labels, and are in the listing (the
+			// contract of node.Provider.Create).
+			return nil, node.Fail(node.ReasonError, "starting %s: %v", ir.Name, err)
 		}
 		out = append(out, inst)
 	}

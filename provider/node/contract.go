@@ -153,8 +153,17 @@ type Provider interface {
 	// Create creates the instances of a request. When the provider has an
 	// instance of a request with the same ID, it returns the instances of
 	// that ID it has and creates nothing, whatever the request names; when
-	// it has none, the request is a new one (see CreateRequest). An error
-	// with a reason (see Fail) says why nothing was created.
+	// it has none, the request is a new one (see CreateRequest).
+	//
+	// A create that fails returns an error with a reason (see Fail) and no
+	// instance: the answer of a failed create is the error alone (review
+	// finding CON-6o). A request refused before anything was made (an
+	// invalid one, a full group) leaves nothing. A create that fails part
+	// of the way may leave the instances it made before the failure, or
+	// remove them: those it leaves carry the request ID and are in the
+	// listing of the group, where the operator finds them, and by the rule
+	// of CreateRequest the request again makes nothing more; the operator
+	// asks for the rest with a new ID.
 	Create(ctx context.Context, group string, req CreateRequest) ([]Instance, error)
 
 	// Delete deletes an instance. Deleting one that is gone is not an error.

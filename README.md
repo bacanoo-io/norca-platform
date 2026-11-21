@@ -439,7 +439,10 @@ purpose, and what a group is still short of is asked for with a new ID. A
 provider that has no instance left with the `request_id` treats the request
 as a new one; it need not remember the IDs of requests whose instances are
 gone. A request that cannot be served fails with a reason:
-`quota`, `no_capacity`, `invalid` or `error`. An instance may report its
+`quota`, `no_capacity`, `invalid` or `error`. The answer of a create that
+fails is the error alone, without instances; one that fails part of the way
+may leave the instances it made (with the `request_id`, in the listing,
+where the operator finds them) or remove them. An instance may report its
 `addresses`, every IP address its node's traffic to the operator can come
 from (its own, a NAT in front of it), best already in the answer of the
 create: the join endpoint binds the join and the renewals of the node to

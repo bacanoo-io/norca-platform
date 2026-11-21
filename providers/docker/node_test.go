@@ -29,7 +29,9 @@ type fakeDocker struct {
 	containers map[string]*container
 	runs       [][]string
 	failRun    error
-	logs       map[string]string
+	// failRunAfter makes every run after that many fail; 0 fails none.
+	failRunAfter int
+	logs         map[string]string
 }
 
 func (f *fakeDocker) Logs(_ context.Context, name string, _ int) (string, error) {
@@ -72,6 +74,9 @@ func (f *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
 	case "run":
 		if f.failRun != nil {
 			return "", f.failRun
+		}
+		if f.failRunAfter > 0 && len(f.runs) >= f.failRunAfter {
+			return "", errors.New("no space left on device")
 		}
 		f.runs = append(f.runs, args)
 		c := &container{Name: "/" + argAfter(args, "--name")}
@@ -373,5 +378,43 @@ func TestDocker_LimitsAndFailures(t *testing.T) {
 	}
 	if err := p.Delete(ctx, "dc1", "../etc"); node.ReasonOf(err) != node.ReasonInvalid {
 		t.Fatalf("a bad id: %v", err)
+	}
+}
+
+// A create that fails part of the way returns an error and no instance (the
+// operator sees only the error over HTTP); the containers it made before the
+// failure stay, carry the request, and are in the listing, and the request
+// again is answered with them and makes nothing (review finding CON-6o: the
+// provider returned the containers made so far together with the error).
+func TestDocker_CreateThatFailsPartOfTheWay(t *testing.T) {
+	p, fd, _ := newTestProvider(t)
+	ctx := context.Background()
+	fd.failRunAfter = 1
+	req := request(t, "eu/workers-dc1/1", "workers-dc1-1-1", "workers-dc1-1-2")
+	insts, err := p.Create(ctx, "dc1", req)
+	if node.ReasonOf(err) != node.ReasonError || err == nil || !strings.Contains(err.Error(), "workers-dc1-1-2") {
+		t.Fatalf("a create whose second container does not start: %v", err)
+	}
+	if len(insts) != 0 {
+		t.Fatalf("a create that failed returned instances with its error: %+v", insts)
+	}
+	g, err := p.Group(ctx, "dc1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Instances) != 1 || g.Instances[0].Name != "workers-dc1-1-1" || g.Instances[0].RequestID != req.RequestID {
+		t.Fatalf("the listing after a create that failed part of the way: %+v", g.Instances)
+	}
+
+	// The request again: the container it has, nothing new.
+	fd.failRunAfter = 0
+	again, err := p.Create(ctx, "dc1", req)
+	if err != nil || len(again) != 1 || again[0].Name != "workers-dc1-1-1" || len(fd.runs) != 1 {
+		t.Fatalf("the request again: %+v, %v, %d runs", again, err, len(fd.runs))
+	}
+	// What is missing comes with a request of its own.
+	rest, err := p.Create(ctx, "dc1", request(t, "eu/workers-dc1/2", "workers-dc1-2-1"))
+	if err != nil || len(rest) != 1 || rest[0].RequestID != "eu/workers-dc1/2" {
+		t.Fatalf("a new request for the rest: %+v, %v", rest, err)
 	}
 }
