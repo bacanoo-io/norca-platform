@@ -208,7 +208,16 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
   and of tokens that expired unused are deleted at the next reconcile, and
   all records of a group when it is deleted with its instances (`drain`,
   `terminate`); orphaned instances keep theirs, so their nodes go on
-  renewing.
+  renewing. An instance is gone when neither the listing of the provider nor
+  a request in `pendingRequests` names it, with one exception: the record of
+  an instance that has joined, issued for a request the status does not know
+  (its number is above `lastRequest`: the status write after the create was
+  lost), is kept for `-list-grace` after the join. The record says that the
+  instance is one of the group, so its node is not a node without an
+  instance either, and a group deleted meanwhile waits for it
+  (`status.deletion.waiting`). The look that finds it writes the request
+  into `pendingRequests`; if neither that nor a listing names the instance
+  by the end of the grace time, the record goes.
 - **A request made again keeps the tokens of the first time.** When the
   operator makes a request again with its own number (a lost answer of the
   create, or instances its listing did not show within `-list-grace`), the

@@ -34,7 +34,12 @@ type JoinIssuer interface {
 	// those of instances that are gone; live are the instances the
 	// provider lists and those of the requests its listing has not all
 	// shown, prefix is the start of the names of the group's instances.
-	Prune(ctx context.Context, group, prefix string, live map[string]bool) error
+	// keep is asked about the record of an instance that joined and is not
+	// live (its name, the request it was issued for, when it joined): a
+	// record it keeps stays, and the names kept are returned
+	// (join.Store.PruneKeeping).
+	Prune(ctx context.Context, group, prefix string, live map[string]bool,
+		keep func(instance, request string, joined time.Time) bool) ([]string, error)
 	// Forget drops every record of a group whose instances are gone with
 	// it (a deletion with the policy drain or terminate).
 	Forget(ctx context.Context, group, prefix string) error
@@ -89,8 +94,39 @@ func (s *StoreJoin) Ticket(ctx context.Context, group, request, instance string,
 }
 
 // Prune implements JoinIssuer.
-func (s *StoreJoin) Prune(ctx context.Context, group, prefix string, live map[string]bool) error {
-	return s.Store.Prune(ctx, group, prefix, live)
+func (s *StoreJoin) Prune(ctx context.Context, group, prefix string, live map[string]bool,
+	keep func(instance, request string, joined time.Time) bool) ([]string, error) {
+
+	return s.Store.PruneKeeping(ctx, group, prefix, live, keep)
+}
+
+// joinedOfUnknownRequest is the keep of JoinIssuer.Prune of a group: it keeps
+// the join record of an instance that joined when the record is of a request
+// the status does not know (its number is above status.lastRequest) and the
+// join is no older than the grace time of the listing. Such a request is one
+// whose status write was lost: neither status.pendingRequests nor, yet, the
+// listing names its instances, but the operator issued the record for the
+// request, so the instance is one of the group (review finding CON-6q: the
+// record was pruned as that of an instance that is gone, and the certificate
+// of its node no longer renewed). The look that keeps it writes the request
+// into the status, or the listing shows the instance; if neither happens
+// within the grace time after the join, the record goes like that of any
+// instance the provider does not have. until gets, by instance, when that
+// is.
+func (r *Reconciler) joinedOfUnknownRequest(group string, status map[string]any, now time.Time,
+	until map[string]time.Time) func(instance, request string, joined time.Time) bool {
+
+	last := lastRequest(status)
+	prefix := r.cfg.Region + "/" + group + "/"
+	return func(instance, request string, joined time.Time) bool {
+		number, ok := strings.CutPrefix(request, prefix)
+		n, err := strconv.ParseInt(number, 10, 64)
+		if !ok || err != nil || n <= last || joined.IsZero() || now.Sub(joined) > r.cfg.ListGrace {
+			return false
+		}
+		until[instance] = joined.Add(r.cfg.ListGrace)
+		return true
+	}
 }
 
 // Seen implements JoinIssuer.

@@ -378,9 +378,26 @@ func (s *Store) Seen(ctx context.Context, group, instance string, addresses []st
 // listing shows it; review finding CON-6i). Only the records of instances
 // whose names start with namePrefix are read.
 func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[string]bool) error {
+	_, err := s.PruneKeeping(ctx, group, namePrefix, live, nil)
+	return err
+}
+
+// PruneKeeping is Prune with a say for the caller about the records of
+// instances that joined and are not live. Live is what the caller knows from
+// the provider and from its own state; when that state can be behind (the
+// operator lost the status write that records a request; review finding
+// CON-6q), the record itself is what says that the instance is one of the
+// group: it names the request the operator issued it for, and when the
+// instance joined. keep is asked about each such record, and one it keeps
+// stays; the names of the instances kept are returned. Records of tokens
+// that expired unused go as in Prune, and so do all records keep does not
+// keep: a record does not stay for ever because it once joined.
+func (s *Store) PruneKeeping(ctx context.Context, group, namePrefix string, live map[string]bool,
+	keep func(instance, request string, joined time.Time) bool) (kept []string, err error) {
+
 	list, _, err := s.Vars.ListVariables(ctx, s.Namespace, s.prefix()+namePrefix, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var errs []error
 	for _, meta := range list {
@@ -400,6 +417,14 @@ func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[st
 			continue
 		}
 		joined := v.Items[itemSerial] != ""
+		if joined && keep != nil {
+			// A time that does not parse is the zero time: long ago.
+			at, _ := time.Parse(time.RFC3339, v.Items[itemJoined])
+			if keep(instance, v.Items[itemRequest], at) {
+				kept = append(kept, instance)
+				continue
+			}
+		}
 		// Expired: no token of the record can be used any more.
 		now := s.now()
 		expired := !slices.ContainsFunc(tokensOf(v), func(t heldToken) bool { return now.Before(t.expires) })
@@ -409,7 +434,7 @@ func (s *Store) Prune(ctx context.Context, group, namePrefix string, live map[st
 			}
 		}
 	}
-	return errors.Join(errs...)
+	return kept, errors.Join(errs...)
 }
 
 // Forget deletes every record of a group, used tokens or not: the group is

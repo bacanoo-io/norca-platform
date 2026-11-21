@@ -6,6 +6,7 @@ package operator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/bacanoo-io/norca-platform/nodescaler/bootstrap/bootstraptest"
 	"github.com/bacanoo-io/norca-platform/nodescaler/join"
 	provider "github.com/bacanoo-io/norca-platform/provider/node"
+	"github.com/bacanoo-io/norca/norca/controller"
 )
 
 // The join tokens of a request that is made again (review finding CON-6h):
@@ -277,5 +279,116 @@ func TestJoinReissue_OnlyJoinedInstancesAreLeftToAskFor(t *testing.T) {
 		if ir.Bootstrap == nil {
 			t.Fatalf("%s has no bootstrap", ir.Name)
 		}
+	}
+}
+
+// lostStatusWriteJoined is a group of two instances whose request the status does
+// not know (the status write after the create was lost), whose machines have
+// joined, with ready nodes, before any listing shows them.
+func lostStatusWriteJoined(t *testing.T, extra map[string]any) (*env, *join.Store) {
+	t.Helper()
+	e, store := joinEnv(t)
+	e.putGroup(2, extra)
+	e.backend.FailNext("UpdateObjectStatus", errors.New("the servers are away"))
+	if _, err := e.r.Reconcile(context.Background(), controller.ObjectKey{Name: "workers-dc1"}); err == nil {
+		t.Fatal("the failed status write is not an error")
+	}
+	if st := e.status(); st["lastRequest"] != nil || st["pendingRequests"] != nil {
+		t.Fatalf("the status was written: %+v", st)
+	}
+	joinAll(t, e, store)
+	e.nodes.set(
+		Node{ID: "n1", Name: "eu-workers-dc1-1-1", Instance: "eu-workers-dc1-1-1", Group: "workers-dc1", Ready: true, Eligible: true},
+		Node{ID: "n2", Name: "eu-workers-dc1-1-2", Instance: "eu-workers-dc1-1-2", Group: "workers-dc1", Ready: true, Eligible: true})
+	e.lag.hide(hideAll)
+	return e, store
+}
+
+// renews checks that the nodes of the two instances can still renew: their
+// join records hold the serial of their certificates.
+func renews(t *testing.T, store *join.Store, when string) {
+	t.Helper()
+	for _, name := range []string{"eu-workers-dc1-1-1", "eu-workers-dc1-1-2"} {
+		if _, group, err := store.Renewing(context.Background(), name, "aa"); err != nil || group != "workers-dc1" {
+			t.Errorf("%s: the node of %s cannot renew its certificate: %v", when, name, err)
+		}
+	}
+}
+
+// The status write after a create is lost, and the machines join before a
+// listing shows them: no listing and no record of the status names them at
+// the next look, but their join records, which the operator wrote for a
+// request the status does not know, say that they are instances of the
+// group. The records are kept, so the certificates renew, and the nodes are
+// not nodes without an instance (review finding CON-6q: the records were
+// pruned, and the nodes reported as foreign and made ineligible).
+func TestJoin_LostStatusWriteKeepsTheRecordsOfNodesThatJoined(t *testing.T) {
+	e, store := lostStatusWriteJoined(t, nil)
+	for look := 1; look <= 2; look++ {
+		e.reconcile()
+		renews(t, store, "after a look without a listing")
+		if t.Failed() {
+			t.FailNow()
+		}
+		if e.hasEvent(CondForeignNode) || len(e.nodes.madeIneligible()) != 0 {
+			t.Fatalf("look %d: the nodes of the instances are foreign: made ineligible %v", look, e.nodes.madeIneligible())
+		}
+		st := e.status()
+		if p := pendingOf(st); len(p) != 1 || p[0]["number"] != 1.0 || p[0]["count"] != 2.0 || st["lastRequest"] != 1.0 {
+			t.Fatalf("look %d: status: %+v", look, st)
+		}
+		if n, asked := len(e.instances()), e.lag.asked(); n != 2 || len(asked) != 1 {
+			t.Fatalf("look %d: %d instances, requests %v", look, n, asked)
+		}
+	}
+
+	// The listing shows them: instances with nodes, as after any request.
+	e.lag.hide(nil)
+	e.reconcile()
+	if st := e.status(); st["pendingRequests"] != nil || st["replicas"] != 2.0 {
+		t.Fatalf("after the listing: %+v", st)
+	}
+	renews(t, store, "after the listing")
+}
+
+// The records are not kept for ever: a record of a node that joined, which
+// neither a listing nor the status names, goes when the grace time of the
+// listing has passed since the join.
+func TestJoin_LostStatusWriteRecordsGoAfterTheGraceTime(t *testing.T) {
+	e, store := lostStatusWriteJoined(t, nil)
+	e.advance(e.r.cfg.ListGrace + time.Second)
+	e.reconcile()
+	for _, name := range []string{"eu-workers-dc1-1-1", "eu-workers-dc1-1-2"} {
+		if _, _, err := store.Renewing(context.Background(), name, "aa"); err == nil {
+			t.Fatalf("the record of %s is kept after the grace time without a listing", name)
+		}
+	}
+}
+
+// A group deleted in that state waits for those instances as it waits for
+// the ones of a request in the status: they are deleted when the listing
+// shows them, and the join records go after them.
+func TestJoin_LostStatusWriteDeletionWaitsForNodesThatJoined(t *testing.T) {
+	e, store := lostStatusWriteJoined(t, map[string]any{"deletion": map[string]any{"policy": "terminate"}})
+	e.backend.RemoveObject(NodeGroupKind, "", "workers-dc1")
+	e.reconcile()
+	if e.gone() {
+		t.Fatal("the group went while instances that joined are not listed")
+	}
+	renews(t, store, "while the deletion waits")
+	d, _ := e.status()["deletion"].(map[string]any)
+	if waiting, _ := d["waiting"].([]any); len(waiting) != 2 {
+		t.Fatalf("status.deletion: %+v", d)
+	}
+
+	e.lag.hide(nil)
+	e.reconcile()
+	if n := len(e.instances()); n != 0 {
+		t.Fatalf("%d instances left", n)
+	}
+	e.nodes.set()
+	e.reconcile()
+	if !e.gone() || e.joinRecords() != 0 {
+		t.Fatalf("gone %t, %d join records", e.gone(), e.joinRecords())
 	}
 }

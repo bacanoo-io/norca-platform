@@ -209,6 +209,31 @@ func (r *Reconciler) deleteGroup(ctx context.Context, obj *api.CustomObject) (ti
 		state.Waiting = append(state.Waiting, fmt.Sprintf("%d instances of request %s that provider %q does not list yet (until %s)",
 			p.unlisted(), r.requestID(obj.Name, p.Number), spec.Provider, p.At.Add(r.cfg.ListGrace).UTC().Format(time.RFC3339)))
 	}
+	// And the instances of a request the status does not know (its status
+	// write was lost) whose nodes have joined: their join records say that
+	// they are instances of the group (joinedOfUnknownRequest). They are
+	// waited for in the same way, and the records stay meanwhile. The records
+	// of instances that are gone are pruned as in a look at a live group.
+	if r.cfg.Join != nil {
+		live := pendingNames(r.cfg.Region, obj.Name, pend)
+		for _, inst := range pg.Instances {
+			live[instanceKey(inst)] = true
+		}
+		until := map[string]time.Time{}
+		kept, err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(r.cfg.Region, obj.Name), live,
+			r.joinedOfUnknownRequest(obj.Name, prev, now, until))
+		if err != nil {
+			r.log.Warn("pruning the join records failed", "group", obj.Name, "error", err)
+		}
+		slices.Sort(kept)
+		for _, name := range kept {
+			if _, deleted := state.Deleted[name]; deleted {
+				continue // listed and deleted here: its record goes with the group
+			}
+			state.Waiting = append(state.Waiting, fmt.Sprintf("instance %s, whose node has joined, that provider %q does not list yet (until %s)",
+				name, spec.Provider, until[name].UTC().Format(time.RFC3339)))
+		}
+	}
 	state.Waiting = uniq(state.Waiting)
 
 	if len(state.Waiting) == 0 {

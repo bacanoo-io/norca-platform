@@ -314,8 +314,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 		for _, inst := range o.instances {
 			live[instanceKey(inst)] = true
 		}
-		if err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(r.cfg.Region, obj.Name), live); err != nil {
+		kept, err := r.cfg.Join.Prune(ctx, obj.Name, instancePrefix(r.cfg.Region, obj.Name), live,
+			r.joinedOfUnknownRequest(obj.Name, prevStatus, now, map[string]time.Time{}))
+		if err != nil {
 			r.log.Warn("pruning the join records failed", "group", obj.Name, "error", err)
+		}
+		// The instances of a request the status does not know, whose nodes
+		// have joined: their names are names of instances of the group too,
+		// so their nodes are not nodes without an instance.
+		for _, name := range kept {
+			awaitedNames[name] = true
 		}
 		r.recordSeen(ctx, obj.Name, o.instances)
 	}
@@ -425,7 +433,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, key controller.ObjectKey) (t
 			// provider could make of the request (an instance without a
 			// bootstrap could not join), so it is not made.
 			notAsked = true
-			pend = r.joinedNotListed(ctx, obj, spec, pend, again, seq, joined, nodes, now)
+			pend = r.joinedNotListed(ctx, obj, spec, pend, again, seq, slices.Max(indexes), joined, nodes, now)
 		default:
 			req := provider.CreateRequest{
 				RequestID:  reqID,
@@ -639,17 +647,19 @@ func (r *Reconciler) describe(ctx context.Context, obj *api.CustomObject, spec *
 }
 
 // joinedNotListed deals with a request that is not made because every
-// instance left to ask for has joined (joined, of request seq) while the
-// listing does not show them. For a request of the status (again): while
-// each of them has a ready node, they are instances the group has, so the
-// request stays and its grace time starts again; otherwise the request is
-// forgotten. When it is not kept, the number of the request counts as used,
-// and what the group is short of is asked for in a new request at the next
-// look. It returns the pending requests.
+// instance left to ask for has joined (joined, of request seq, the highest
+// index asked) while the listing does not show them. While each of them has
+// a ready node, they are instances the group has: a request of the status
+// (again) stays and its grace time starts again, and a request the status
+// does not know (its status write was lost, and the join records of its
+// instances were kept: joinedOfUnknownRequest) gets its record now, as after
+// an answer. Otherwise the request is forgotten. The number of the request
+// counts as used either way, and what the group is still short of is asked
+// for in a new request. It returns the pending requests.
 func (r *Reconciler) joinedNotListed(ctx context.Context, obj *api.CustomObject, spec *groupSpec, pend []*pendingRequest,
-	again *pendingRequest, seq int64, joined []string, nodes []Node, now time.Time) []*pendingRequest {
+	again *pendingRequest, seq int64, asked int, joined []string, nodes []Node, now time.Time) []*pendingRequest {
 
-	ready := again != nil && len(joined) > 0
+	ready := len(joined) > 0
 	for _, name := range joined {
 		ready = ready && slices.ContainsFunc(nodes, func(n Node) bool { return n.Instance == name && n.Ready })
 	}
@@ -658,6 +668,9 @@ func (r *Reconciler) joinedNotListed(ctx context.Context, obj *api.CustomObject,
 		r.log.Warn("a request is not made and forgotten: the instances left to ask for have joined, and not all of their nodes are ready",
 			"group", obj.Name, "request", reqID, "instances", joined)
 		return slices.DeleteFunc(pend, func(p *pendingRequest) bool { return p == again })
+	}
+	if again == nil {
+		return append(pend, &pendingRequest{Number: seq, Count: int64(len(joined)), Asked: int64(asked), At: now, Asks: 1})
 	}
 	r.event(ctx, obj, api.ObjectEventTypeWarning, "InstancesNotListed", fmt.Sprintf(
 		"provider %q did not list %d instances of request %s in %s; their nodes have joined and are ready, so the request is not made again",

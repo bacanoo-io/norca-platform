@@ -653,3 +653,53 @@ func TestHealth(t *testing.T) {
 		t.Fatalf("health without a node CA: %d %+v", rec.Code, got)
 	}
 }
+
+// PruneKeeping asks about the record of an instance that joined and is not
+// live, with the request it was issued for and when it joined; what it keeps
+// stays and is returned, the rest goes as in Prune (review finding CON-6q).
+func TestPruneKeeping(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	for _, name := range []string{"workers-1-1", "workers-1-2"} {
+		token, err := e.store.Issue(ctx, "workers", "eu/workers/1", name, 10*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, _, err := e.store.Redeem(ctx, name, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.store.Joined(ctx, rec, token, "aa"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A token not used yet: not asked about, and kept while it is valid.
+	if _, err := e.store.Issue(ctx, "workers", "eu/workers/1", "workers-1-3", 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	asked := map[string]string{}
+	kept, err := e.store.PruneKeeping(ctx, "workers", "workers", map[string]bool{},
+		func(instance, request string, joined time.Time) bool {
+			asked[instance] = request
+			if joined.IsZero() || time.Since(joined) > time.Minute {
+				t.Errorf("%s joined at %v", instance, joined)
+			}
+			return instance == "workers-1-1"
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 1 || kept[0] != "workers-1-1" || len(asked) != 2 || asked["workers-1-2"] != "eu/workers/1" {
+		t.Fatalf("kept %v, asked about %v", kept, asked)
+	}
+	exists := func(inst string) bool {
+		return e.backend.GetVariable("default", "nodescaler/join/eu/"+inst) != nil
+	}
+	if !exists("workers-1-1") || exists("workers-1-2") || !exists("workers-1-3") {
+		t.Fatalf("records: 1 %t (want kept), 2 %t (want pruned), 3 %t (want kept: a valid token)",
+			exists("workers-1-1"), exists("workers-1-2"), exists("workers-1-3"))
+	}
+	if _, _, err := e.store.Renewing(ctx, "workers-1-1", "aa"); err != nil {
+		t.Fatalf("the renewal of the instance that was kept: %v", err)
+	}
+}
