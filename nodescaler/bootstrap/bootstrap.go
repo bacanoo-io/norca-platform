@@ -55,17 +55,17 @@ const (
 	// ItemValidity is the validity of a node certificate (default 60d).
 	ItemValidity = "validity"
 	// ItemTLSDir, ItemConfigFile and ItemService are where the files go and
-	// the systemd unit of the agent (defaults /etc/norca/tls,
-	// /etc/norca/norca.hcl and norca).
+	// the service of the agent, a systemd unit or an OpenRC service of that
+	// name (defaults /etc/norca/tls, /etc/norca/norca.hcl and norca).
 	ItemTLSDir     = "tls_dir"
 	ItemConfigFile = "config_file"
 	ItemService    = "service"
 	// ItemJoinBinary is where norca-join is on the machines of the nodes
 	// that join with a key of their own (default /usr/local/bin/norca-join).
 	ItemJoinBinary = "join_binary"
-	// ItemInstallScript is a bash script that installs what the machine
-	// needs before the agent can start: the norca binary, the CNI plugins,
-	// norca-join, the directories and the systemd unit of the agent
+	// ItemInstallScript is a script that installs what the machine needs
+	// before the agent can start: the norca binary, the CNI plugins,
+	// norca-join, the directories and the service of the agent
 	// (norca-deployer node-scaling install-script, node_scaling.machine.install
 	// = boot). Optional: without it the image of the machine has them.
 	ItemInstallScript = "install_script"
@@ -152,8 +152,8 @@ func Parse(region string, items map[string]string) (*Template, error) {
 			*field = v
 		}
 	}
-	if !validService.MatchString(t.Service) {
-		return nil, fmt.Errorf("the service %q of the bootstrap is not a systemd unit name", t.Service)
+	if err := checkService(t.Service); err != nil {
+		return nil, err
 	}
 	if script := items[ItemInstallScript]; strings.TrimSpace(script) != "" {
 		if !strings.HasPrefix(script, "#!") {
@@ -164,7 +164,26 @@ func Parse(region string, items map[string]string) (*Template, error) {
 	return t, nil
 }
 
-var validService = regexp.MustCompile(`^[A-Za-z0-9@._-]+$`)
+// validService is a name systemd and OpenRC both take for a service: a
+// letter or a digit, then letters, digits, '.', '_' and '-'. It goes into
+// a shell line of runcmd unquoted, so it has no character the shell reads.
+// A systemd template instance (norca@x) has no OpenRC service of its name.
+var validService = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// checkService checks the service of the agent: the bootstrap enables and
+// starts it with systemd or OpenRC, whichever runs on the machine, so the
+// name must be one of a service of both.
+func checkService(name string) error {
+	if !validService.MatchString(name) {
+		return fmt.Errorf("the service %q of the bootstrap is not a service name of systemd and OpenRC "+
+			"(a letter or a digit, then letters, digits, '.', '_' and '-')", name)
+	}
+	if strings.HasSuffix(name, ".service") {
+		return fmt.Errorf("the service %q of the bootstrap names a systemd unit: name the service without .service, "+
+			"the name OpenRC knows it by too", name)
+	}
+	return nil
+}
 
 // Node is what belongs to one node, the fields of the agent configuration
 // template.
@@ -239,8 +258,45 @@ func (t *Template) Render(n Node) (*Rendered, error) {
 	t.writeInstallScript(&doc)
 	doc.WriteString("runcmd:\n")
 	t.runInstallScript(&doc)
-	doc.WriteString("  - [systemctl, enable, --now, " + t.Service + "]\n")
+	writeRun(&doc, enableLine(t.Service, ""))
 	return &Rendered{UserData: doc.String(), Serial: leaf.SerialNumber.Text(16), NotAfter: leaf.NotAfter}, nil
+}
+
+// enableLine is the runcmd line that enables and starts a service with the
+// init system that runs on the machine, decided at boot: systemd when
+// /run/systemd/system exists (the test of sd_booted), then OpenRC when
+// rc-service is there (Alpine). On a machine with neither it fails, and
+// cloud-init logs the error of runcmd. The image of the machine decides,
+// not the template: one bootstrap serves the families of the install
+// script (Debian and RHEL with systemd, Alpine with OpenRC).
+//
+// openRCScript, when not empty, is the OpenRC service of the same name that
+// the bootstrap wrote into /etc/init.d: a systemd machine removes it before
+// it enables the unit. systemctl enable hands a script of /etc/init.d with
+// the name of the unit to systemd-sysv-install, and on Debian its
+// update-rc.d refuses a script without an LSB header ("Default-Start
+// contains no runlevels"): the enable fails.
+//
+// The line is POSIX sh (dash, bash, busybox ash), as cloud-init and
+// tiny-cloud run each line of runcmd with sh. The name is one checkService
+// accepts and the script a path of validPath, so they need no quoting.
+func enableLine(service, openRCScript string) string {
+	systemd := "systemctl daemon-reload && systemctl enable --now " + service
+	if openRCScript != "" {
+		systemd = "rm -f " + openRCScript + " && " + systemd
+	}
+	return "if [ -d /run/systemd/system ]; then " + systemd +
+		"; elif command -v rc-service >/dev/null 2>&1; then rc-update add " + service + " default && rc-service " +
+		service + " start; else echo \"norca bootstrap: neither systemd nor OpenRC runs on this machine: " + service +
+		" is not started\" >&2; exit 1; fi"
+}
+
+// writeRun writes a runcmd entry: a shell line as a YAML single-quoted
+// string. cloud-init runs a string entry as a line of its sh script, and
+// tiny-cloud (the bootstrapper of the Alpine cloud images) runs each entry
+// with sh -c; tiny-cloud does not read the list form ([cmd, arg]).
+func writeRun(b *strings.Builder, line string) {
+	b.WriteString("  - '" + strings.ReplaceAll(line, "'", "''") + "'\n")
 }
 
 // writeInstallScript writes the install script among the files, if the
@@ -256,7 +312,7 @@ func (t *Template) writeInstallScript(doc *strings.Builder) {
 // agent or norca-join is started.
 func (t *Template) runInstallScript(doc *strings.Builder) {
 	if t.InstallScript != "" {
-		doc.WriteString("  - [" + InstallScriptPath + "]\n")
+		writeRun(doc, InstallScriptPath)
 	}
 }
 

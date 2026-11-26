@@ -6,6 +6,8 @@ package bootstrap
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -62,8 +64,17 @@ func TestRenderJoin(t *testing.T) {
 	if !strings.Contains(unit, "ExecStart=/opt/norca/bin/norca-join run -config /etc/norca/norca-join.json") {
 		t.Fatalf("unit:\n%s", unit)
 	}
-	if !strings.Contains(r.UserData, "[systemctl, enable, --now, norca-join]") ||
-		strings.Contains(r.UserData, "[systemctl, enable, --now, norca]") {
+	// The OpenRC service of the same program: supervised, started again
+	// after 10 seconds as the unit is.
+	openrc := string(f["/etc/init.d/norca-join"])
+	for _, want := range []string{"#!/sbin/openrc-run\n", "\nsupervisor=supervise-daemon\n",
+		"\ncommand=\"/opt/norca/bin/norca-join\"\n", "\ncommand_args=\"run -config /etc/norca/norca-join.json\"\n",
+		"\nrespawn_delay=10\n", "\nrespawn_max=0\n", "\tneed net\n"} {
+		if !strings.Contains(openrc, want) {
+			t.Fatalf("the OpenRC service has no %q:\n%s", want, openrc)
+		}
+	}
+	if !strings.HasSuffix(r.UserData, "runcmd:\n  - '"+enableLine(JoinUnit, JoinOpenRCFile)+"'\n") {
 		t.Fatalf("runcmd: norca-join starts the agent, not the bootstrap:\n%s", r.UserData)
 	}
 
@@ -74,6 +85,11 @@ func TestRenderJoin(t *testing.T) {
 	}
 	if doc.JoinConfig() != "/etc/norca/norca-join.json" {
 		t.Fatalf("the join configuration of the document: %q", doc.JoinConfig())
+	}
+	for _, file := range doc.Files {
+		if file.Path == JoinOpenRCFile && file.Mode != 0o755 {
+			t.Fatalf("the OpenRC service has mode %o", file.Mode)
+		}
 	}
 	if cfg, err := doc.ConfigFile(); err != nil || cfg != "/etc/norca/norca.hcl" {
 		t.Fatalf("the agent configuration of the document: %q %v", cfg, err)
@@ -89,9 +105,39 @@ func TestRenderJoin(t *testing.T) {
 	if _, err := tmpl.RenderJoin(Node{Name: "a-1-1"}, JoinTicket{Token: "t", URLs: []string{"http://x:1"}}); err == nil {
 		t.Fatal("a join with an http endpoint")
 	}
-	tmpl.JoinBinary = "norca-join"
+	// The paths go into the unit and the OpenRC service unquoted.
+	for _, binary := range []string{"norca-join", "/opt/norca join", "/opt/$(reboot)", "/opt/`reboot`", `/opt/"x`} {
+		tmpl.JoinBinary = binary
+		if _, err := tmpl.RenderJoin(Node{Name: "a-1-1"}, JoinTicket{Token: "t", URLs: []string{"https://x:1"}}); err == nil {
+			t.Fatalf("the join binary %q", binary)
+		}
+	}
+	tmpl.JoinBinary = "/usr/local/bin/norca-join"
+	tmpl.ConfigFile = "/etc/$HOME/norca.hcl"
 	if _, err := tmpl.RenderJoin(Node{Name: "a-1-1"}, JoinTicket{Token: "t", URLs: []string{"https://x:1"}}); err == nil {
-		t.Fatal("a relative join binary")
+		t.Fatal("a join configuration with a $")
+	}
+}
+
+// The OpenRC service of norca-join is a script of sh: it parses, and it
+// defines what openrc-run reads.
+func TestJoinOpenRC(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the script runs on Linux")
+	}
+	script := joinOpenRC("/usr/local/bin/norca-join", "/etc/norca/norca-join.json")
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	// openrc-run sources the script; here sh does, and prints the variables.
+	probe := script + "\nprintf '%s|%s|%s|%s\\n' \"$supervisor\" \"$command\" \"$command_args\" \"$respawn_delay\"\n"
+	out, err := exec.Command(sh, "-c", probe).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if got, want := string(out), "supervise-daemon|/usr/local/bin/norca-join|run -config /etc/norca/norca-join.json|10\n"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
@@ -133,15 +179,15 @@ func TestInstallScript(t *testing.T) {
 	// one without, plus the file and the first command.
 	entry := "  - path: " + InstallScriptPath + "\n    permissions: '0700'\n    encoding: b64\n    content: " +
 		base64.StdEncoding.EncodeToString([]byte(installScript)) + "\n"
-	run := "  - [" + InstallScriptPath + "]\n"
-	if !strings.Contains(with.UserData, entry+"runcmd:\n"+run+"  - [systemctl, daemon-reload]\n") {
+	run := "  - '" + InstallScriptPath + "'\n"
+	enableJoin := "  - '" + enableLine(JoinUnit, JoinOpenRCFile) + "'\n"
+	if !strings.Contains(with.UserData, entry+"runcmd:\n"+run+enableJoin) {
 		t.Fatalf("the script is not written and run first:\n%s", with.UserData)
 	}
 	if got := strings.Replace(strings.Replace(with.UserData, entry, "", 1), run, "", 1); got != without.UserData {
 		t.Fatalf("without the script the documents differ:\n%s\n---\n%s", got, without.UserData)
 	}
-	wantRun := "runcmd:\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, norca-join]\n"
-	if !strings.HasSuffix(without.UserData, wantRun) {
+	if !strings.HasSuffix(without.UserData, "runcmd:\n"+enableJoin) {
 		t.Fatalf("runcmd without a script:\n%s", without.UserData)
 	}
 
@@ -150,7 +196,8 @@ func TestInstallScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(r.UserData, "runcmd:\n"+run+"  - [systemctl, enable, --now, norca]\n") {
+	enableAgent := "  - '" + enableLine("norca", "") + "'\n"
+	if !strings.HasSuffix(r.UserData, "runcmd:\n"+run+enableAgent) {
 		t.Fatalf("basic runcmd:\n%s", r.UserData)
 	}
 	if string(files(t, r.UserData)[InstallScriptPath]) != installScript {
@@ -160,7 +207,7 @@ func TestInstallScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(r.UserData, InstallScriptPath) || !strings.HasSuffix(r.UserData, "runcmd:\n  - [systemctl, enable, --now, norca]\n") {
+	if strings.Contains(r.UserData, InstallScriptPath) || !strings.HasSuffix(r.UserData, "runcmd:\n"+enableAgent) {
 		t.Fatalf("basic without a script:\n%s", r.UserData)
 	}
 
@@ -169,7 +216,7 @@ func TestInstallScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(doc.RunCmd) != 3 || doc.RunCmd[0] != "["+InstallScriptPath+"]" {
+	if len(doc.RunCmd) != 2 || doc.RunCmd[0] != InstallScriptPath || doc.RunCmd[1] != enableLine(JoinUnit, JoinOpenRCFile) {
 		t.Fatalf("runcmd: %q", doc.RunCmd)
 	}
 	if cfg, err := doc.ConfigFile(); err != nil || cfg != "/etc/norca/norca.hcl" || doc.JoinConfig() == "" {

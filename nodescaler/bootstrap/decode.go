@@ -20,7 +20,8 @@ import (
 type Document struct {
 	Hostname string
 	Files    []File
-	RunCmd   []string
+	// RunCmd are the shell lines of runcmd, unquoted.
+	RunCmd []string
 }
 
 // File is an entry of write_files.
@@ -104,7 +105,7 @@ func Decode(doc string) (*Document, error) {
 		item := strings.TrimSpace(line)
 		switch section {
 		case "runcmd":
-			d.RunCmd = append(d.RunCmd, strings.TrimPrefix(item, "- "))
+			d.RunCmd = append(d.RunCmd, unquote(strings.TrimPrefix(item, "- ")))
 		case "write_files":
 			if rest, ok := strings.CutPrefix(item, "- "); ok {
 				if err := finish(); err != nil {
@@ -148,4 +149,13 @@ func Decode(doc string) (*Document, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+// unquote returns the string of a YAML single-quoted scalar, the form of a
+// runcmd line (writeRun); any other item is returned as it is.
+func unquote(item string) string {
+	if len(item) >= 2 && item[0] == '\'' && item[len(item)-1] == '\'' {
+		return strings.ReplaceAll(item[1:len(item)-1], "''", "'")
+	}
+	return item
 }
