@@ -7,9 +7,12 @@
 // before it expires (package join).
 //
 //	norca-join run -config /etc/norca/norca-join.json
-//	    joins, starts the agent (systemctl enable --now <service>), renews,
-//	    and sends the agent SIGHUP after each renewal (the systemd unit of
-//	    the bootstrap runs this)
+//	    joins, enables and starts the service of the agent, renews, and
+//	    sends the agent SIGHUP after each renewal (the service of the
+//	    bootstrap runs this); with systemd (systemctl enable --now <service>,
+//	    systemctl kill --signal=HUP) or OpenRC (rc-update add <service>
+//	    default, rc-service <service> start, rc-service <service> reload),
+//	    whichever runs on the machine
 //	norca-join run -config /etc/norca/norca-join.json -- norca agent -config /etc/norca/norca.hcl
 //	    the same, with the agent as its child (a container): norca-join
 //	    ends when the agent does, and passes SIGTERM and SIGINT on
@@ -93,25 +96,25 @@ func run(args []string) (int, error) {
 		if conf.Service == "" {
 			return 2, errors.New("no service in the configuration and no agent command after --")
 		}
+		// Found before the join: a machine that cannot start the agent
+		// keeps its one-time token.
+		initSys := detectInit(systemdRunDir, exec.LookPath)
+		if initSys == initUnknown {
+			return 1, fmt.Errorf("neither systemd nor OpenRC runs on this machine: norca-join cannot start the service %s; "+
+				"run the agent as the child of norca-join instead (norca-join run -config ... -- <agent command>)", conf.Service)
+		}
+		logger.Debug("the service of the agent", "service", conf.Service, "init", initSys.String())
 		r.Start = func(ctx context.Context) error {
-			return systemctl(ctx, "enable", "--now", conf.Service)
+			return runCommands(ctx, initSys.startCommands(conf.Service)...)
 		}
 		r.Reload = func() error {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
-			return systemctl(ctx, "kill", "--kill-whom=main", "--signal=HUP", conf.Service)
+			return runCommands(ctx, initSys.reloadCommand(conf.Service))
 		}
 		return 0, r.Run(ctx)
 	}
 	return supervise(stop, r, command, logger)
-}
-
-func systemctl(ctx context.Context, args ...string) error {
-	out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput() //nolint:gosec // G204: systemctl for the unit of the agent named in the configuration
-	if err != nil {
-		return fmt.Errorf("systemctl %v: %w: %s", args, err, out)
-	}
-	return nil
 }
 
 // supervise runs the agent as the child of norca-join: started once the node

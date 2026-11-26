@@ -115,8 +115,9 @@ type Config struct {
 	// certificate was issued.
 	StateFile string `json:"state_file"`
 
-	// Service is the systemd unit of the agent: started after the join,
-	// sent SIGHUP after a renewal. Unused when norca-join runs the agent.
+	// Service is the service of the agent, a systemd unit or an OpenRC
+	// service of that name: enabled and started after the join, sent
+	// SIGHUP after a renewal. Unused when norca-join runs the agent.
 	Service string `json:"service,omitempty"`
 
 	// KeyStore is where the key of the node is made and kept, at the join
