@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -91,6 +92,29 @@ while :; do sleep 0.1; done`
 	// The token was used and is gone from the configuration.
 	if c, err := join.LoadConfig(confPath); err != nil || c.Token != "" {
 		t.Fatalf("the configuration after the join: %+v %v", c, err)
+	}
+}
+
+// -version and --version print the version the release sets with
+// -ldflags "-X main.version=...", and need no configuration.
+func TestRunVersion(t *testing.T) {
+	old, oldStdout := version, os.Stdout
+	t.Cleanup(func() { version, os.Stdout = old, oldStdout })
+	version = "1.2.3"
+	for _, arg := range []string{"-version", "--version"} {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stdout = w
+		code, runErr := run([]string{arg})
+		_ = w.Close()
+		os.Stdout = oldStdout
+		out, _ := io.ReadAll(r)
+		_ = r.Close()
+		if code != 0 || runErr != nil || string(out) != "norca-join 1.2.3\n" {
+			t.Fatalf("%s: %d %v %q", arg, code, runErr, out)
+		}
 	}
 }
 
