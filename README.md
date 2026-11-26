@@ -165,9 +165,9 @@ only the operator may read it):
 | `agent_config` | The agent configuration, a Go template with `.Name`, `.Region`, `.Datacenter`, `.Pool`, `.Class`, `.Meta`, `.CAFile`, `.CertFile`, `.KeyFile` and the functions `hcl` (a quoted string) and `hclmap` (a map as an HCL object). |
 | `trust_domain` | The SPIFFE trust domain; the node gets `spiffe://<domain>/region/<region>/node/<name>`. |
 | `validity` | The validity of a node certificate (`60d`). |
-| `tls_dir`, `config_file`, `service` | Where the files go and the unit of the agent (`/etc/norca/tls`, `/etc/norca/norca.hcl`, `norca`). |
+| `tls_dir`, `config_file`, `service` | Where the files go and the service of the agent, a systemd unit or an OpenRC service of that name (`/etc/norca/tls`, `/etc/norca/norca.hcl`, `norca`). The name is one both take: a letter or a digit, then letters, digits, `.`, `_` and `-`, without `.service`. |
 | `join_binary` | Where `norca-join` is on the machines, for the join below (`/usr/local/bin/norca-join`). |
-| `install_script` | Optional: a bash script that installs the `norca` binary, the CNI plugins, `norca-join`, the directories and the unit of the agent (`norca-deployer node-scaling install-script`, written with `node_scaling.machine.install: boot`). The bootstrap writes it to `/usr/local/sbin/norca-node-install.sh` (0700) and runs it before it starts the agent or `norca-join`. Without it the image of the machine has all of that. The docker provider ignores it: it mounts the binaries itself. |
+| `install_script` | Optional: a script that installs the `norca` binary, the CNI plugins, `norca-join`, the directories and the service of the agent (`norca-deployer node-scaling install-script`, written with `node_scaling.machine.install: boot`). The bootstrap writes it to `/usr/local/sbin/norca-node-install.sh` (0700) and runs it before it starts the agent or `norca-join`. Without it the image of the machine has all of that. The docker provider ignores it: it mounts the binaries itself. |
 
 For each instance the operator issues a certificate with the node CA (the
 file holds the leaf and the node CA), renders the agent configuration with
@@ -179,15 +179,40 @@ writes the files and starts the agent. Every certificate is an event
 asked for (`Provisioned` False, `NoBootstrap`); `-bootstrap=false` sends only
 the names, for a provider that brings its own machines.
 
+**systemd or OpenRC, decided at boot.** One document serves machines with
+systemd (Debian, Ubuntu, RHEL) and with OpenRC (Alpine): its last `runcmd`
+line enables and starts the service with the init system that runs. With
+systemd (`/run/systemd/system` exists) it runs `systemctl daemon-reload` and
+`systemctl enable --now <service>`; otherwise, with `rc-service` there,
+`rc-update add <service> default` and `rc-service <service> start`; on a
+machine with neither it fails, and cloud-init logs the error. The lines of
+`runcmd` are shell lines (YAML strings) in POSIX `sh`: cloud-init runs them
+in its `sh` script, and tiny-cloud, the bootstrapper of the Alpine cloud
+images, runs each with `sh -c` (it does not read the list form
+`[cmd, arg]`). tiny-cloud (3.2, Alpine 3.22) handles `write_files` and
+`runcmd` but not `hostname`: the machine takes the host name of its
+metadata, and the agent configuration names the node anyway.
+
 **The join: the key stays on the node.** With `-join-listen` the bootstrap
 carries no key and no certificate: a **one-time token**, the join endpoints,
-the cluster CA, the agent configuration and the unit of `norca-join`.
+the cluster CA, the agent configuration and the service of `norca-join`, as a
+systemd unit (`/etc/systemd/system/norca-join.service`) and as an OpenRC
+service (`/etc/init.d/norca-join`, run by `supervise-daemon`, started again
+10 seconds after it ended, as the unit is). The line of `runcmd` enables the
+one of the init system that runs; a systemd machine first removes the
+OpenRC service, since `systemctl enable` hands a script of `/etc/init.d`
+with the name of the unit to `update-rc.d`, which refuses it.
 `norca-join` makes the key on the machine, sends a certificate request with
 the token to the **join endpoint** of the operator (every instance of the
 operator serves it), and gets a certificate of `-join-validity` (7 days);
 it starts the agent, renews the certificate at two thirds of its life with
 the current one as its client certificate, and sends the agent SIGHUP: the
-agent loads the new pair and keeps its connections. The node carries the
+agent loads the new pair and keeps its connections. It starts and signals
+the service of the agent with the init system that runs, as the bootstrap
+decides: `systemctl enable --now` and `systemctl kill --signal=HUP`, or
+`rc-update add`, `rc-service <service> start` and `rc-service <service>
+reload` (the OpenRC service of norca-deployer sends SIGHUP on reload). On a
+machine with neither it does not join, and keeps its token. The node carries the
 meta `norca.identity = "join"` and no `norca.cert_expires`, so it is not
 replaced for its age (an explicit `rolling.max_node_age` still applies).
 
@@ -282,7 +307,7 @@ replaced for its age (an explicit `rolling.max_node_age` still applies).
 
 ```shell
 norca-nodescaler -region eu -join-listen :8490 -join-validity 168h -join-key-store auto
-norca-join run -config /etc/norca/norca-join.json                       # the unit of the bootstrap
+norca-join run -config /etc/norca/norca-join.json                       # the service of the bootstrap
 norca-join run -config /etc/norca/norca-join.json -- norca agent -config /etc/norca/norca.hcl   # in a container
 ```
 
@@ -750,5 +775,16 @@ LoadBalancer operator (`loadbalancer/operator/e2e_test.go`) installs the
 (`NORCA_REGISTRY_DIR`, or next to this repository), and is skipped without
 them. The whole chain on real machines is in the lab (`norca-lab`, cases
 `nodescaler`, `loadbalancer`, `loadbalancer-docker`).
+
+**Releases.** A tag `v<version>` (or the Release workflow run by hand with
+the version of a tag) builds `norca-join` for linux/amd64 and linux/arm64
+with `CGO_ENABLED=0` (`.github/workflows/release.yml`): one static binary
+per architecture for glibc and musl (Alpine) machines alike, checked to have
+no ELF interpreter and to run `norca-join --version` in Alpine and Debian.
+The draft GitHub release has `norca-join_<version>_linux_<arch>`, a
+CycloneDX SBOM per binary (`norca-join_<version>_linux_<arch>.cdx.json`)
+and `norca-platform_<version>_SHA256SUMS`; norca-deployer downloads from it
+with `node_scaling.machine.join_download: {source: official, version: ...}`.
+The release notes name the norca commit the binaries were built with.
 
 Commits are signed off (`git commit -s`).
