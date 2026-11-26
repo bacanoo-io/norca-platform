@@ -1,0 +1,202 @@
+# SPDX-FileCopyrightText: 2026 Norca contributors
+# SPDX-License-Identifier: MPL-2.0
+#
+# Release of norca-join, started by pushing a tag v<version> (v0.1.0,
+# v0.1.0-rc.1), or by hand (Run workflow) with the version of a tag that
+# exists. It builds norca-join for linux/amd64 and linux/arm64 with
+# CGO_ENABLED=0: one static binary per architecture, which runs on glibc
+# machines (Debian, Ubuntu, RHEL) and on musl machines (Alpine) alike. It
+# checks that the binaries have no ELF interpreter and run (norca-join
+# --version) in Alpine and Debian, writes a CycloneDX SBOM per binary, and
+# creates a draft GitHub release with the binaries, the SBOMs, the checksums
+# (norca-platform_<version>_SHA256SUMS) and the release notes
+# (.github/release-notes.md). The node scaling machines of norca-deployer
+# download norca-join from it (node_scaling.machine.join_download, source
+# official), checked against the SHA256SUMS: the names of the assets are
+# part of that contract.
+#
+# go.mod takes the Norca API and the controller SDK from the checkout next to
+# this repository (replace => ../norca/norca/...): the commit of norca is
+# resolved once and named in the release notes.
+#
+# Actions are pinned by commit, as in the norca release:
+#   actions/checkout v7.0.1, actions/setup-go v7.0.0,
+#   actions/upload-artifact v7.0.2, actions/download-artifact v8.0.2.
+# The run checks use alpine:3.22 and debian:12 by digest (multi-arch indexes).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The tag to release, e.g. v0.1.0 (it must exist)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The tag: pushed, or named by hand.
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  CYCLONEDX_GOMOD: github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+
+jobs:
+  prepare:
+    name: Check the version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      norca-commit: ${{ steps.norca.outputs.commit }}
+    steps:
+      - name: The tag is a version
+        id: version
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$TAG is not a version tag like v0.1.0 or v0.1.0-rc.1"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+          path: norca-platform
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bacanoo-io/norca
+          path: norca
+      - name: The commit of norca for both builds
+        id: norca
+        run: echo "commit=$(git -C norca rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build linux/${{ matrix.goarch }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Each on a runner of its architecture, so that the binary runs
+          # there in the containers of the check.
+          - goarch: amd64
+            runner: ubuntu-24.04
+          - goarch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NAME: norca-join_${{ needs.prepare.outputs.version }}_linux_${{ matrix.goarch }}
+      ALPINE_IMAGE: alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
+      DEBIAN_IMAGE: debian:12@sha256:1d04200c2ece1d4d75a2a6f8e11ebce7d86a2ae28b34bb2c9cbb3ee9f4953e75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          path: norca-platform
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bacanoo-io/norca
+          ref: ${{ needs.prepare.outputs.norca-commit }}
+          path: norca
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: norca-platform/go.mod
+          cache: false
+      - name: Build norca-join
+        working-directory: norca-platform
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist/bin"
+          CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-X main.version=$VERSION" \
+            -o "$GITHUB_WORKSPACE/dist/bin/$NAME" ./cmd/norca-join
+          go version -m "$GITHUB_WORKSPACE/dist/bin/$NAME"
+      - name: The binary is static
+        run: |
+          file "dist/bin/$NAME"
+          # A dynamically linked binary has an INTERP program header (the
+          # loader of glibc or musl); a static one has none.
+          if readelf -lW "dist/bin/$NAME" | grep -q 'INTERP'; then
+            echo "::error::$NAME has an ELF interpreter: it is not static"
+            readelf -lW "dist/bin/$NAME" | grep -A1 INTERP
+            exit 1
+          fi
+      - name: It runs on Alpine and Debian
+        run: |
+          for image in "$ALPINE_IMAGE" "$DEBIAN_IMAGE"; do
+            got="$(docker run --rm -v "$GITHUB_WORKSPACE/dist/bin:/b:ro" "$image" "/b/$NAME" --version)"
+            echo "${image%%@*}: $got"
+            if [ "$got" != "norca-join $VERSION" ]; then
+              echo "::error::${image%%@*}: norca-join --version printed '$got', want 'norca-join $VERSION'"
+              exit 1
+            fi
+          done
+      - name: SBOM
+        run: |
+          go install "$CYCLONEDX_GOMOD"
+          mkdir -p dist/sbom
+          "$(go env GOPATH)/bin/cyclonedx-gomod" bin -json -version "v$VERSION" \
+            -output "dist/sbom/$NAME.cdx.json" "dist/bin/$NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-linux-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: GitHub release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+      - name: Assets and checksums
+        run: |
+          mkdir -p release
+          install -m 0755 dist/bin/* release/
+          install -m 0644 dist/sbom/*.cdx.json release/
+          (cd release && sha256sum -- * > "norca-platform_${VERSION}_SHA256SUMS")
+          ls -l release
+          cat "release/norca-platform_${VERSION}_SHA256SUMS"
+      - name: Release notes
+        env:
+          TAG_URL: ${{ github.server_url }}/${{ github.repository }}/tree/${{ needs.prepare.outputs.tag }}
+          NORCA_COMMIT: ${{ needs.prepare.outputs.norca-commit }}
+          NORCA_URL: ${{ github.server_url }}/bacanoo-io/norca/tree/${{ needs.prepare.outputs.norca-commit }}
+        run: |
+          sed -e "s|{{VERSION}}|$VERSION|g" -e "s|{{TAG_URL}}|$TAG_URL|g" \
+            -e "s|{{NORCA_COMMIT}}|$NORCA_COMMIT|g" -e "s|{{NORCA_URL}}|$NORCA_URL|g" \
+            .github/release-notes.md > release-notes.md
+          cat release-notes.md
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--draft --verify-tag --title "norca-platform $VERSION" --notes-file release-notes.md)
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" "${flags[@]}" release/*
